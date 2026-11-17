@@ -366,9 +366,22 @@ final class MeterViewModel: ObservableObject {
   }
 
   func setToolEnabled(_ key: String, enabled: Bool) {
-    guard !busy else { return }
+    guard !busy, !runtime.runningFromDmg else { return }
     toolToggles[key] = enabled
-    postConfig(["tools": [key: enabled]], quietBanner: false, bannerText: "\(displayTitle(for: key)) 已\(enabled ? "开启" : "关闭")")
+    if enabled && (!launchAgentExists || !daemonOnline) {
+      masterEnabled = true
+      let args = launchAgentExists ? ["start-daemon"] : ["install"]
+      runAction(args: args, successText: "\(displayTitle(for: key)) 已开启") { [weak self] in
+        self?.postConfig(["enabled": true, "tools": [key: true]], quietBanner: true)
+      }
+      return
+    }
+    var body: [String: Any] = ["tools": [key: enabled]]
+    if enabled && !masterEnabled {
+      masterEnabled = true
+      body["enabled"] = true
+    }
+    postConfig(body, quietBanner: false, bannerText: "\(displayTitle(for: key)) 已\(enabled ? "开启" : "关闭")")
   }
 
   private func postConfig(_ bodyObj: [String: Any], quietBanner: Bool, bannerText: String = "") {
@@ -544,33 +557,141 @@ final class MeterViewModel: ObservableObject {
   func downloadAndOpenUpdate(_ info: UpdateReleaseInfo) {
     guard !updateDownloading, let url = URL(string: info.downloadUrl) else { return }
     updateDownloading = true
-    updateStatusText = "正在下载 v\(info.version) 安装镜像…"
+    updateStatusText = "正在下载 v\(info.version) 更新包…"
+
+    let bundleUrl = Bundle.main.bundleURL
+    let canSelfReplace =
+      !runtime.runningFromDmg &&
+      bundleUrl.path.hasSuffix(".app") &&
+      FileManager.default.isWritableFile(atPath: bundleUrl.deletingLastPathComponent().path)
 
     URLSession.shared.downloadTask(with: url) { [weak self] tempUrl, _, err in
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
-        self.updateDownloading = false
-        if let err = err {
+      guard let self = self else { return }
+      if let err = err {
+        DispatchQueue.main.async {
+          self.updateDownloading = false
           self.updateStatusText = "下载失败：\(err.localizedDescription)"
-          return
         }
-        guard let tempUrl = tempUrl else {
+        return
+      }
+      guard let tempUrl = tempUrl else {
+        DispatchQueue.main.async {
+          self.updateDownloading = false
           self.updateStatusText = "下载未返回文件。"
-          return
         }
-        let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
-        let fileName = url.lastPathComponent.isEmpty ? "AI-Turn-Meter-\(info.version)-arm64.dmg" : url.lastPathComponent
-        let dest = downloadsDir.appendingPathComponent(fileName)
-        try? FileManager.default.removeItem(at: dest)
-        do {
-          try FileManager.default.moveItem(at: tempUrl, to: dest)
-          self.updateStatusText = "已下载到「下载」文件夹并打开。拖入「应用程序」覆盖后打开一次即自动更新。"
-          NSWorkspace.shared.open(dest)
-        } catch {
-          self.updateStatusText = "保存安装包失败：\(error.localizedDescription)"
+        return
+      }
+
+      // Move synchronously before URLSession cleans up `tempUrl` when this handler returns.
+      let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+      let dest = downloadsDir.appendingPathComponent("AI-Turn-Meter-\(info.version)-arm64.dmg")
+      let fm = FileManager.default
+      try? fm.removeItem(at: dest)
+      do {
+        try fm.moveItem(at: tempUrl, to: dest)
+      } catch {
+        let msg = error.localizedDescription
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "保存安装包失败：\(msg)"
         }
+        return
+      }
+
+      if canSelfReplace {
+        DispatchQueue.main.async {
+          self.updateStatusText = "正在安装 v\(info.version) 并准备重启…"
+        }
+        if let errMsg = Self.installAppUpdateAndRelaunch(dmgUrl: dest, targetAppUrl: bundleUrl) {
+          DispatchQueue.main.async {
+            self.updateDownloading = false
+            self.updateStatusText = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
+            NSWorkspace.shared.open(dest)
+          }
+        }
+        return
+      }
+
+      DispatchQueue.main.async {
+        self.updateDownloading = false
+        self.updateStatusText = "已下载到「下载」文件夹并打开安装包，拖入「应用程序」覆盖即可。"
+        NSWorkspace.shared.open(dest)
       }
     }.resume()
+  }
+
+  private nonisolated static func runSync(_ launchPath: String, _ args: [String]) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: launchPath)
+    p.arguments = args
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do {
+      try p.run()
+      p.waitUntilExit()
+      return p.terminationStatus
+    } catch {
+      return -1
+    }
+  }
+
+  private nonisolated static func installAppUpdateAndRelaunch(dmgUrl: URL, targetAppUrl: URL) -> String? {
+    let fm = FileManager.default
+    let stageDir = fm.temporaryDirectory.appendingPathComponent("ai-turn-meter-upd-\(UUID().uuidString)", isDirectory: true)
+    let mntDir = stageDir.appendingPathComponent("mnt", isDirectory: true)
+    let stagedApp = stageDir.appendingPathComponent("AI Turn Meter.app", isDirectory: true)
+
+    do {
+      try fm.createDirectory(at: mntDir, withIntermediateDirectories: true)
+    } catch {
+      return "准备更新目录失败"
+    }
+
+    let attachRc = runSync("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-mountpoint", mntDir.path, dmgUrl.path])
+    guard attachRc == 0 else {
+      try? fm.removeItem(at: stageDir)
+      return "挂载镜像失败"
+    }
+
+    let srcApp = mntDir.appendingPathComponent("AI Turn Meter.app", isDirectory: true)
+    guard fm.fileExists(atPath: srcApp.appendingPathComponent("Contents/MacOS/AITurnMeter").path) else {
+      _ = runSync("/usr/bin/hdiutil", ["detach", mntDir.path, "-quiet"])
+      try? fm.removeItem(at: stageDir)
+      return "安装包内未找到应用文件"
+    }
+
+    let copyRc = runSync("/usr/bin/ditto", [srcApp.path, stagedApp.path])
+    _ = runSync("/usr/bin/hdiutil", ["detach", mntDir.path, "-quiet"])
+    try? fm.removeItem(at: mntDir)
+
+    guard copyRc == 0 else {
+      try? fm.removeItem(at: stageDir)
+      return "解压新版应用失败"
+    }
+    try? fm.removeItem(at: dmgUrl)
+
+    let pid = ProcessInfo.processInfo.processIdentifier
+    let script = """
+    while kill -0 "$1" 2>/dev/null; do sleep 0.1; done
+    rm -rf "$3" && /usr/bin/ditto "$2" "$3" && (/usr/bin/xattr -dr com.apple.quarantine "$3" >/dev/null 2>&1 || true) && /usr/bin/open -n "$3"
+    rm -rf "$4"
+    """
+    let launcher = Process()
+    launcher.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    launcher.arguments = ["-c", script, "atm-updater", "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path]
+    launcher.standardOutput = FileHandle.nullDevice
+    launcher.standardError = FileHandle.nullDevice
+    do {
+      try launcher.run()
+    } catch {
+      try? fm.removeItem(at: stageDir)
+      return "启动替换脚本失败"
+    }
+
+    DispatchQueue.main.async {
+      NSApp.terminate(nil)
+    }
+    return nil
   }
 }
 
@@ -594,47 +715,37 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
       }
 
-      // Master Switch Card
-      HStack(spacing: 14) {
+      // Compact Top Status Header (no redundant master toggle button)
+      HStack(spacing: 8) {
         Circle()
-          .fill(vm.isActiveOverall ? Color.green : Color.gray.opacity(0.45))
-          .frame(width: 10, height: 10)
-        VStack(alignment: .leading, spacing: 3) {
-          HStack(spacing: 6) {
-            Text(vm.isActiveOverall ? "Token 与速度显示已开启" : "Token 与速度显示已关闭")
-              .font(.system(size: 15, weight: .semibold))
-            Text("v\(vm.version)")
-              .font(.system(size: 11))
-              .foregroundColor(.secondary)
-          }
-          Text(
-            vm.isActiveOverall
-              ? "关闭本窗口后仍会在后台生效 · 可随时在此一键暂停"
-              : "已隐藏各软件内的所有显示 · 拨开右侧开关即可恢复"
-          )
-          .font(.system(size: 11.5))
+          .fill(vm.isActiveOverall ? Color.green : (vm.daemonOnline ? Color.orange : Color.gray.opacity(0.5)))
+          .frame(width: 8, height: 8)
+        Text(
+          vm.isActiveOverall
+            ? "后台运行中"
+            : (vm.daemonOnline ? "已暂停显示" : "后台未启动")
+        )
+        .font(.system(size: 13, weight: .semibold))
+        Text("v\(vm.version)")
+          .font(.system(size: 11))
           .foregroundColor(.secondary)
-        }
         Spacer()
         if vm.busy {
           ProgressView().controlSize(.small)
+        } else if !vm.daemonOnline && !vm.runtime.runningFromDmg {
+          Button("开启后台") { vm.setMasterEnabled(true) }
+            .controlSize(.small)
+        } else if !vm.masterEnabled && !vm.runtime.runningFromDmg {
+          Button("恢复显示") { vm.setMasterEnabled(true) }
+            .controlSize(.small)
+        } else {
+          Text("关闭窗口后仍在后台生效")
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
         }
-        Toggle("", isOn: Binding(
-          get: { vm.isActiveOverall },
-          set: { vm.setMasterEnabled($0) }
-        ))
-        .toggleStyle(.switch)
-        .labelsHidden()
-        .controlSize(.large)
-        .disabled(vm.busy || vm.runtime.runningFromDmg)
       }
-      .padding(14)
-      .background(Color(nsColor: .controlBackgroundColor))
-      .clipShape(RoundedRectangle(cornerRadius: 12))
-      .overlay(
-        RoundedRectangle(cornerRadius: 12)
-          .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-      )
+      .padding(.horizontal, 4)
+      .padding(.vertical, 2)
 
       if vm.isActiveOverall && !vm.appsNeedingInlineCdp.isEmpty {
         HStack(spacing: 10) {
@@ -718,7 +829,7 @@ struct ContentView: View {
             ))
             .toggleStyle(.switch)
             .labelsHidden()
-            .disabled(!installed || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
+            .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
           }
           .padding(.horizontal, 12)
           .padding(.vertical, 10)
@@ -736,12 +847,16 @@ struct ContentView: View {
 
       // Minimal Footer
       HStack {
-        Text("拖入新版 .dmg 覆盖打开即自动更新")
-          .font(.system(size: 11))
-          .foregroundColor(.secondary)
+        Button {
+          vm.checkForUpdates()
+        } label: {
+          Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+            .font(.system(size: 12))
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         Spacer()
         Menu {
-          Button("检查更新…") { vm.checkForUpdates() }
           Button("Cursor Remote-SSH 配置…") {
             vm.knownSshHosts = MeterRuntime.readSshConfigHosts()
             if vm.sshHost.isEmpty, let first = vm.knownSshHosts.first {
@@ -755,6 +870,11 @@ struct ContentView: View {
             vm.runAction(args: ["install"], successText: "已重新同步全部配置与扩展")
           }
           Button("刷新状态") { vm.refreshDoctorAndBootstrap() }
+          if vm.daemonOnline {
+            Button(vm.masterEnabled ? "暂停全部显示" : "恢复全部显示") {
+              vm.setMasterEnabled(!vm.masterEnabled)
+            }
+          }
           Divider()
           if vm.daemonOnline {
             Button("彻底退出后台进程") {
@@ -774,7 +894,7 @@ struct ContentView: View {
       }
     }
     .padding(16)
-    .frame(minWidth: 520, minHeight: 460)
+    .frame(minWidth: 500, minHeight: 380)
     .onAppear { vm.start() }
     .alert("确认彻底卸载？", isPresented: $vm.showUninstallAlert) {
       Button("取消", role: .cancel) {}
@@ -849,7 +969,7 @@ struct ContentView: View {
           }
           Spacer()
           if let info = vm.availableUpdate {
-            Button("下载新版安装包") { vm.downloadAndOpenUpdate(info) }
+            Button("立即更新并重启") { vm.downloadAndOpenUpdate(info) }
               .buttonStyle(.borderedProminent)
               .disabled(vm.updateDownloading)
           }
@@ -873,7 +993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       self.vm = model
       let view = ContentView(vm: model)
       let win = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 540, height: 480),
+        contentRect: NSRect(x: 0, y: 0, width: 520, height: 400),
         styleMask: [.titled, .closable, .miniaturizable, .resizable],
         backing: .buffered,
         defer: false
