@@ -10,7 +10,7 @@ export const APP_SPECS = {
     key: 'antigravity',
     name: 'Antigravity',
     bundleName: 'Antigravity.app',
-    exeRelPath: 'Contents/MacOS/Electron',
+    exeRelPath: 'Contents/MacOS/Antigravity',
     portFileRel: ['Library', 'Application Support', 'Antigravity', 'DevToolsActivePort'],
   },
   codex: {
@@ -107,6 +107,16 @@ export function isPortListening(port) {
   }
 }
 
+export function isAppRunning(spec) {
+  if (!spec?.installed || !spec?.exePath) return false;
+  try {
+    execFileSync('pgrep', ['-f', spec.exePath], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function readActivePort(spec, homeDir = homedir()) {
   if (spec.port) return isPortListening(spec.port) ? spec.port : null;
   const portFile = spec.portFile || (spec.portFileRel ? join(homeDir, ...spec.portFileRel) : null);
@@ -119,4 +129,104 @@ export function readActivePort(spec, homeDir = homedir()) {
     }
   }
   return null;
+}
+
+/**
+ * Extract user/wrapper `--flag` arguments from a running app main process so relaunches preserve them.
+ * @param {string} commandLine
+ * @param {string} exePath
+ * @returns {string[]}
+ */
+export function extractPreservableArgs(commandLine, exePath) {
+  if (!commandLine || !exePath) return [];
+  const trimmed = String(commandLine).trim();
+  if (trimmed !== exePath && (!trimmed.startsWith(exePath) || !/\s/.test(trimmed[exePath.length]))) {
+    return [];
+  }
+  const rest = trimmed.slice(exePath.length).trim();
+  if (!rest) return [];
+  const tokens = rest.split(/\s+/);
+  const preserved = [];
+  let skipNext = false;
+  for (const tok of tokens) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
+    if (tok === '--remote-debugging-port') {
+      skipNext = true;
+      continue;
+    }
+    if (
+      tok === '--remote-debugging-pipe' ||
+      tok.startsWith('--remote-debugging-port=') ||
+      tok.startsWith('-psn_') ||
+      !tok.startsWith('--')
+    ) {
+      continue;
+    }
+    if (!preserved.includes(tok)) preserved.push(tok);
+  }
+  return preserved;
+}
+
+/**
+ * Read preserved CLI flags from a currently running main app binary, if any.
+ * @param {{ exePath?: string }} spec
+ * @returns {string[]}
+ */
+export function readRunningProcessArgs(spec) {
+  if (!spec?.exePath) return [];
+  try {
+    const out = execFileSync('/bin/ps', ['-axo', 'command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    for (const line of out.split(/\r?\n/)) {
+      const args = extractPreservableArgs(line, spec.exePath);
+      if (args.length > 0) return args;
+    }
+  } catch {}
+  return [];
+}
+
+/**
+ * Check whether any framework/helper child processes inside an app bundle are still running.
+ * @param {{ installed?: boolean, appPath?: string | null }} spec
+ * @returns {boolean}
+ */
+export function hasAppHelpersRunning(spec) {
+  if (!spec?.installed || !spec?.appPath) return false;
+  const frameworksMarker = join(spec.appPath, 'Contents', 'Frameworks');
+  try {
+    const out = execFileSync('/bin/ps', ['-axo', 'command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.split(/\r?\n/).some((line) => line.includes(frameworksMarker));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify Chrome DevTools HTTP target list is actually responsive on `127.0.0.1:<port>`.
+ * @param {number} port
+ * @param {number} [timeoutMs]
+ * @returns {Promise<boolean>}
+ */
+export async function isCdpHttpReady(port, timeoutMs = 800) {
+  if (!port) return false;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: ctrl.signal });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return Array.isArray(data);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }

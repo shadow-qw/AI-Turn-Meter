@@ -15,7 +15,12 @@ import { join } from 'node:path';
 import {
   APP_SPECS,
   DEFAULT_DAEMON_PORT,
+  hasAppHelpersRunning,
+  isAppRunning,
+  isCdpHttpReady,
+  isPortListening,
   readActivePort,
+  readRunningProcessArgs,
   resolveAppPaths,
 } from '../src/apps.mjs';
 import {
@@ -74,13 +79,18 @@ async function cmdStatus(jsonMode = false) {
       name: resolved.name,
       appPath: resolved.appPath,
       installed: resolved.installed,
+      running: isAppRunning(resolved),
       cdpPort,
       latestTurn: state?.byTool?.[key] || null,
     };
   }
 
   if (jsonMode) {
-    console.log(JSON.stringify({ version: getPkgVersion(), port: PORT, online, apps, state }));
+    const config = state?.config || {
+      enabled: true,
+      tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    };
+    console.log(JSON.stringify({ version: getPkgVersion(), port: PORT, online, config, apps, state }));
     return;
   }
 
@@ -132,34 +142,33 @@ async function cmdDoctor(jsonMode = false) {
   }
 }
 
-function cmdOpen(target) {
-  if (target === 'all') {
-    for (const k of ['codex', 'cursor', 'codebuddy']) {
-      if (resolveAppPaths(APP_SPECS[k]).installed) cmdOpen(k);
-    }
-    return;
-  }
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function openSingleApp(target, { exitOnError = true } = {}) {
+  const fail = (message) => {
+    console.error(message);
+    if (exitOnError) process.exit(1);
+    return false;
+  };
+
   const baseSpec = APP_SPECS[target];
   if (!baseSpec) {
-    console.error(`Unknown app "${target}". Choose: codex | cursor | codebuddy | antigravity | all`);
-    process.exit(1);
+    return fail(`Unknown app "${target}". Choose: codex | cursor | codebuddy | antigravity | all`);
   }
   const spec = resolveAppPaths(baseSpec);
   if (!spec.installed || !spec.appPath) {
-    console.error(`Not installed: ${spec.bundleName}`);
-    process.exit(1);
+    return fail(`Not installed: ${spec.bundleName}`);
   }
-  if (target === 'antigravity' || readActivePort(spec)) {
+  const activePort = readActivePort(spec);
+  if (target === 'antigravity' || (activePort && (await isCdpHttpReady(activePort)))) {
     execFileSync('open', ['-a', spec.appPath]);
     console.log(`Focused ${spec.name}`);
-    return;
+    return true;
   }
 
-  let running = false;
-  try {
-    execFileSync('pgrep', ['-f', spec.exePath], { stdio: 'ignore' });
-    running = true;
-  } catch {}
+  // Capture existing launch flags (e.g. --mute-audio) before quitting so guards or user switches survive restart.
+  const preservedArgs = readRunningProcessArgs(spec);
+  let running = isAppRunning(spec);
 
   if (running) {
     try {
@@ -167,24 +176,68 @@ function cmdOpen(target) {
     } catch {}
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      try {
-        execFileSync('pgrep', ['-f', spec.exePath], { stdio: 'ignore' });
-        execFileSync('sleep', ['0.25']);
-      } catch {
+      if (!isAppRunning(spec)) {
         running = false;
         break;
       }
+      await sleepMs(250);
     }
     if (running) {
-      console.error(`${spec.name} 未在 8 秒内退出（可能存在未保存文件或确认弹窗），请手动退出后重试 ai-turn-meter open ${target}`);
-      process.exit(1);
+      return fail(
+        `${spec.name} 未在 8 秒内退出（可能存在未保存文件或确认弹窗），请手动退出后重试 ai-turn-meter open ${target}`
+      );
     }
+    const helperDeadline = Date.now() + 2000;
+    while (Date.now() < helperDeadline && hasAppHelpersRunning(spec)) {
+      await sleepMs(150);
+    }
+    await sleepMs(250);
   }
 
-  execFileSync('open', ['-a', spec.appPath, '--args', `--remote-debugging-port=${spec.port}`], {
+  const launchArgs = [...preservedArgs, `--remote-debugging-port=${spec.port}`];
+  execFileSync('open', ['-na', spec.appPath, '--args', ...launchArgs], {
     stdio: 'ignore',
   });
+
+  const cdpDeadline = Date.now() + 10000;
+  let ready = false;
+  while (Date.now() < cdpDeadline) {
+    if (isPortListening(spec.port) && (await isCdpHttpReady(spec.port))) {
+      ready = true;
+      break;
+    }
+    await sleepMs(250);
+  }
+  if (ready) {
+    // Re-check after 1.6s so a background watchdog relaunch that drops `--remote-debugging-port` is caught honestly.
+    await sleepMs(1600);
+    ready = isPortListening(spec.port) && (await isCdpHttpReady(spec.port));
+  }
+  if (!ready) {
+    const postArgs = readRunningProcessArgs(spec);
+    const detail = isAppRunning(spec)
+      ? `${spec.name} 启动后调试口 ${spec.port} 未保持开启（当前进程参数：${postArgs.join(' ') || '无'}，可能被其他守护脚本重启覆盖）`
+      : `${spec.name} 未能开启调试口 ${spec.port}`;
+    return fail(detail);
+  }
+
   console.log(`Launched ${spec.name} with CDP on 127.0.0.1:${spec.port}`);
+  return true;
+}
+
+async function cmdOpen(target) {
+  if (target === 'all') {
+    let allOk = true;
+    for (const k of ['codex', 'cursor', 'codebuddy']) {
+      if (resolveAppPaths(APP_SPECS[k]).installed) {
+        const ok = await openSingleApp(k, { exitOnError: false });
+        if (!ok) allOk = false;
+      }
+    }
+    if (!allOk) process.exit(1);
+    return;
+  }
+  await openSingleApp(target, { exitOnError: true });
 }
 
 function cmdSshInfo(host = '<remote-host>') {
@@ -251,7 +304,7 @@ if (flags.includes('--version') || flags.includes('-v')) {
   uninstallLaunchAgent({ dryRun });
 } else if (cmd === 'open') {
   const target = argv[argv.indexOf('open') + 1];
-  cmdOpen(target);
+  await cmdOpen(target);
 } else if (cmd === 'ssh-info') {
   const idx = argv.indexOf('ssh-info');
   const host = argv[idx + 1] && !argv[idx + 1].startsWith('-') ? argv[idx + 1] : undefined;

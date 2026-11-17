@@ -96,7 +96,12 @@ function activate(context) {
     return { baseUrl, tool, workspacePath, workspaceHash };
   }
 
-  function renderTurn(turn) {
+  function renderTurn(turn, disabled = false) {
+    if (disabled) {
+      statusItem.hide();
+      return;
+    }
+    statusItem.show();
     if (!turn) {
       statusItem.text = '$(pulse) 等待首轮回复';
       statusItem.tooltip = buildTooltip(null);
@@ -114,8 +119,9 @@ function activate(context) {
     if (workspaceHash) qs.set('workspaceHash', workspaceHash);
     try {
       const data = await httpGetJson(`${baseUrl}/v1/match?${qs.toString()}`);
-      renderTurn(data.turn || null);
+      renderTurn(data.turn || null, Boolean(data.disabled));
     } catch {
+      statusItem.show();
       statusItem.text = '$(pulse) Daemon 未连接';
       statusItem.tooltip = `无法连接本机 ${baseUrl}`;
     }

@@ -30,7 +30,7 @@ export function getDefaultCdpSpecs() {
  */
 export function buildInjectedRuntimeSource() {
   return `(() => {
-  const RUNTIME_VERSION = 8;
+  const RUNTIME_VERSION = 9;
   if (window.__aiTurnMeterVersion === RUNTIME_VERSION) return;
   if (typeof window.__aiTurnMeterCleanup === 'function') {
     try { window.__aiTurnMeterCleanup(); } catch {}
@@ -326,7 +326,7 @@ export function buildInjectedRuntimeSource() {
     for (const el of candidates) {
       if (el.id === POPOVER_ID || el.classList?.contains(PILL_CLASS)) continue;
       if (cEl.contains(el) || el.contains(cEl)) continue;
-      if (el.closest('pre, code, nav, aside, header, [role="tablist"], [role="menubar"], [role="navigation"]')) {
+      if (el.closest('pre, code, nav, aside, header, [data-pending="true"], [role="tablist"], [role="menubar"], [role="navigation"]')) {
         continue;
       }
 
@@ -340,7 +340,7 @@ export function buildInjectedRuntimeSource() {
       const isIdeChat = activeTool === 'cursor' || activeTool === 'codebuddy';
       const minBtns = isIdeChat ? 2 : 3;
       if (btns.length < minBtns || btns.length > 7) continue;
-      const svgBtns = btns.filter((b) => b.querySelector('svg'));
+      const svgBtns = btns.filter((b) => b.querySelector('svg, .codicon, [data-icon-name], .ui-icon'));
       if (svgBtns.length < 2) continue;
 
       const style = window.getComputedStyle(el);
@@ -350,8 +350,12 @@ export function buildInjectedRuntimeSource() {
       const text = cleanTextWithoutPill(el);
       if (text.length > 48) continue;
 
+      const isExplicitCursorFooter =
+        activeTool === 'cursor' &&
+        (el.classList?.contains('agent-transcript-turn-actions') ||
+          el.classList?.contains('agent-transcript-turn-actions-trailing'));
       const hasTimeHint = /(?:just now|ago|刚刚|秒前|分钟前|小时前|星期|今天|昨天|\\d{1,2}:\\d{2}|\\d+[smh])/i.test(text);
-      if (isIdeChat && btns.length === 2 && !hasTimeHint) continue;
+      if (isIdeChat && btns.length === 2 && !hasTimeHint && !isExplicitCursorFooter) continue;
 
       const firstBtnOffset = btns[0].getBoundingClientRect().left - rect.left;
       const alignRight = isIdeChat && style.justifyContent !== 'flex-end' && firstBtnOffset <= 24;
@@ -625,10 +629,16 @@ export function buildInjectedRuntimeSource() {
  * Multi-host loopback CDP inline pill injector.
  */
 export class CdpInlineInjector {
-  constructor({ specs = getDefaultCdpSpecs(), getTurnForTool = null, getTurnsForTool = null }) {
+  constructor({
+    specs = getDefaultCdpSpecs(),
+    getTurnForTool = null,
+    getTurnsForTool = null,
+    shouldPushTool = null,
+  }) {
     this.specs = specs;
     this.getTurnForTool = getTurnForTool;
     this.getTurnsForTool = getTurnsForTool;
+    this.shouldPushTool = shouldPushTool;
     this.timer = null;
     this.lastPushedByTool = new Map();
     this.runtimeSource = buildInjectedRuntimeSource();
@@ -725,6 +735,9 @@ export class CdpInlineInjector {
   }
 
   async pushTool(spec, { force = false } = {}) {
+    if (typeof this.shouldPushTool === 'function' && !this.shouldPushTool(spec.tool)) {
+      return false;
+    }
     let turns = [];
     if (typeof this.getTurnsForTool === 'function') {
       turns = (this.getTurnsForTool(spec.tool) || []).filter(Boolean);
@@ -753,6 +766,23 @@ export class CdpInlineInjector {
     }
     if (anyOk) this.lastPushedByTool.set(spec.tool, sig);
     return anyOk;
+  }
+
+  async clearTool(tool) {
+    const spec = this.specs.find((s) => s.tool === tool);
+    if (!spec) return false;
+    this.lastPushedByTool.delete(tool);
+    const port = this.resolvePort(spec);
+    if (!port) return false;
+    const targets = await this.findTargets(port);
+    if (targets.length === 0) return false;
+    const expr = 'if (typeof window.__aiTurnMeterCleanup === "function") { window.__aiTurnMeterCleanup(); } window.__aiTurnMeterVersion = 0;';
+    await Promise.all(targets.map((t) => this.evaluateOnTarget(t.webSocketDebuggerUrl, expr)));
+    return true;
+  }
+
+  async clearAll() {
+    await Promise.all(this.specs.map((s) => this.clearTool(s.tool).catch(() => false)));
   }
 
   async pushAll({ force = false, tools = null } = {}) {

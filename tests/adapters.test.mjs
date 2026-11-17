@@ -29,7 +29,7 @@ import {
   buildInjectedRuntimeSource,
 } from '../packages/daemon/src/cdp-injector.mjs';
 import { createMeterServer } from '../packages/daemon/src/server.mjs';
-import { APP_SPECS, resolveAppPaths } from '../packages/daemon/src/apps.mjs';
+import { APP_SPECS, extractPreservableArgs, resolveAppPaths } from '../packages/daemon/src/apps.mjs';
 import {
   buildLaunchAgentPlist,
   cleanCursorHooks,
@@ -634,6 +634,39 @@ test('TurnStore & HTTP server separate per-turn from sessionTotal and match work
         await fetch(`${baseUrl}/v1/match?tool=cursor&workspace=${encodeURIComponent('/tmp/ws-shared')}`)
       ).json();
       assert.equal(cursorShared.turn.tool, 'cursor');
+
+      // Per-tool and global toggle via /v1/config
+      await fetch(`${baseUrl}/v1/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tools: { cursor: false } }),
+      });
+      const disabledCursor = await (
+        await fetch(`${baseUrl}/v1/match?tool=cursor&workspace=${encodeURIComponent('/tmp/ws-shared')}`)
+      ).json();
+      assert.equal(disabledCursor.disabled, true);
+      assert.equal(disabledCursor.turn, null);
+
+      await fetch(`${baseUrl}/v1/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      const disabledAll = await (
+        await fetch(`${baseUrl}/v1/match?tool=codex&workspace=${encodeURIComponent('/tmp/ws-shared')}`)
+      ).json();
+      assert.equal(disabledAll.disabled, true);
+
+      await fetch(`${baseUrl}/v1/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true, tools: { cursor: true } }),
+      });
+      const restoredCursor = await (
+        await fetch(`${baseUrl}/v1/match?tool=cursor&workspace=${encodeURIComponent('/tmp/ws-shared')}`)
+      ).json();
+      assert.equal(restoredCursor.disabled, undefined);
+      assert.equal(restoredCursor.turn.tool, 'cursor');
     } finally {
       rmSync(hookStateDir, { recursive: true, force: true });
     }
@@ -667,7 +700,8 @@ test('CdpInlineInjector resolves static ports and DevToolsActivePort files clean
 test('Injected popover script compiles and supports multi-turn non-clobbering pills', () => {
   const src = buildInjectedRuntimeSource();
   new Function(src);
-  assert.match(src, /RUNTIME_VERSION = 8/);
+  assert.match(src, /RUNTIME_VERSION = 9/);
+  assert.match(src, /agent-transcript-turn-actions/);
   assert.match(src, /__aiTurnMeterUpdateTurns/);
   assert.match(src, /data-align/);
   assert.match(src, /atm-grid/);
@@ -753,4 +787,32 @@ test('Installer patches & cleans Cursor hooks with numeric version and resolves 
   } finally {
     rmSync(tmpHome, { recursive: true, force: true });
   }
+});
+
+test('extractPreservableArgs preserves existing wrapper flags and drops old debugging switches', () => {
+  const cursorExe = '/Applications/Cursor.app/Contents/MacOS/Cursor';
+  assert.deepEqual(
+    extractPreservableArgs(
+      `${cursorExe} --mute-audio --disable-audio-output --remote-debugging-port=47922 -psn_0_1234`,
+      cursorExe
+    ),
+    ['--mute-audio', '--disable-audio-output']
+  );
+
+  assert.deepEqual(
+    extractPreservableArgs(
+      '/Applications/CodeBuddy CN.app/Contents/MacOS/Electron --remote-debugging-port 47923 --disable-gpu --disable-gpu',
+      '/Applications/CodeBuddy CN.app/Contents/MacOS/Electron'
+    ),
+    ['--disable-gpu']
+  );
+
+  // Must not match Helper binaries
+  assert.deepEqual(
+    extractPreservableArgs(
+      '/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper --type=renderer',
+      cursorExe
+    ),
+    []
+  );
 });

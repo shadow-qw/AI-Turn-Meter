@@ -1,5 +1,6 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { URL } from 'node:url';
 import { CodexAdapter } from './adapters/codex.mjs';
 import { AntigravityAdapter } from './adapters/antigravity.mjs';
@@ -8,6 +9,29 @@ import { drainCursorSpool, processCursorHookPayload } from './adapters/cursor.mj
 import { CdpInlineInjector } from './cdp-injector.mjs';
 import { getPackageMeta } from './installer.mjs';
 import { TurnStore } from './store.mjs';
+
+const TOOL_KEYS = ['antigravity', 'codex', 'cursor', 'codebuddy'];
+
+function loadMeterConfig(configPath) {
+  const defaults = {
+    enabled: true,
+    tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+  };
+  if (!configPath || !existsSync(configPath)) return defaults;
+  try {
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+    const tools = { ...defaults.tools };
+    for (const k of TOOL_KEYS) {
+      if (typeof raw?.tools?.[k] === 'boolean') tools[k] = raw.tools[k];
+    }
+    return {
+      enabled: typeof raw?.enabled === 'boolean' ? raw.enabled : true,
+      tools,
+    };
+  } catch {
+    return defaults;
+  }
+}
 
 export function createMeterServer({
   port = Number(process.env.AI_TURN_METER_PORT || 47831),
@@ -19,8 +43,22 @@ export function createMeterServer({
 } = {}) {
   const store = new TurnStore(dbPath);
   const hookStateDir = stateDir || (dbPath && dbPath !== ':memory:' ? dirname(dbPath) : undefined);
+  const configPath = hookStateDir ? join(hookStateDir, 'config.json') : null;
+  let config = loadMeterConfig(configPath);
   /** @type {Set<http.ServerResponse>} */
   const sseClients = new Set();
+
+  function isToolEnabled(tool) {
+    if (!config.enabled) return false;
+    if (!tool) return true;
+    return config.tools[tool] !== false;
+  }
+
+  function persistConfig() {
+    if (!configPath) return;
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  }
 
   function broadcast(event, data) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -37,14 +75,16 @@ export function createMeterServer({
 
   function onTurnsChanged(records) {
     if (!records || records.length === 0) return;
-    const state = store.getState();
+    const state = { ...store.getState(), config };
     broadcast('state', state);
     for (const r of records) {
       broadcast('turn', r);
     }
     if (cdpInjector) {
-      const changedTools = [...new Set(records.map((r) => r.tool))];
-      cdpInjector.pushAll({ force: true, tools: changedTools }).catch(() => {});
+      const changedTools = [...new Set(records.map((r) => r.tool))].filter((t) => isToolEnabled(t));
+      if (changedTools.length > 0) {
+        cdpInjector.pushAll({ force: true, tools: changedTools }).catch(() => {});
+      }
     }
   }
 
@@ -58,6 +98,7 @@ export function createMeterServer({
 
   if (enableCdp) {
     cdpInjector = new CdpInlineInjector({
+      shouldPushTool: (tool) => isToolEnabled(tool),
       getTurnsForTool: (tool) => {
         const recent = store.getRecentTurns(60, tool);
         if (tool === 'antigravity') {
@@ -82,7 +123,13 @@ export function createMeterServer({
     if (req.method === 'GET' && url.pathname === '/v1/state') {
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(store.getState(limit)));
+      res.end(JSON.stringify({ ...store.getState(limit), config }));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/config') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(config));
       return;
     }
 
@@ -98,6 +145,11 @@ export function createMeterServer({
       const tool = url.searchParams.get('tool') || null;
       const workspacePath = url.searchParams.get('workspace') || null;
       const workspaceHash = url.searchParams.get('workspaceHash') || null;
+      if (!config.enabled || (tool && !isToolEnabled(tool))) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ turn: null, disabled: true }));
+        return;
+      }
       const turn = store.getMatchForIde({ tool, workspacePath, workspaceHash });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ turn }));
@@ -111,7 +163,7 @@ export function createMeterServer({
         Connection: 'keep-alive',
       });
       sseClients.add(res);
-      res.write(`event: state\ndata: ${JSON.stringify(store.getState())}\n\n`);
+      res.write(`event: state\ndata: ${JSON.stringify({ ...store.getState(), config })}\n\n`);
       const keepAlive = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -127,7 +179,12 @@ export function createMeterServer({
       return;
     }
 
-    if (req.method === 'POST' && (url.pathname === '/v1/ingest' || url.pathname === '/v1/ingest/cursor-hook')) {
+    if (
+      req.method === 'POST' &&
+      (url.pathname === '/v1/ingest' ||
+        url.pathname === '/v1/ingest/cursor-hook' ||
+        url.pathname === '/v1/config')
+    ) {
       let body = '';
       req.setEncoding('utf8');
       req.on('data', (chunk) => {
@@ -141,6 +198,34 @@ export function createMeterServer({
       req.on('end', () => {
         try {
           const payload = JSON.parse(body);
+          if (url.pathname === '/v1/config') {
+            const prevEnabled = config.enabled;
+            const prevTools = { ...config.tools };
+            if (typeof payload?.enabled === 'boolean') config.enabled = payload.enabled;
+            if (payload?.tools && typeof payload.tools === 'object') {
+              for (const k of TOOL_KEYS) {
+                if (typeof payload.tools[k] === 'boolean') config.tools[k] = payload.tools[k];
+              }
+            }
+            persistConfig();
+            broadcast('state', { ...store.getState(), config });
+            if (cdpInjector) {
+              if (!config.enabled && prevEnabled) {
+                cdpInjector.clearAll().catch(() => {});
+              } else {
+                for (const k of TOOL_KEYS) {
+                  const was = prevEnabled && prevTools[k] !== false;
+                  const now = isToolEnabled(k);
+                  if (was && !now) cdpInjector.clearTool(k).catch(() => {});
+                  else if (!was && now) cdpInjector.pushAll({ force: true, tools: [k] }).catch(() => {});
+                }
+              }
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, config }));
+            return;
+          }
+
           let turn = payload;
           if (url.pathname === '/v1/ingest/cursor-hook') {
             turn = processCursorHookPayload(payload, hookStateDir ? { stateDir: hookStateDir } : undefined);
@@ -201,6 +286,12 @@ export function createMeterServer({
     antigravityAdapter.stop();
     codeBuddyAdapter.stop();
     cdpInjector?.stop();
+    if (cdpInjector) {
+      await Promise.race([
+        cdpInjector.clearAll().catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 800)),
+      ]);
+    }
     if (spoolTimer) clearInterval(spoolTimer);
     for (const res of sseClients) res.end();
     sseClients.clear();

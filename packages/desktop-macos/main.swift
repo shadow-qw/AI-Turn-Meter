@@ -5,14 +5,18 @@ import SwiftUI
 struct TurnSummary: Decodable {
   let model: String?
   let inlineText: String?
-  let callCount: Int?
-  let cacheRatePct: Double?
+}
+
+struct MeterConfigPayload: Decodable {
+  let enabled: Bool
+  let tools: [String: Bool]
 }
 
 struct StatusAppEntry: Decodable {
   let name: String
   let appPath: String?
   let installed: Bool
+  let running: Bool?
   let cdpPort: Int?
   let latestTurn: TurnSummary?
 }
@@ -21,6 +25,7 @@ struct StatusResponse: Decodable {
   let version: String?
   let port: Int
   let online: Bool
+  let config: MeterConfigPayload?
   let apps: [String: StatusAppEntry]
 }
 
@@ -169,12 +174,18 @@ final class MeterViewModel: ObservableObject {
   @Published var version: String = "0.2.1"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
-  @Published var daemonPid: Int? = nil
-  @Published var daemonVersion: String? = nil
   @Published var daemonPort: Int = 47831
   @Published var launchAgentExists: Bool = false
   @Published var launchAgentLoaded: Bool = false
-  @Published var cursorHooksOk: Bool = false
+
+  @Published var masterEnabled: Bool = true
+  @Published var toolToggles: [String: Bool] = [
+    "antigravity": true,
+    "codex": true,
+    "cursor": true,
+    "codebuddy": true,
+  ]
+
   @Published var apps: [String: StatusAppEntry] = [:]
   @Published var vsixVersions: [String: String] = [:]
 
@@ -198,11 +209,19 @@ final class MeterViewModel: ObservableObject {
 
   let orderedKeys = ["antigravity", "codex", "cursor", "codebuddy"]
 
-  var canEnableAnyInlineCdp: Bool {
-    ["codex", "cursor", "codebuddy"].contains { key in
-      guard let entry = apps[key] else { return false }
+  var isActiveOverall: Bool {
+    daemonOnline && masterEnabled
+  }
+
+  var appsNeedingInlineCdp: [String] {
+    ["codex", "cursor", "codebuddy"].filter { key in
+      guard isToolEnabled(key), let entry = apps[key] else { return false }
       return entry.installed && entry.cdpPort == nil
     }
+  }
+
+  func isToolEnabled(_ key: String) -> Bool {
+    toolToggles[key] ?? true
   }
 
   func start() {
@@ -231,19 +250,27 @@ final class MeterViewModel: ObservableObject {
     }
   }
 
-  func placementHint(for key: String, cdpPort: Int?) -> String {
-    switch key {
-    case "antigravity":
-      return "每次启动自动识别 · 统计显示在消息操作栏左侧"
-    case "codex":
-      return cdpPort != nil ? "底栏胶囊已激活 · 回复底栏左侧实时展示" : "点右侧「开启底栏」重启后即可直接在对话里展示"
-    case "cursor":
-      return cdpPort != nil ? "右下角状态栏 + 消息底栏胶囊均已开启" : "右下角状态栏已就绪 · 想显示在消息旁可点右侧「开启底栏」"
-    case "codebuddy":
-      return cdpPort != nil ? "右下角状态栏 + 消息底栏胶囊均已开启" : "右下角状态栏已就绪 · 想显示在消息旁可点右侧「开启底栏」"
-    default:
-      return ""
+  func appSubtitle(for key: String) -> String {
+    guard let entry = apps[key], entry.installed else { return "未安装" }
+    if !masterEnabled { return "全局已暂停显示" }
+    if !isToolEnabled(key) { return "已关闭此软件显示" }
+
+    if let turn = entry.latestTurn, let inline = turn.inlineText {
+      let modelStr = (turn.model != nil && turn.model != "unknown") ? "\(turn.model!) · " : ""
+      return "\(modelStr)\(inline)"
     }
+    if key == "cursor" || key == "codebuddy" {
+      return entry.cdpPort != nil ? "已开启状态栏与消息旁胶囊，等待首轮对话" : "已在右下角状态栏就绪，等待首轮对话"
+    }
+    if key == "codex" && entry.cdpPort == nil {
+      return (entry.running ?? false) ? "正在运行（需点右侧按钮重启一次以显示胶囊）" : "未启动（点右侧按钮即可带统计启动）"
+    }
+    return "等待新对话记录"
+  }
+
+  func inlineBtnLabel(for key: String) -> String {
+    let isRunning = apps[key]?.running ?? false
+    return isRunning ? "重启并显示在消息旁" : "启动并显示在消息旁"
   }
 
   func pollStatusOnly() {
@@ -258,12 +285,34 @@ final class MeterViewModel: ObservableObject {
       }
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
-        if let v = parsed.version { self.version = v }
-        self.daemonOnline = parsed.online
-        self.daemonPort = parsed.port
-        self.apps = parsed.apps
+        self.applyStatus(parsed)
       }
     }
+  }
+
+  private func applyStatus(_ st: StatusResponse) {
+    if let v = st.version { self.version = v }
+    self.daemonOnline = st.online
+    self.daemonPort = st.port
+    self.apps = st.apps
+    if let cfg = st.config {
+      self.masterEnabled = cfg.enabled
+      for (k, v) in cfg.tools { self.toolToggles[k] = v }
+    }
+  }
+
+  private func applyDoctor(_ doc: DoctorResponse) {
+    if let v = doc.version { self.version = v }
+    self.updateFeedUrl = doc.updateFeedUrl
+    self.daemonOnline = doc.daemon.ok
+    self.daemonPort = doc.daemon.port
+    self.launchAgentExists = doc.launchAgent.plistExists
+    self.launchAgentLoaded = doc.launchAgent.launchAgentLoaded
+    var map: [String: String] = [:]
+    for (k, v) in doc.apps {
+      if let vv = v.vsixVersion { map[k] = vv }
+    }
+    self.vsixVersions = map
   }
 
   func refreshDoctorAndBootstrap() {
@@ -281,14 +330,8 @@ final class MeterViewModel: ObservableObject {
 
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
-        if let doc = doc {
-          self.applyDoctor(doc)
-        }
-        if let st = st {
-          self.daemonOnline = st.online
-          self.daemonPort = st.port
-          self.apps = st.apps
-        }
+        if let doc = doc { self.applyDoctor(doc) }
+        if let st = st { self.applyStatus(st) }
 
         if shouldAutoBootstrap, !rt.runningFromDmg, let doc = doc {
           let targetVersion = doc.version ?? self.version
@@ -298,45 +341,77 @@ final class MeterViewModel: ObservableObject {
               (doc.daemon.version != nil && doc.daemon.version != targetVersion))
 
           if !doc.launchAgent.plistExists {
-            self.runAction(args: ["install"], successText: "已完成首次自动配置并启动后台服务")
+            self.runAction(args: ["install"], successText: "已完成首次安装并开启")
           } else if needsAppUpgrade {
-            self.runAction(args: ["install"], successText: "已自动将后台与扩展更新至 v\(targetVersion)")
-          } else if !doc.daemon.ok {
-            self.runAction(args: ["start-daemon"], successText: "已拉起后台服务")
+            self.runAction(args: ["install"], successText: "已自动更新到 v\(targetVersion)")
+          } else if !doc.daemon.ok && self.masterEnabled {
+            self.runAction(args: ["start-daemon"], successText: "已开启后台统计")
           }
         }
       }
     }
   }
 
-  private func applyDoctor(_ doc: DoctorResponse) {
-    if let v = doc.version { self.version = v }
-    self.updateFeedUrl = doc.updateFeedUrl
-    self.daemonOnline = doc.daemon.ok
-    self.daemonPid = doc.daemon.pid
-    self.daemonVersion = doc.daemon.version
-    self.daemonPort = doc.daemon.port
-    self.launchAgentExists = doc.launchAgent.plistExists
-    self.launchAgentLoaded = doc.launchAgent.launchAgentLoaded
-    self.cursorHooksOk = doc.cursorHooks.validVersion && doc.cursorHooks.configured
-    var map: [String: String] = [:]
-    for (k, v) in doc.apps {
-      if let vv = v.vsixVersion { map[k] = vv }
+  func setMasterEnabled(_ enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    masterEnabled = enabled
+    if enabled && (!launchAgentExists || !daemonOnline) {
+      let args = launchAgentExists ? ["start-daemon"] : ["install"]
+      runAction(args: args, successText: "已一键开启") { [weak self] in
+        self?.postConfig(["enabled": true], quietBanner: true)
+      }
+      return
     }
-    self.vsixVersions = map
+    postConfig(["enabled": enabled], quietBanner: false, bannerText: enabled ? "已一键开启全部显示" : "已一键关闭全部显示")
   }
 
-  func runAction(args: [String], successText: String) {
+  func setToolEnabled(_ key: String, enabled: Bool) {
+    guard !busy else { return }
+    toolToggles[key] = enabled
+    postConfig(["tools": [key: enabled]], quietBanner: false, bannerText: "\(displayTitle(for: key)) 已\(enabled ? "开启" : "关闭")")
+  }
+
+  private func postConfig(_ bodyObj: [String: Any], quietBanner: Bool, bannerText: String = "") {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/config"),
+          let jsonData = try? JSONSerialization.data(withJSONObject: bodyObj) else {
+      return
+    }
+    var req = URLRequest(url: url, timeoutInterval: 4)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jsonData
+
+    URLSession.shared.dataTask(with: req) { [weak self] _, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "设置同步失败：\(err.localizedDescription)"
+          return
+        }
+        if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+          if !quietBanner && !bannerText.isEmpty {
+            self.bannerIsError = false
+            self.statusBanner = bannerText
+          }
+          self.pollStatusOnly()
+        }
+      }
+    }.resume()
+  }
+
+  func runAction(args: [String], successText: String, onSuccess: (() -> Void)? = nil) {
     guard !busy else { return }
     busy = true
-    statusBanner = "正在执行…"
+    statusBanner = "正在处理…"
     bannerIsError = false
     let rt = runtime
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-      let res = rt.runCli(args, timeoutSec: 30)
+      let cliTimeout = args.first == "open" ? 45.0 : 30.0
+      let res = rt.runCli(args, timeoutSec: cliTimeout)
       if res.exitCode == 0 {
-        Thread.sleep(forTimeInterval: 0.6)
+        Thread.sleep(forTimeInterval: 0.5)
       }
       let docRes = rt.runCli(["doctor", "--json"], timeoutSec: 12)
       let stRes = rt.runCli(["status", "--json"], timeoutSec: 6)
@@ -347,14 +422,11 @@ final class MeterViewModel: ObservableObject {
         guard let self = self else { return }
         self.busy = false
         if let doc = doc { self.applyDoctor(doc) }
-        if let st = st {
-          self.daemonOnline = st.online
-          self.daemonPort = st.port
-          self.apps = st.apps
-        }
+        if let st = st { self.applyStatus(st) }
         if res.exitCode == 0 {
           self.bannerIsError = false
           self.statusBanner = successText
+          onSuccess?()
         } else {
           self.bannerIsError = true
           let msg = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -382,7 +454,7 @@ final class MeterViewModel: ObservableObject {
           !rawUrl.isEmpty,
           let url = URL(string: rawUrl) else {
       updateChecking = false
-      updateStatusText = "当前是离线独立安装包（未绑定在线更新源）。\n\n以后拿到新版 .dmg 时，只需把新版「AI Turn Meter.app」拖进「应用程序」覆盖原软件并打开一次，后台服务与 IDE 扩展就会自动更新生效。"
+      updateStatusText = "当前是离线独立安装包。\n\n收到新版 .dmg 时直接拖入「应用程序」覆盖原软件并打开一次，后台与扩展就会自动完成更新。"
       return
     }
 
@@ -492,7 +564,7 @@ final class MeterViewModel: ObservableObject {
         try? FileManager.default.removeItem(at: dest)
         do {
           try FileManager.default.moveItem(at: tempUrl, to: dest)
-          self.updateStatusText = "已下载到「下载」文件夹，正在打开安装包。请将新版拖入「应用程序」覆盖原软件，打开后将自动升级。"
+          self.updateStatusText = "已下载到「下载」文件夹并打开。拖入「应用程序」覆盖后打开一次即自动更新。"
           NSWorkspace.shared.open(dest)
         } catch {
           self.updateStatusText = "保存安装包失败：\(error.localizedDescription)"
@@ -511,7 +583,7 @@ struct ContentView: View {
         HStack(spacing: 10) {
           Image(systemName: "externaldrive.badge.exclamationmark")
             .foregroundColor(.orange)
-          Text("当前正在安装包内打开。请先将「AI Turn Meter.app」拖入「应用程序」，再打开即可自动完成配置。")
+          Text("请先将「AI Turn Meter.app」拖入「应用程序」后再打开使用。")
             .font(.system(size: 12))
           Spacer()
           Button("打开应用程序") { vm.openApplicationsFolder() }
@@ -522,22 +594,23 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
       }
 
-      // Header card
-      HStack(spacing: 12) {
+      // Master Switch Card
+      HStack(spacing: 14) {
         Circle()
-          .fill(vm.daemonOnline ? Color.green : Color.red)
-          .frame(width: 9, height: 9)
-        VStack(alignment: .leading, spacing: 2) {
+          .fill(vm.isActiveOverall ? Color.green : Color.gray.opacity(0.45))
+          .frame(width: 10, height: 10)
+        VStack(alignment: .leading, spacing: 3) {
           HStack(spacing: 6) {
-            Text(vm.daemonOnline ? "后台运行中" : "后台未启动")
-              .font(.system(size: 14, weight: .semibold))
+            Text(vm.isActiveOverall ? "Token 与速度显示已开启" : "Token 与速度显示已关闭")
+              .font(.system(size: 15, weight: .semibold))
             Text("v\(vm.version)")
               .font(.system(size: 11))
               .foregroundColor(.secondary)
           }
           Text(
-            (vm.launchAgentLoaded ? "开机自启已开" : "未设开机自启") +
-            (vm.daemonPid != nil ? " · 端口 \(vm.daemonPort)" : "")
+            vm.isActiveOverall
+              ? "关闭本窗口后仍会在后台生效 · 可随时在此一键暂停"
+              : "已隐藏各软件内的所有显示 · 拨开右侧开关即可恢复"
           )
           .font(.system(size: 11.5))
           .foregroundColor(.secondary)
@@ -546,30 +619,43 @@ struct ContentView: View {
         if vm.busy {
           ProgressView().controlSize(.small)
         }
-        if vm.canEnableAnyInlineCdp {
-          Button("全部开启底栏") {
-            vm.runAction(args: ["open", "all"], successText: "已为已安装的软件统一开启底栏胶囊")
-          }
-          .buttonStyle(.borderedProminent)
-          .disabled(vm.busy || vm.runtime.runningFromDmg)
-        } else {
-          Button(vm.daemonOnline ? "重启后台" : "启动后台") {
-            vm.runAction(args: ["start-daemon"], successText: "后台服务已就绪")
-          }
-          .disabled(vm.busy || vm.runtime.runningFromDmg)
-        }
-        Button("修复/同步扩展") {
-          vm.runAction(args: ["install"], successText: "已重新同步后台、Cursor Hooks 与 IDE 扩展")
-        }
+        Toggle("", isOn: Binding(
+          get: { vm.isActiveOverall },
+          set: { vm.setMasterEnabled($0) }
+        ))
+        .toggleStyle(.switch)
+        .labelsHidden()
+        .controlSize(.large)
         .disabled(vm.busy || vm.runtime.runningFromDmg)
       }
-      .padding(12)
+      .padding(14)
       .background(Color(nsColor: .controlBackgroundColor))
-      .clipShape(RoundedRectangle(cornerRadius: 10))
+      .clipShape(RoundedRectangle(cornerRadius: 12))
       .overlay(
-        RoundedRectangle(cornerRadius: 10)
+        RoundedRectangle(cornerRadius: 12)
           .stroke(Color.primary.opacity(0.08), lineWidth: 1)
       )
+
+      if vm.isActiveOverall && !vm.appsNeedingInlineCdp.isEmpty {
+        HStack(spacing: 10) {
+          Image(systemName: "sparkles")
+            .foregroundColor(.accentColor)
+          Text("Codex / Cursor / CodeBuddy 如需在聊天消息旁直接显示，点右侧一键重启接入：")
+            .font(.system(size: 11.5))
+            .foregroundColor(.secondary)
+          Spacer()
+          Button("一键全部接入") {
+            vm.runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
+          }
+          .buttonStyle(.borderedProminent)
+          .controlSize(.small)
+          .disabled(vm.busy || vm.runtime.runningFromDmg)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.accentColor.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+      }
 
       if let msg = vm.statusBanner {
         HStack(spacing: 8) {
@@ -585,155 +671,130 @@ struct ContentView: View {
             .foregroundColor(.secondary)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, 7)
         .background((vm.bannerIsError ? Color.red : Color.green).opacity(0.1))
         .clipShape(RoundedRectangle(cornerRadius: 8))
       }
 
-      // 4 Apps List
+      // 4 Apps Toggle List
       VStack(spacing: 8) {
         ForEach(vm.orderedKeys, id: \.self) { key in
           let entry = vm.apps[key]
           let installed = entry?.installed ?? false
-          let cdpPort = entry?.cdpPort
-          let vsixVer = vm.vsixVersions[key]
+          let enabled = vm.isToolEnabled(key)
+          let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
 
-          HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
+          HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
               HStack(spacing: 6) {
                 Text(vm.displayTitle(for: key))
                   .font(.system(size: 13.5, weight: .semibold))
-                if !installed {
-                  badge("未安装", color: .gray)
-                } else {
-                  if cdpPort != nil {
-                    badge("底栏胶囊已开启", color: .green)
-                  } else if key != "antigravity" {
-                    badge("未开底栏", color: .secondary)
-                  } else {
-                    badge("等待窗口打开", color: .secondary)
-                  }
-                  if key == "cursor" || key == "codebuddy" {
-                    if let vv = vsixVer {
-                      badge("状态栏就绪 (v\(vv))", color: .teal)
-                    } else {
-                      badge("状态栏未安装", color: .orange)
-                    }
-                  }
+                  .foregroundColor(installed ? .primary : .secondary)
+                if installed && vm.isActiveOverall && enabled && entry?.cdpPort != nil {
+                  Circle()
+                    .fill(Color.green)
+                    .frame(width: 6, height: 6)
                 }
               }
-
-              Text(vm.placementHint(for: key, cdpPort: cdpPort))
-                .font(.system(size: 11))
+              Text(vm.appSubtitle(for: key))
+                .font(.system(size: 11.5))
                 .foregroundColor(.secondary)
-
-              if let turn = entry?.latestTurn, let inline = turn.inlineText {
-                let modelStr = (turn.model != nil && turn.model != "unknown") ? "\(turn.model!) · " : ""
-                Text("\(modelStr)\(inline)")
-                  .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                  .foregroundColor(.primary.opacity(0.88))
-                  .lineLimit(1)
-              } else {
-                Text("暂无对话记录")
-                  .font(.system(size: 11))
-                  .foregroundColor(.secondary.opacity(0.75))
-              }
+                .lineLimit(1)
             }
 
             Spacer()
 
-            if installed {
-              if key == "antigravity" || cdpPort != nil {
-                Button("切到窗口") {
-                  vm.runAction(args: ["open", key], successText: "已切换到 \(vm.displayTitle(for: key))")
-                }
-                .controlSize(.small)
-                .disabled(vm.busy)
-              } else {
-                Button("开启底栏") {
-                  vm.runAction(args: ["open", key], successText: "已带调试口重新打开 \(vm.displayTitle(for: key))")
-                }
-                .controlSize(.small)
-                .disabled(vm.busy)
+            if needsInline {
+              Button(vm.inlineBtnLabel(for: key)) {
+                vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
               }
+              .controlSize(.small)
+              .disabled(vm.busy)
             }
+
+            Toggle("", isOn: Binding(
+              get: { installed && enabled && vm.isActiveOverall },
+              set: { vm.setToolEnabled(key, enabled: $0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .disabled(!installed || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
           }
-          .padding(11)
+          .padding(.horizontal, 12)
+          .padding(.vertical, 10)
           .background(Color(nsColor: .controlBackgroundColor))
           .clipShape(RoundedRectangle(cornerRadius: 10))
           .overlay(
             RoundedRectangle(cornerRadius: 10)
               .stroke(Color.primary.opacity(0.07), lineWidth: 1)
           )
+          .opacity(installed ? 1.0 : 0.55)
         }
       }
 
-      Text("提示：关掉本窗口后统计仍在后台自动运行；收到新版 .dmg 时拖入覆盖打开一次即自动更新。")
-        .font(.system(size: 11))
-        .foregroundColor(.secondary)
-        .frame(maxWidth: .infinity, alignment: .leading)
+      Spacer(minLength: 2)
 
-      // Bottom utility bar
+      // Minimal Footer
       HStack {
-        Button("检查更新") { vm.checkForUpdates() }
-          .controlSize(.small)
-
-        Button("Cursor SSH 配置") {
-          vm.knownSshHosts = MeterRuntime.readSshConfigHosts()
-          if vm.sshHost.isEmpty, let first = vm.knownSshHosts.first {
-            vm.sshHost = first
-          }
-          vm.generateSshSnippet()
-          vm.showSshSheet = true
-        }
-        .controlSize(.small)
-
+        Text("拖入新版 .dmg 覆盖打开即自动更新")
+          .font(.system(size: 11))
+          .foregroundColor(.secondary)
         Spacer()
-
-        if vm.daemonOnline {
-          Button("停止后台") {
-            vm.runAction(args: ["stop-daemon"], successText: "后台服务已停止")
+        Menu {
+          Button("检查更新…") { vm.checkForUpdates() }
+          Button("Cursor Remote-SSH 配置…") {
+            vm.knownSshHosts = MeterRuntime.readSshConfigHosts()
+            if vm.sshHost.isEmpty, let first = vm.knownSshHosts.first {
+              vm.sshHost = first
+            }
+            vm.generateSshSnippet()
+            vm.showSshSheet = true
           }
-          .controlSize(.small)
-          .disabled(vm.busy)
+          Divider()
+          Button("修复或重新同步扩展配置") {
+            vm.runAction(args: ["install"], successText: "已重新同步全部配置与扩展")
+          }
+          Button("刷新状态") { vm.refreshDoctorAndBootstrap() }
+          Divider()
+          if vm.daemonOnline {
+            Button("彻底退出后台进程") {
+              vm.runAction(args: ["stop-daemon"], successText: "后台进程已退出")
+            }
+          }
+          Button("完全卸载本地配置…", role: .destructive) {
+            vm.showUninstallAlert = true
+          }
+        } label: {
+          Label("更多设置", systemImage: "gearshape")
+            .font(.system(size: 12))
         }
-
-        Button("刷新") {
-          vm.refreshDoctorAndBootstrap()
-        }
+        .menuStyle(.borderedButton)
         .controlSize(.small)
-        .disabled(vm.busy)
-
-        Button("完全卸载…") {
-          vm.showUninstallAlert = true
-        }
-        .controlSize(.small)
-        .foregroundColor(.red)
-        .disabled(vm.busy)
+        .fixedSize()
       }
     }
     .padding(16)
-    .frame(minWidth: 580, minHeight: 560)
+    .frame(minWidth: 520, minHeight: 460)
     .onAppear { vm.start() }
-    .alert("确认彻底卸载本地集成？", isPresented: $vm.showUninstallAlert) {
+    .alert("确认彻底卸载？", isPresented: $vm.showUninstallAlert) {
       Button("取消", role: .cancel) {}
       Button("卸载", role: .destructive) {
-        vm.runAction(args: ["uninstall"], successText: "已移除开机自启、Cursor Hooks、IDE 扩展与 CLI")
+        vm.runAction(args: ["uninstall"], successText: "已移除后台服务、Cursor Hooks 与 IDE 扩展")
       }
     } message: {
-      Text("将停止后台服务，移除开机自启、Cursor Hooks 与 IDE 扩展；已采集的历史记录（~/.local/share/ai-turn-meter/meter.db）会保留。")
+      Text("将停止后台服务，移除开机自启、Cursor Hooks 与 IDE 扩展；历史统计库会保留。")
     }
     .sheet(isPresented: $vm.showSshSheet) {
       VStack(alignment: .leading, spacing: 12) {
         Text("Cursor Remote-SSH 上报配置")
           .font(.headline)
-        Text("Remote-SSH 模式下，Cursor Hook 在远端服务器执行。请在 Mac ~/.ssh/config 为目标主机添加端口转发，并将下方 hooks.json 写入远端服务器。")
+        Text("连接远端服务器时，在 Mac ~/.ssh/config 加上端口转发，并将下方 hooks.json 放到远端服务器即可。")
           .font(.system(size: 12))
           .foregroundColor(.secondary)
         if !vm.knownSshHosts.isEmpty {
           ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-              Text("检测到配置:")
+              Text("本机 Host:")
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
               ForEach(vm.knownSshHosts, id: \.self) { h in
@@ -749,7 +810,7 @@ struct ContentView: View {
         HStack {
           TextField("远端 Host（如 dev-server.example.com）", text: $vm.sshHost)
             .textFieldStyle(.roundedBorder)
-          Button("生成配置") { vm.generateSshSnippet() }
+          Button("生成") { vm.generateSshSnippet() }
         }
         ScrollView {
           Text(vm.sshPreview)
@@ -758,7 +819,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
         }
-        .frame(height: 220)
+        .frame(height: 210)
         .background(Color(nsColor: .textBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         HStack {
@@ -772,7 +833,7 @@ struct ContentView: View {
         }
       }
       .padding(18)
-      .frame(width: 550, height: 440)
+      .frame(width: 540, height: 420)
     }
     .sheet(isPresented: $vm.showUpdateSheet) {
       VStack(alignment: .leading, spacing: 14) {
@@ -782,17 +843,6 @@ struct ContentView: View {
           .font(.system(size: 12.5))
           .foregroundColor(.secondary)
           .fixedSize(horizontal: false, vertical: true)
-        if let info = vm.availableUpdate, !info.notes.isEmpty {
-          ScrollView {
-            Text(info.notes)
-              .font(.system(size: 11.5))
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .padding(8)
-          }
-          .frame(height: 120)
-          .background(Color(nsColor: .textBackgroundColor))
-          .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
         HStack {
           if vm.updateChecking || vm.updateDownloading {
             ProgressView().controlSize(.small)
@@ -810,17 +860,6 @@ struct ContentView: View {
       .frame(width: 440)
     }
   }
-
-  @ViewBuilder
-  private func badge(_ text: String, color: Color) -> some View {
-    Text(text)
-      .font(.system(size: 10.5, weight: .medium))
-      .padding(.horizontal, 6)
-      .padding(.vertical, 2)
-      .foregroundColor(color)
-      .background(color.opacity(0.12))
-      .clipShape(Capsule())
-  }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -834,7 +873,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       self.vm = model
       let view = ContentView(vm: model)
       let win = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 610, height: 580),
+        contentRect: NSRect(x: 0, y: 0, width: 540, height: 480),
         styleMask: [.titled, .closable, .miniaturizable, .resizable],
         backing: .buffered,
         defer: false
