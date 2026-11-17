@@ -1,0 +1,8 @@
+.DS_Store
+dist/*.dmg
+dist/*.tar.gz
+dist/.vsix-stage
+dist/.dmg-stage
+dist/.release-stage
+dist/.mnt-verify
+dist/.AppIcon.iconset

@@ -1,0 +1,48 @@
+{
+  "name": "ai-turn-meter",
+  "displayName": "AI Turn Meter",
+  "description": "Auto-updating per-turn input/output tokens, cache hit rate, and TPS in the status bar via local AI Turn Meter daemon.",
+  "version": "0.1.2",
+  "publisher": "local-ai-turn-meter",
+  "extensionKind": [
+    "ui"
+  ],
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiTurnMeter.refresh",
+        "title": "AI Turn Meter: Refresh Now"
+      },
+      {
+        "command": "aiTurnMeter.showRecent",
+        "title": "AI Turn Meter: Show Recent Turns"
+      }
+    ],
+    "configuration": {
+      "title": "AI Turn Meter",
+      "properties": {
+        "aiTurnMeter.daemonUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:47831",
+          "description": "Local AI Turn Meter daemon base URL."
+        },
+        "aiTurnMeter.toolFilter": {
+          "type": "string",
+          "enum": ["auto", "cursor", "codebuddy", "antigravity", "codex"],
+          "default": "auto",
+          "description": "Auto-detect host IDE or pin a specific tool."
+        }
+      }
+    }
+  }
+}

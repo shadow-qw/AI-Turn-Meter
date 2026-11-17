@@ -1,0 +1,32 @@
+{
+  "name": "ai-turn-meter",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "description": "Single unified daemon & inline display monitor for Antigravity, Codex Desktop, Cursor, and CodeBuddy CN on macOS.",
+  "homepage": "https://github.com/shadow-qw/AI-Turn-Meter",
+  "repository": "https://github.com/shadow-qw/AI-Turn-Meter",
+  "updateFeedUrl": "https://github.com/shadow-qw/AI-Turn-Meter/releases/latest",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "ai-turn-meter": "./packages/daemon/bin/cli.mjs"
+  },
+  "files": [
+    "packages/",
+    "scripts/",
+    "dist/ai-turn-meter.vsix",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "daemon": "node packages/daemon/bin/daemon.mjs",
+    "verify:local": "node scripts/verify-local.mjs",
+    "package:vsix": "node scripts/package-vsix.mjs",
+    "install:all": "node scripts/install.mjs",
+    "uninstall:all": "node scripts/uninstall.mjs",
+    "release:tarball": "node scripts/build-release.mjs",
+    "release:dmg": "node scripts/build-dmg.mjs"
+  }
+}
