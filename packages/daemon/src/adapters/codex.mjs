@@ -335,17 +335,20 @@ export function parseCodexSessionContent(content, filePath = '') {
   return completedTurns;
 }
 
-function collectJsonlFiles(dir, out = []) {
+function collectJsonlFiles(dir, out = [], maxFiles = Infinity) {
+  if (out.length >= maxFiles) return out;
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch {
     return out;
   }
+  entries.sort((a, b) => b.name.localeCompare(a.name));
   for (const ent of entries) {
+    if (out.length >= maxFiles) break;
     const full = join(dir, ent.name);
     if (ent.isDirectory()) {
-      collectJsonlFiles(full, out);
+      collectJsonlFiles(full, out, maxFiles);
     } else if (ent.isFile() && ent.name.endsWith('.jsonl')) {
       out.push(full);
     }
@@ -364,7 +367,7 @@ export class CodexAdapter {
   }
 
   scan({ maxRecentFiles = 30 } = {}) {
-    const files = collectJsonlFiles(this.sessionsDir)
+    const files = collectJsonlFiles(this.sessionsDir, [], Math.max(maxRecentFiles * 2, 40))
       .map((fp) => {
         try {
           return { fp, mtimeMs: statSync(fp).mtimeMs };

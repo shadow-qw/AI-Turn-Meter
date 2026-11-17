@@ -39,7 +39,11 @@ export function toNonNegFloat(v) {
 
 export function normalizePreviewText(v, maxLen = 120) {
   if (typeof v !== 'string') return null;
-  const clean = v.replace(/\s+/g, ' ').trim();
+  const clean = v
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (!clean) return null;
   return clean.slice(0, maxLen);
 }

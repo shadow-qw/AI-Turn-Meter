@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -16,7 +16,9 @@ function loadState(filePath) {
 
 function saveState(filePath, state) {
   mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(state));
+  const tmpFile = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmpFile, JSON.stringify(state));
+  renameSync(tmpFile, filePath);
 }
 
 function pruneOldEntries(state, nowMs) {
@@ -110,8 +112,17 @@ export function processCursorHookPayload(payload, { stateDir = defaultStateDir()
         : typeof payload.last_assistant_message === 'string' && payload.last_assistant_message.trim()
           ? payload.last_assistant_message
           : null;
-    if (entry && msgText && !entry.replyPreview) {
-      entry.replyPreview = msgText;
+    if (
+      entry &&
+      (msgText || (eventName === 'stop' && entry.toolActiveStartMs !== null))
+    ) {
+      if (msgText) entry.replyPreview = msgText;
+      if (eventName === 'stop' && entry.toolActiveStartMs !== null) {
+        if (nowMs >= entry.toolActiveStartMs) {
+          entry.toolWaitMs += nowMs - entry.toolActiveStartMs;
+        }
+        entry.toolActiveStartMs = null;
+      }
       entry.updatedAtMs = nowMs;
       saveState(stateFile, state);
     }
@@ -178,12 +189,19 @@ export function processCursorHookPayload(payload, { stateDir = defaultStateDir()
 export function drainCursorSpool(store, stateDir = defaultStateDir()) {
   const spoolFile = join(stateDir, 'cursor-spool.jsonl');
   if (!existsSync(spoolFile)) return [];
+  const tmpFile = `${spoolFile}.draining-${process.pid}-${Date.now()}`;
   let lines;
   try {
-    lines = readFileSync(spoolFile, 'utf8').split(/\r?\n/).filter(Boolean);
-    writeFileSync(spoolFile, '');
+    renameSync(spoolFile, tmpFile);
+    lines = readFileSync(tmpFile, 'utf8').split(/\r?\n/).filter(Boolean);
   } catch {
     return [];
+  } finally {
+    try {
+      if (existsSync(tmpFile)) rmSync(tmpFile, { force: true });
+    } catch {
+      // ignore cleanup error
+    }
   }
   const records = [];
   for (const l of lines) {

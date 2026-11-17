@@ -8,7 +8,7 @@
  */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,6 +21,12 @@ const repo = repoArg ? repoArg.split('=')[1].trim() : null;
 execFileSync(process.execPath, [join(ROOT, 'scripts', 'package-vsix.mjs')], { stdio: 'inherit' });
 
 const distDir = join(ROOT, 'dist');
+mkdirSync(distDir, { recursive: true });
+for (const f of readdirSync(distDir)) {
+  if (/^ai-turn-meter-.*\.tar\.gz$/.test(f)) {
+    rmSync(join(distDir, f), { force: true });
+  }
+}
 const stageRoot = join(distDir, '.release-stage');
 const folderName = `ai-turn-meter-${version}`;
 const stagePkg = join(stageRoot, folderName);

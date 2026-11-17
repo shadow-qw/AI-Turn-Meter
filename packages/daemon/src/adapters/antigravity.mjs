@@ -154,9 +154,13 @@ export function parseAntigravityTranscriptContent(
     let sumStreamingMs = 0;
     let sumStreamOut = 0;
     let firstTtftMs = null;
+    let replyPreview = null;
     const seenEntries = new Set();
 
     for (const ps of rt.plannerSteps) {
+      if (typeof ps.content === 'string' && ps.content.trim()) {
+        replyPreview = ps.content;
+      }
       const inp = Number(ps.input_tokens) || 0;
       const cr = Number(ps.cache_read_tokens) || 0;
       const out = Number(ps.output_tokens) || 0;
@@ -226,6 +230,7 @@ export function parseAntigravityTranscriptContent(
       ttftMs: firstTtftMs,
       tps,
       tpsMethod,
+      replyPreview,
     });
   }
 
@@ -432,13 +437,17 @@ export class AntigravityAdapter {
   }
 
   async scan({ maxRecentFiles = 20 } = {}) {
-    const files = this.listTranscriptFiles().slice(0, maxRecentFiles).reverse();
+    const dirtyFiles = this.listTranscriptFiles()
+      .slice(0, maxRecentFiles)
+      .reverse()
+      .filter(({ fp, mtimeMs }) => this.fileMtimes.get(fp) !== mtimeMs);
+    if (dirtyFiles.length === 0) return [];
+
     const metaMap = loadConversationMetaMap(this.geminiRoot);
     const servers = await this.getServers();
     const changed = [];
 
-    for (const { fp, sessionId, host, mtimeMs } of files) {
-      if (this.fileMtimes.get(fp) === mtimeMs) continue;
+    for (const { fp, sessionId, host, mtimeMs } of dirtyFiles) {
       let content;
       try {
         content = readFileSync(fp, 'utf8');

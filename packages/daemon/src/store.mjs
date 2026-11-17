@@ -104,7 +104,7 @@ export class TurnStore {
     `);
 
     this.getExistingStmt = this.db.prepare(
-      `SELECT completed_at_ms, total_input_tokens, output_tokens, tps, call_count FROM turns WHERE turn_uid = ?`
+      `SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, output_tokens, tps, call_count, model, workspace_path, reply_preview FROM turns WHERE turn_uid = ?`
     );
 
     this.sessionAggStmt = this.db.prepare(`
@@ -128,40 +128,48 @@ export class TurnStore {
   upsertTurn(rawTurn) {
     const t = normalizeTurn(rawTurn);
     const prev = this.getExistingStmt.get(t.turnUid);
-    this.upsertStmt.run(
-      t.turnUid,
-      t.tool,
-      t.host,
-      t.sessionId,
-      t.turnId,
-      t.model,
-      t.workspacePath,
-      t.workspaceHash,
-      t.startedAtMs,
-      t.completedAtMs,
-      t.callCount,
-      t.totalInputTokens,
-      t.uncachedInputTokens,
-      t.cacheReadTokens,
-      t.cacheWriteTokens,
-      t.outputTokens,
-      t.thinkingTokens,
-      t.cacheRatePct,
-      t.durationMs,
-      t.modelActiveMs,
-      t.ttftMs,
-      t.tps,
-      t.tpsMethod,
-      t.replyPreview
-    );
 
     const changed =
       !prev ||
       prev.completed_at_ms !== t.completedAtMs ||
       prev.total_input_tokens !== t.totalInputTokens ||
+      prev.uncached_input_tokens !== t.uncachedInputTokens ||
+      prev.cache_read_tokens !== t.cacheReadTokens ||
       prev.output_tokens !== t.outputTokens ||
       prev.tps !== t.tps ||
-      prev.call_count !== t.callCount;
+      prev.call_count !== t.callCount ||
+      (!prev.reply_preview && Boolean(t.replyPreview)) ||
+      (prev.model === 'unknown' && t.model !== 'unknown') ||
+      (!prev.workspace_path && Boolean(t.workspacePath));
+
+    if (changed) {
+      this.upsertStmt.run(
+        t.turnUid,
+        t.tool,
+        t.host,
+        t.sessionId,
+        t.turnId,
+        t.model,
+        t.workspacePath,
+        t.workspaceHash,
+        t.startedAtMs,
+        t.completedAtMs,
+        t.callCount,
+        t.totalInputTokens,
+        t.uncachedInputTokens,
+        t.cacheReadTokens,
+        t.cacheWriteTokens,
+        t.outputTokens,
+        t.thinkingTokens,
+        t.cacheRatePct,
+        t.durationMs,
+        t.modelActiveMs,
+        t.ttftMs,
+        t.tps,
+        t.tpsMethod,
+        t.replyPreview
+      );
+    }
 
     return {
       changed,

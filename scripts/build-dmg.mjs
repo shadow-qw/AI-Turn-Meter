@@ -172,6 +172,12 @@ console.log(`Using standalone Node runtime: ${nodeBin}`);
 execFileSync(process.execPath, [join(ROOT, 'scripts', 'package-vsix.mjs')], { stdio: 'inherit' });
 
 const distDir = join(ROOT, 'dist');
+mkdirSync(distDir, { recursive: true });
+for (const f of readdirSync(distDir)) {
+  if (/^AI-Turn-Meter-.*\.dmg$/.test(f)) {
+    rmSync(join(distDir, f), { force: true });
+  }
+}
 const stageDir = join(distDir, '.dmg-stage');
 const appDir = join(stageDir, 'AI Turn Meter.app');
 const contentsDir = join(appDir, 'Contents');

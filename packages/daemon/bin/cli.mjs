@@ -20,6 +20,8 @@ import {
   isCdpHttpReady,
   isPortListening,
   readActivePort,
+  readListeningTcpPorts,
+  readProcessCommandLines,
   readRunningProcessArgs,
   resolveAppPaths,
 } from '../src/apps.mjs';
@@ -71,15 +73,17 @@ async function cmdStatus(jsonMode = false) {
     }
   } catch {}
 
+  const listeningPorts = readListeningTcpPorts();
+  const processLines = readProcessCommandLines();
   const apps = {};
   for (const [key, spec] of Object.entries(APP_SPECS)) {
     const resolved = resolveAppPaths(spec);
-    const cdpPort = resolved.installed ? readActivePort(resolved) : null;
+    const cdpPort = resolved.installed ? readActivePort(resolved, undefined, listeningPorts) : null;
     apps[key] = {
       name: resolved.name,
       appPath: resolved.appPath,
       installed: resolved.installed,
-      running: isAppRunning(resolved),
+      running: isAppRunning(resolved, processLines),
       cdpPort,
       latestTurn: state?.byTool?.[key] || null,
     };

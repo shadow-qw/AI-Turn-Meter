@@ -171,7 +171,7 @@ final class MeterRuntime: Sendable {
 final class MeterViewModel: ObservableObject {
   let runtime = MeterRuntime()
 
-  @Published var version: String = "0.2.1"
+  @Published var version: String = "0.2.5"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -335,8 +335,9 @@ final class MeterViewModel: ObservableObject {
 
         if shouldAutoBootstrap, !rt.runningFromDmg, let doc = doc {
           let targetVersion = doc.version ?? self.version
+          let isBundledApp = Bundle.main.bundlePath.hasSuffix(".app")
           let needsAppUpgrade =
-            (doc.launchAgent.managedByApp ?? false) &&
+            isBundledApp &&
             (doc.launchAgent.pointsToCurrentRoot == false ||
               (doc.daemon.version != nil && doc.daemon.version != targetVersion))
 

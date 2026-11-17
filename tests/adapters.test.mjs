@@ -10,11 +10,13 @@ import {
   formatInlineSummary,
   formatTokens,
   formatTps,
+  normalizePreviewText,
   normalizeTurn,
 } from '../packages/daemon/src/format.mjs';
 import { TurnStore } from '../packages/daemon/src/store.mjs';
 import { parseCodexSessionContent } from '../packages/daemon/src/adapters/codex.mjs';
 import {
+  AntigravityAdapter,
   buildAntigravitySpeedIndex,
   parseAntigravityTranscriptContent,
 } from '../packages/daemon/src/adapters/antigravity.mjs';
@@ -27,9 +29,16 @@ import { processCursorHookPayload, drainCursorSpool } from '../packages/daemon/s
 import {
   CdpInlineInjector,
   buildInjectedRuntimeSource,
+  isEligibleCdpTarget,
 } from '../packages/daemon/src/cdp-injector.mjs';
 import { createMeterServer } from '../packages/daemon/src/server.mjs';
-import { APP_SPECS, extractPreservableArgs, resolveAppPaths } from '../packages/daemon/src/apps.mjs';
+import {
+  APP_SPECS,
+  extractPreservableArgs,
+  isAppRunning,
+  isPortListening,
+  resolveAppPaths,
+} from '../packages/daemon/src/apps.mjs';
 import {
   buildLaunchAgentPlist,
   cleanCursorHooks,
@@ -700,7 +709,7 @@ test('CdpInlineInjector resolves static ports and DevToolsActivePort files clean
 test('Injected popover script compiles and supports multi-turn non-clobbering pills', () => {
   const src = buildInjectedRuntimeSource();
   new Function(src);
-  assert.match(src, /RUNTIME_VERSION = 10/);
+  assert.match(src, /RUNTIME_VERSION = 12/);
   assert.match(src, /agent-transcript-turn-actions/);
   assert.match(src, /__aiTurnMeterUpdateTurns/);
   assert.match(src, /data-align/);
@@ -1051,4 +1060,523 @@ test('Injected runtime mounts right-aligned pills onto Cursor virtualized turn-a
   assert.equal(bar2.lastElementChild.dataset.atmTurnUid, 'cursor:ssh-1:t2');
 
   assert.equal(barPending.querySelector('.ai-turn-meter-inline-pill'), null);
+});
+
+test('Antigravity & CodeBuddy CLI extract replyPreview with Markdown link normalization and TurnStore skips no-op writes', async () => {
+  assert.equal(
+    normalizePreviewText('已修改 [server.mjs](file:///Users/demo/packages/daemon/src/server.mjs#L10-L20) 与 ![diagram](https://example.com/a.png)'),
+    '已修改 server.mjs 与 diagram'
+  );
+
+  const agTranscript = [
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-17T04:00:00Z' }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-17T04:00:02Z',
+      content: '中间说明文本',
+      input_tokens: 1000,
+      cache_read_tokens: 8000,
+      output_tokens: 100,
+      tool_calls: [{ name: 'read_file' }],
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-17T04:00:04Z',
+      content: '最终答复：请查看 [README.md](file:///Users/demo/README.md) 中的说明。',
+      input_tokens: 500,
+      cache_read_tokens: 9000,
+      output_tokens: 200,
+      tool_calls: [],
+    }),
+  ].join('\n');
+
+  const agTurns = parseAntigravityTranscriptContent(agTranscript, {
+    sessionId: 'conv-prev',
+    workspacePath: '/tmp/ag',
+  });
+  assert.equal(agTurns.length, 1);
+  assert.equal(agTurns[0].replyPreview, '最终答复：请查看 [README.md](file:///Users/demo/README.md) 中的说明。');
+
+  const store = new TurnStore(':memory:');
+  try {
+    const first = store.upsertTurn(agTurns[0]);
+    assert.equal(first.changed, true);
+    assert.equal(first.record.replyPreview, '最终答复：请查看 README.md 中的说明。');
+
+    const second = store.upsertTurn(agTurns[0]);
+    assert.equal(second.changed, false);
+
+    const updated = store.upsertTurn({ ...agTurns[0], model: 'gemini-4-hydrogen' });
+    assert.equal(updated.changed, true);
+    assert.equal(updated.record.model, 'gemini-4-hydrogen');
+  } finally {
+    store.close();
+  }
+
+  const cliWithReply = [
+    JSON.stringify({ type: 'message', role: 'user', id: 'u1', timestamp: 1000, cwd: '/tmp/cb' }),
+    JSON.stringify({
+      type: 'message',
+      role: 'assistant',
+      id: 'a1',
+      timestamp: 2000,
+      content: [{ type: 'text', text: 'CodeBuddy CLI 答复正文' }],
+      providerData: {
+        messageId: 'm1',
+        requestModelName: 'GLM',
+        rawUsage: { prompt_tokens: 500, prompt_cache_hit_tokens: 200, completion_tokens: 50 },
+      },
+    }),
+  ].join('\n');
+  const cbCliTurns = parseCodeBuddyCliContent(cliWithReply, 'cli-prev.jsonl');
+  assert.equal(cbCliTurns.length, 1);
+  assert.equal(cbCliTurns[0].replyPreview, 'CodeBuddy CLI 答复正文');
+
+  // AntigravityAdapter.scan returns immediately on unchanged files without touching RPC
+  const tmpGem = mkdtempSync(join(tmpdir(), 'ag-idle-'));
+  const memStore = new TurnStore(':memory:');
+  try {
+    const sessBrain = join(tmpGem, 'antigravity', 'brain', 'sess-idle', '.system_generated', 'logs');
+    mkdirSync(sessBrain, { recursive: true });
+    writeFileSync(join(sessBrain, 'transcript.jsonl'), agTranscript);
+    const adapter = new AntigravityAdapter({ store: memStore, geminiRoot: tmpGem, enableRpc: false });
+    let rpcChecks = 0;
+    adapter.getServers = async () => {
+      rpcChecks += 1;
+      return null;
+    };
+    const firstScan = await adapter.scan();
+    assert.equal(firstScan.length, 1);
+    assert.equal(rpcChecks, 1);
+    const secondScan = await adapter.scan();
+    assert.equal(secondScan.length, 0);
+    assert.equal(rpcChecks, 1);
+  } finally {
+    memStore.close();
+    rmSync(tmpGem, { recursive: true, force: true });
+  }
+});
+
+test('Cursor hook closes unclosed tool timer on stop and keeps latest replyPreview', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cursor-stop-'));
+  try {
+    processCursorHookPayload(
+      { hook_event_name: 'beforeSubmitPrompt', conversation_id: 'c2', generation_id: 'g2' },
+      { stateDir, nowMs: 1000 }
+    );
+    processCursorHookPayload(
+      { hook_event_name: 'beforeShellExecution', conversation_id: 'c2', generation_id: 'g2' },
+      { stateDir, nowMs: 2000 }
+    );
+    processCursorHookPayload(
+      { hook_event_name: 'afterAgentResponse', conversation_id: 'c2', generation_id: 'g2', text: '第一段过渡回复' },
+      { stateDir, nowMs: 3000 }
+    );
+    const done = processCursorHookPayload(
+      {
+        hook_event_name: 'stop',
+        conversation_id: 'c2',
+        generation_id: 'g2',
+        last_assistant_message: '最后完整回复',
+        input_tokens: 1000,
+        output_tokens: 200,
+      },
+      { stateDir, nowMs: 5000 }
+    );
+    assert.ok(done);
+    assert.equal(done.replyPreview, '最后完整回复');
+    assert.equal(done.durationMs, 4000);
+    // Unclosed tool window [2000..5000] = 3000ms subtracted -> 1000ms active
+    assert.equal(done.modelActiveMs, 1000);
+    assert.equal(done.tpsMethod, 'e2e_minus_tools');
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('Injected runtime matches Markdown-cleaned replyPreview and bounds Pass 3 within anchored segments', () => {
+  class MiniEl {
+    constructor(tag, { className = '', attrs = {}, rect = {}, style = {}, text = '' } = {}) {
+      this.tagName = tag.toUpperCase();
+      this.nodeType = 1;
+      this.className = className;
+      this.attrs = { ...attrs };
+      this.dataset = {};
+      this.style = { ...style };
+      this._rect = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, ...rect };
+      this._style = { display: 'flex', flexDirection: 'row', justifyContent: 'flex-end', visibility: 'visible', opacity: '1', overflowY: 'visible', ...style };
+      this.children = [];
+      this.childNodes = [];
+      this.parentElement = null;
+      if (text) this.childNodes.push({ nodeType: 3, nodeValue: text });
+      const self = this;
+      this.classList = {
+        contains: (c) => self.className.split(/\s+/).includes(c),
+      };
+    }
+    set textContent(v) {
+      this.children = [];
+      this.childNodes = v ? [{ nodeType: 3, nodeValue: String(v) }] : [];
+    }
+    get firstChild() { return this.childNodes[0] || null; }
+    get firstElementChild() { return this.children[0] || null; }
+    get lastElementChild() { return this.children[this.children.length - 1] || null; }
+    appendChild(ch) {
+      ch.parentElement = this;
+      this.children.push(ch);
+      this.childNodes.push(ch);
+      return ch;
+    }
+    insertBefore(ch, ref) {
+      ch.parentElement = this;
+      const idx = ref ? this.children.indexOf(ref) : -1;
+      if (idx === -1) return this.appendChild(ch);
+      this.children.splice(idx, 0, ch);
+      this.childNodes.splice(idx, 0, ch);
+      return ch;
+    }
+    removeChild(ch) {
+      this.children = this.children.filter((c) => c !== ch);
+      this.childNodes = this.childNodes.filter((c) => c !== ch);
+      ch.parentElement = null;
+    }
+    remove() {
+      if (this.parentElement) this.parentElement.removeChild(this);
+    }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+    addEventListener() {}
+    getBoundingClientRect() { return this._rect; }
+    contains(other) {
+      if (other === this) return true;
+      return this.children.some((c) => c.contains(other));
+    }
+    closest(sel) {
+      let cur = this;
+      while (cur) {
+        if (MiniEl.matches(cur, sel)) return cur;
+        cur = cur.parentElement;
+      }
+      return null;
+    }
+    querySelectorAll(sel) {
+      const out = [];
+      const walk = (n) => {
+        for (const c of n.children) {
+          if (MiniEl.matches(c, sel)) out.push(c);
+          walk(c);
+        }
+      };
+      walk(this);
+      return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+    static matches(el, selList) {
+      return selList.split(',').some((raw) => {
+        const s = raw.replace(':scope >', '').trim();
+        if (!s) return false;
+        if (s.startsWith('.')) return el.classList.contains(s.slice(1));
+        if (s.startsWith('#')) return el.attrs.id === s.slice(1) || el.id === s.slice(1);
+        if (s.startsWith('[')) {
+          const m = s.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/);
+          if (!m) return false;
+          const val = el.getAttribute(m[1]);
+          return m[2] !== undefined ? val === m[2] : val !== null;
+        }
+        return el.tagName === s.toUpperCase();
+      });
+    }
+  }
+
+  const body = new MiniEl('body');
+  const head = new MiniEl('head');
+  const list = new MiniEl('div', {
+    rect: { left: 100, top: 60, right: 800, bottom: 760, width: 700, height: 700 },
+    style: { overflowY: 'auto' },
+  });
+  list.scrollHeight = 1400;
+  list.clientHeight = 700;
+  body.appendChild(list);
+
+  function addReply(y, replyText) {
+    const card = new MiniEl('div', { rect: { left: 120, top: y, right: 780, bottom: y + 90, width: 660, height: 90 }, style: { display: 'block' } });
+    card.appendChild(new MiniEl('div', { text: replyText, style: { display: 'block' } }));
+    const bar = new MiniEl('div', { rect: { left: 120, top: y + 60, right: 780, bottom: y + 84, width: 660, height: 24 }, style: { display: 'flex', justifyContent: 'flex-end' } });
+    for (const lbl of ['Copy', 'Good', 'Bad']) {
+      const btn = new MiniEl('button', { rect: { left: 700, top: y + 62, right: 720, bottom: y + 82, width: 20, height: 20 }, attrs: { 'aria-label': lbl } });
+      btn.appendChild(new MiniEl('svg'));
+      bar.appendChild(btn);
+    }
+    card.appendChild(bar);
+    list.appendChild(card);
+    return bar;
+  }
+
+  // Top unmatched reply (turn 2), middle anchored reply (turn 3 with Markdown link in DB), bottom unmatched reply (no turn 4 yet)
+  const barTop = addReply(100, '这是第二轮摘要文本');
+  const barAnchored = addReply(250, '请查看 README.md 并验证结果');
+  const barBottom = addReply(400, '尚未入库的第四轮流式内容');
+
+  body.appendChild(
+    new MiniEl('div', {
+      attrs: { contenteditable: 'true' },
+      rect: { left: 120, top: 820, right: 780, bottom: 880, width: 660, height: 60 },
+    })
+  );
+
+  const doc = {
+    title: 'Antigravity',
+    head,
+    body,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    getElementById: (id) => [...head.children, ...body.children].find((e) => e.id === id || e.attrs.id === id) || null,
+    createElement: (tag) => new MiniEl(tag),
+    querySelector: (sel) => body.querySelector(sel),
+    querySelectorAll: (sel) => body.querySelectorAll(sel),
+  };
+  const win = {
+    location: { pathname: '/' },
+    innerWidth: 1280,
+    innerHeight: 960,
+    document: doc,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    getComputedStyle: (el) => el._style,
+  };
+  win.window = win;
+  class FakeMutationObserver { observe() {} disconnect() {} }
+  new Function('window', 'document', 'MutationObserver', 'setTimeout', 'clearTimeout', buildInjectedRuntimeSource())(
+    win,
+    doc,
+    FakeMutationObserver,
+    () => 0,
+    () => {}
+  );
+
+  win.__aiTurnMeterUpdateTurns(
+    [
+      {
+        turnUid: 'antigravity:s-ag:t1',
+        tool: 'antigravity',
+        sessionId: 's-ag',
+        completedAtMs: 1000,
+        totalInputTokens: 1000,
+        cacheReadTokens: 800,
+        outputTokens: 50,
+        tps: 100,
+        replyPreview: '第一轮已滚动出屏幕',
+      },
+      {
+        turnUid: 'antigravity:s-ag:t2',
+        tool: 'antigravity',
+        sessionId: 's-ag',
+        completedAtMs: 2000,
+        totalInputTokens: 2000,
+        cacheReadTokens: 1600,
+        outputTokens: 100,
+        tps: 120,
+        replyPreview: '不同文本触发 Pass 3 区间对齐',
+      },
+      {
+        turnUid: 'antigravity:s-ag:t3',
+        tool: 'antigravity',
+        sessionId: 's-ag',
+        completedAtMs: 3000,
+        totalInputTokens: 3000,
+        cacheReadTokens: 2500,
+        outputTokens: 150,
+        tps: 140,
+        replyPreview: '请查看 [README.md](file:///Users/demo/README.md) 并验证结果',
+      },
+    ],
+    'antigravity'
+  );
+
+  assert.equal(barAnchored.querySelector('.ai-turn-meter-inline-pill')?.dataset?.atmTurnUid, 'antigravity:s-ag:t3');
+  assert.equal(barTop.querySelector('.ai-turn-meter-inline-pill')?.dataset?.atmTurnUid, 'antigravity:s-ag:t2');
+  // Bottom bar must NOT wrongly steal t1/t2 from above the t3 anchor
+  assert.equal(barBottom.querySelector('.ai-turn-meter-inline-pill'), null);
+});
+
+test('isEligibleCdpTarget, cleanTextWithoutPill style stripping, and batched apps helpers', () => {
+  const ws = 'ws://127.0.0.1:47921/devtools/page/1';
+  assert.equal(isEligibleCdpTarget({ type: 'page', webSocketDebuggerUrl: ws, url: 'https://127.0.0.1:53082/c/abc' }), true);
+  assert.equal(isEligibleCdpTarget({ type: 'page', webSocketDebuggerUrl: ws, url: 'app://-/index.html' }), true);
+  assert.equal(isEligibleCdpTarget({ type: 'page', webSocketDebuggerUrl: ws, url: 'data:text/html,hi' }), false);
+  assert.equal(isEligibleCdpTarget({ type: 'page', webSocketDebuggerUrl: ws, url: 'about:blank' }), false);
+  assert.equal(isEligibleCdpTarget({ type: 'webview', webSocketDebuggerUrl: ws, url: 'codex-sandbox://viz' }), false);
+  assert.equal(isEligibleCdpTarget({ type: 'webview', webSocketDebuggerUrl: ws, url: 'https://chatgpt.com/api/auth/session' }), false);
+  assert.equal(
+    isEligibleCdpTarget({ type: 'page', webSocketDebuggerUrl: ws, url: 'app://-/index.html?initialRoute=%2Favatar-overlay' }),
+    false
+  );
+
+  // Batch helpers use pre-fetched port Set and ps line arrays
+  const portSet = new Set([47831, 47921]);
+  assert.equal(isPortListening(47831, portSet), true);
+  assert.equal(isPortListening(47922, portSet), false);
+  assert.equal(
+    isAppRunning(
+      { installed: true, exePath: '/Applications/Cursor.app/Contents/MacOS/Cursor' },
+      ['/Applications/Cursor.app/Contents/MacOS/Cursor --remote-debugging-port=47922']
+    ),
+    true
+  );
+  assert.equal(
+    isAppRunning(
+      { installed: true, exePath: '/Applications/Cursor.app/Contents/MacOS/Cursor' },
+      ['/Applications/ChatGPT.app/Contents/MacOS/ChatGPT']
+    ),
+    false
+  );
+
+  // cleanTextWithoutPill skips <style>, <script>, <svg>
+  class NodeEl {
+    constructor(tag, { attrs = {}, rect = {}, style = {}, text = '' } = {}) {
+      this.tagName = tag.toUpperCase();
+      this.nodeType = 1;
+      this.className = '';
+      this.attrs = { ...attrs };
+      this.dataset = {};
+      this.style = { ...style };
+      this._rect = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, ...rect };
+      this._style = { display: 'flex', flexDirection: 'row', justifyContent: 'flex-end', visibility: 'visible', opacity: '1', overflowY: 'visible', ...style };
+      this.children = [];
+      this.childNodes = [];
+      this.parentElement = null;
+      if (text) this.childNodes.push({ nodeType: 3, nodeValue: text });
+      const self = this;
+      this.classList = { contains: (c) => self.className.split(/\s+/).includes(c) };
+    }
+    set textContent(v) {
+      this.children = [];
+      this.childNodes = v ? [{ nodeType: 3, nodeValue: String(v) }] : [];
+    }
+    get firstChild() { return this.childNodes[0] || null; }
+    get firstElementChild() { return this.children[0] || null; }
+    get lastElementChild() { return this.children[this.children.length - 1] || null; }
+    appendChild(ch) { ch.parentElement = this; this.children.push(ch); this.childNodes.push(ch); return ch; }
+    insertBefore(ch, ref) {
+      ch.parentElement = this;
+      const idx = ref ? this.children.indexOf(ref) : -1;
+      if (idx === -1) return this.appendChild(ch);
+      this.children.splice(idx, 0, ch);
+      this.childNodes.splice(idx, 0, ch);
+      return ch;
+    }
+    removeChild(ch) { this.children = this.children.filter((c) => c !== ch); this.childNodes = this.childNodes.filter((c) => c !== ch); ch.parentElement = null; }
+    remove() { if (this.parentElement) this.parentElement.removeChild(this); }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+    addEventListener() {}
+    getBoundingClientRect() { return this._rect; }
+    contains(other) { return other === this || this.children.some((c) => c.contains(other)); }
+    closest(sel) {
+      let cur = this;
+      while (cur) {
+        if (NodeEl.matches(cur, sel)) return cur;
+        cur = cur.parentElement;
+      }
+      return null;
+    }
+    querySelectorAll(sel) {
+      const out = [];
+      const walk = (n) => {
+        for (const c of n.children) {
+          if (NodeEl.matches(c, sel)) out.push(c);
+          walk(c);
+        }
+      };
+      walk(this);
+      return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+    static matches(el, selList) {
+      return selList.split(',').some((raw) => {
+        const s = raw.replace(':scope >', '').trim();
+        if (!s) return false;
+        if (s.startsWith('.')) return el.classList.contains(s.slice(1));
+        if (s.startsWith('#')) return el.attrs.id === s.slice(1) || el.id === s.slice(1);
+        if (s.startsWith('[')) {
+          const m = s.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/);
+          if (!m) return false;
+          const val = el.getAttribute(m[1]);
+          return m[2] !== undefined ? val === m[2] : val !== null;
+        }
+        return el.tagName === s.toUpperCase();
+      });
+    }
+  }
+
+  const body = new NodeEl('body');
+  const head = new NodeEl('head');
+  const list = new NodeEl('div', { rect: { left: 100, top: 60, right: 800, bottom: 760, width: 700, height: 700 }, style: { overflowY: 'auto' } });
+  list.scrollHeight = 1000;
+  list.clientHeight = 700;
+  body.appendChild(list);
+  const card = new NodeEl('div', { rect: { left: 120, top: 100, right: 780, bottom: 190, width: 660, height: 90 }, style: { display: 'block' } });
+  card.appendChild(new NodeEl('style', { text: '/* Copied tooltip CSS */ .copied { color: red; }' }));
+  card.appendChild(new NodeEl('div', { text: '干净的正文回复', style: { display: 'block' } }));
+  const bar = new NodeEl('div', { rect: { left: 120, top: 160, right: 780, bottom: 184, width: 660, height: 24 }, style: { display: 'flex', justifyContent: 'flex-end' } });
+  for (const lbl of ['Copy', 'Good', 'Bad']) {
+    const btn = new NodeEl('button', { rect: { left: 700, top: 162, right: 720, bottom: 182, width: 20, height: 20 }, attrs: { 'aria-label': lbl } });
+    btn.appendChild(new NodeEl('svg'));
+    bar.appendChild(btn);
+  }
+  card.appendChild(bar);
+  list.appendChild(card);
+  body.appendChild(new NodeEl('div', { attrs: { contenteditable: 'true' }, rect: { left: 120, top: 820, right: 780, bottom: 880, width: 660, height: 60 } }));
+
+  const doc = {
+    title: 'Antigravity',
+    head,
+    body,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    getElementById: (id) => [...head.children, ...body.children].find((e) => e.id === id || e.attrs.id === id) || null,
+    createElement: (tag) => new NodeEl(tag),
+    querySelector: (sel) => body.querySelector(sel),
+    querySelectorAll: (sel) => body.querySelectorAll(sel),
+  };
+  const win = {
+    location: { pathname: '/' },
+    innerWidth: 1280,
+    innerHeight: 960,
+    document: doc,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    getComputedStyle: (el) => el._style,
+  };
+  win.window = win;
+  class FakeMutationObserver { observe() {} disconnect() {} }
+  new Function('window', 'document', 'MutationObserver', 'setTimeout', 'clearTimeout', buildInjectedRuntimeSource())(
+    win,
+    doc,
+    FakeMutationObserver,
+    () => 0,
+    () => {}
+  );
+  win.__aiTurnMeterUpdateTurns(
+    [
+      {
+        turnUid: 'antigravity:s-clean:t1',
+        tool: 'antigravity',
+        sessionId: 's-clean',
+        completedAtMs: 1000,
+        totalInputTokens: 500,
+        cacheReadTokens: 300,
+        outputTokens: 50,
+        tps: 90,
+        replyPreview: '干净的正文回复',
+      },
+    ],
+    'antigravity'
+  );
+  assert.equal(bar.dataset.atmMsgSig.includes('Copied'), false);
+  assert.equal(bar.dataset.atmMsgSig.includes('干净的正文回复'), true);
 });

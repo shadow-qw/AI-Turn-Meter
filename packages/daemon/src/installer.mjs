@@ -12,7 +12,13 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { APP_SPECS, DEFAULT_DAEMON_PORT, readActivePort, resolveAppPaths } from './apps.mjs';
+import {
+  APP_SPECS,
+  DEFAULT_DAEMON_PORT,
+  readActivePort,
+  readListeningTcpPorts,
+  resolveAppPaths,
+} from './apps.mjs';
 
 export const LAUNCH_AGENT_LABEL = 'com.local.ai-turn-meter.daemon';
 export const VSIX_EXT_ID = 'local-ai-turn-meter.ai-turn-meter';
@@ -229,7 +235,10 @@ export function installCliLink({
   }
   const cliSrc = join(root, 'packages', 'daemon', 'bin', 'cli.mjs');
   const cliDst = join(homeDir, '.local', 'bin', 'ai-turn-meter');
-  if (process.env.AI_TURN_METER_STABLE_ROOT && process.env.AI_TURN_METER_NODE_BIN) {
+  if (
+    (process.env.AI_TURN_METER_STABLE_ROOT && process.env.AI_TURN_METER_NODE_BIN) ||
+    root.includes('.app/Contents/Resources/runtime')
+  ) {
     log(`Write CLI wrapper: ${cliDst}`);
     if (!dryRun) {
       mkdirSync(dirname(cliDst), { recursive: true });
@@ -362,7 +371,7 @@ export async function installAll({
   patchCursorHooks({ dryRun, homeDir, hookCmd: buildHookCommand({ nodeBin, root }), log });
   installVsix({ dryRun, root, homeDir, log });
   removeLegacyApps({ dryRun, homeDir, log });
-  if (!skipCliLink) installCliLink({ dryRun, root, homeDir, log });
+  if (!skipCliLink) installCliLink({ dryRun, root, nodeBin, homeDir, log });
   if (!skipLaunchAgent) installLaunchAgent({ dryRun, nodeBin, root, homeDir, log });
   log('Install complete.');
 }
@@ -428,10 +437,11 @@ export async function runDoctor({ port = DEFAULT_DAEMON_PORT, homeDir = homedir(
     }
   }
 
+  const listeningPorts = readListeningTcpPorts();
   const apps = {};
   for (const [key, spec] of Object.entries(APP_SPECS)) {
     const info = resolveAppPaths(spec, { homeDir });
-    const cdpPort = info.installed ? readActivePort(info, homeDir) : null;
+    const cdpPort = info.installed ? readActivePort(info, homeDir, listeningPorts) : null;
     let vsixVersion = null;
     if (info.cliPath) {
       try {

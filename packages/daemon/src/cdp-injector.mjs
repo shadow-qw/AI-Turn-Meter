@@ -30,7 +30,7 @@ export function getDefaultCdpSpecs() {
  */
 export function buildInjectedRuntimeSource() {
   return `(() => {
-  const RUNTIME_VERSION = 10;
+  const RUNTIME_VERSION = 12;
   if (window.__aiTurnMeterVersion === RUNTIME_VERSION) return;
   if (typeof window.__aiTurnMeterCleanup === 'function') {
     try { window.__aiTurnMeterCleanup(); } catch {}
@@ -279,6 +279,10 @@ export function buildInjectedRuntimeSource() {
         return;
       }
       if (node.nodeType !== 1) return;
+      const tag = (node.tagName || '').toUpperCase();
+      if (tag === 'STYLE' || tag === 'SCRIPT' || tag === 'SVG' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') {
+        return;
+      }
       if (node.classList?.contains(PILL_CLASS) || node.id === POPOVER_ID || node.id === 'ai-turn-meter-inline-pill') {
         return;
       }
@@ -435,6 +439,8 @@ export function buildInjectedRuntimeSource() {
 
   function normalizeMatchText(s) {
     return String(s || '')
+      .replace(/!\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1')
+      .replace(/\\[([^\\]]+)\\]\\([^)]*\\)/g, '$1')
       .replace(/[\\x60*_>#~\\[\\]]+/g, ' ')
       .replace(/\\s+/g, ' ')
       .trim();
@@ -465,19 +471,72 @@ export function buildInjectedRuntimeSource() {
     // Pass 1: exact text preview match (prioritize longer previews)
     const previewPool = pool
       .filter((t) => typeof t.replyPreview === 'string' && t.replyPreview.length >= 4)
-      .sort((a, b) => b.replyPreview.length - a.replyPreview.length);
+      .sort(
+        (a, b) =>
+          b.replyPreview.length - a.replyPreview.length ||
+          (b.completedAtMs || 0) - (a.completedAtMs || 0)
+      );
 
     for (const f of footers) {
-      const hit = previewPool.find((t) => !usedTurnUids.has(t.turnUid) && matchPreview(f.contextText, t.replyPreview));
+      const hit = previewPool.find(
+        (t) => !usedTurnUids.has(t.turnUid) && matchPreview(f.contextText, t.replyPreview)
+      );
       if (hit) {
         assignedByFooter.set(f, hit);
         usedTurnUids.add(hit.turnUid);
-        if (!detectedSessionId) detectedSessionId = hit.sessionId;
       }
+    }
+
+    if (!detectedSessionId && assignedByFooter.size > 0) {
+      const sessionStats = new Map();
+      for (const hit of assignedByFooter.values()) {
+        const cur = sessionStats.get(hit.sessionId) || { count: 0, maxLen: 0, latestMs: 0 };
+        cur.count += 1;
+        cur.maxLen = Math.max(cur.maxLen, (hit.replyPreview || '').length);
+        cur.latestMs = Math.max(cur.latestMs, hit.completedAtMs || 0);
+        sessionStats.set(hit.sessionId, cur);
+      }
+      let bestSid = null;
+      let bestStat = null;
+      for (const [sid, st] of sessionStats.entries()) {
+        if (
+          !bestStat ||
+          st.count > bestStat.count ||
+          (st.count === bestStat.count && st.maxLen > bestStat.maxLen) ||
+          (st.count === bestStat.count &&
+            st.maxLen === bestStat.maxLen &&
+            st.latestMs > bestStat.latestMs)
+        ) {
+          bestSid = sid;
+          bestStat = st;
+        }
+      }
+      detectedSessionId = bestSid;
     }
 
     if (detectedSessionId) {
       pool = pool.filter((t) => t.sessionId === detectedSessionId);
+      let evicted = false;
+      for (const [f, t] of Array.from(assignedByFooter.entries())) {
+        if (t.sessionId !== detectedSessionId) {
+          assignedByFooter.delete(f);
+          usedTurnUids.delete(t.turnUid);
+          evicted = true;
+        }
+      }
+      if (evicted) {
+        const scopedPreviewPool = previewPool.filter((t) => t.sessionId === detectedSessionId);
+        for (const f of footers) {
+          if (assignedByFooter.has(f)) continue;
+          const hit = scopedPreviewPool.find(
+            (t) => !usedTurnUids.has(t.turnUid) && matchPreview(f.contextText, t.replyPreview)
+          );
+          if (hit) {
+            assignedByFooter.set(f, hit);
+            usedTurnUids.add(hit.turnUid);
+          }
+        }
+      }
     }
 
     // Pass 2: preserve already-mounted turn pins when the message wrapper wasn't recycled
@@ -487,15 +546,21 @@ export function buildInjectedRuntimeSource() {
       const prevUid = existingPill?.dataset?.atmTurnUid;
       const prevSig = f.el.dataset?.atmMsgSig || '';
       if (prevUid && !usedTurnUids.has(prevUid) && prevSig === f.msgSig) {
-        const found = pool.find((t) => t.turnUid === prevUid);
+        const found = pool.find(
+          (t) => t.turnUid === prevUid && (!detectedSessionId || t.sessionId === detectedSessionId)
+        );
         if (found) {
           assignedByFooter.set(f, found);
           usedTurnUids.add(found.turnUid);
+          if (!detectedSessionId) {
+            detectedSessionId = found.sessionId;
+            pool = pool.filter((t) => t.sessionId === detectedSessionId);
+          }
         }
       }
     }
 
-    // Pass 3: align remaining session turns chronologically bottom-up onto unmatched footers
+    // Pass 3: align remaining session turns chronologically bottom-up within anchored segments
     let workspaceSessionId = null;
     if (!detectedSessionId && !urlSessionId) {
       const rawTitle = (document.title || '').split(' [')[0].split(' — ')[0].trim();
@@ -510,20 +575,53 @@ export function buildInjectedRuntimeSource() {
       workspaceSessionId ||
       (!urlSessionId && pool.every((t) => !t.replyPreview) ? pool[0]?.sessionId : null);
     if (activeSessionId) {
-      const unusedFooters = footers.filter((f) => !assignedByFooter.has(f));
-      const unusedTurns = pool
-        .filter((t) => t.sessionId === activeSessionId && !usedTurnUids.has(t.turnUid))
+      const sessionTurns = pool
+        .filter((t) => t.sessionId === activeSessionId)
         .sort((a, b) => (a.completedAtMs || 0) - (b.completedAtMs || 0));
 
-      let fi = unusedFooters.length - 1;
-      let ti = unusedTurns.length - 1;
-      while (fi >= 0 && ti >= 0) {
-        const f = unusedFooters[fi];
-        const t = unusedTurns[ti];
-        assignedByFooter.set(f, t);
-        usedTurnUids.add(t.turnUid);
-        fi -= 1;
-        ti -= 1;
+      const anchorIndices = [];
+      for (let i = 0; i < footers.length; i += 1) {
+        if (assignedByFooter.has(footers[i])) anchorIndices.push(i);
+      }
+
+      if (anchorIndices.length === 0) {
+        const unusedTurns = sessionTurns.filter((t) => !usedTurnUids.has(t.turnUid));
+        let fi = footers.length - 1;
+        let ti = unusedTurns.length - 1;
+        while (fi >= 0 && ti >= 0) {
+          assignedByFooter.set(footers[fi], unusedTurns[ti]);
+          usedTurnUids.add(unusedTurns[ti].turnUid);
+          fi -= 1;
+          ti -= 1;
+        }
+      } else {
+        const segStarts = [-1, ...anchorIndices];
+        const segEnds = [...anchorIndices, footers.length];
+        for (let s = 0; s < segStarts.length; s += 1) {
+          const leftIdx = segStarts[s];
+          const rightIdx = segEnds[s];
+          if (rightIdx - leftIdx <= 1) continue;
+          const lowerTurn = leftIdx >= 0 ? assignedByFooter.get(footers[leftIdx]) : null;
+          const upperTurn = rightIdx < footers.length ? assignedByFooter.get(footers[rightIdx]) : null;
+          const lowerMs = lowerTurn ? lowerTurn.completedAtMs || 0 : -Infinity;
+          const upperMs = upperTurn ? upperTurn.completedAtMs || 0 : Infinity;
+          if (lowerMs > upperMs) continue;
+
+          const segFooters = footers.slice(leftIdx + 1, rightIdx);
+          const segTurns = sessionTurns.filter((t) => {
+            if (usedTurnUids.has(t.turnUid)) return false;
+            const ms = t.completedAtMs || 0;
+            return ms >= lowerMs && ms <= upperMs;
+          });
+          let fi = segFooters.length - 1;
+          let ti = segTurns.length - 1;
+          while (fi >= 0 && ti >= 0) {
+            assignedByFooter.set(segFooters[fi], segTurns[ti]);
+            usedTurnUids.add(segTurns[ti].turnUid);
+            fi -= 1;
+            ti -= 1;
+          }
+        }
       }
     }
 
@@ -671,6 +769,34 @@ export function buildInjectedRuntimeSource() {
 })();`;
 }
 
+const IGNORED_CDP_URL_PREFIXES = [
+  'devtools://',
+  'chrome-extension://',
+  'chrome://',
+  'data:',
+  'about:',
+  'blob:',
+  'codex-sandbox://',
+];
+
+export function isEligibleCdpTarget(t) {
+  if (!t || typeof t !== 'object') return false;
+  if (t.type !== 'page' && t.type !== 'webview') return false;
+  if (typeof t.webSocketDebuggerUrl !== 'string' || !t.webSocketDebuggerUrl.startsWith('ws://127.0.0.1')) {
+    return false;
+  }
+  if (typeof t.url !== 'string' || t.url.length === 0) return false;
+  if (IGNORED_CDP_URL_PREFIXES.some((prefix) => t.url.startsWith(prefix))) return false;
+  if (
+    t.url.includes('/api/auth/') ||
+    t.url.includes('initialRoute=%2Favatar-overlay') ||
+    t.url.includes('initialRoute=/avatar-overlay')
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Multi-host loopback CDP inline pill injector.
  */
@@ -714,16 +840,7 @@ export class CdpInlineInjector {
       if (!res.ok) return [];
       const targets = await res.json();
       if (!Array.isArray(targets)) return [];
-      return targets.filter(
-        (t) =>
-          (t.type === 'page' || t.type === 'webview') &&
-          typeof t.webSocketDebuggerUrl === 'string' &&
-          t.webSocketDebuggerUrl.startsWith('ws://127.0.0.1') &&
-          typeof t.url === 'string' &&
-          !t.url.startsWith('devtools://') &&
-          !t.url.startsWith('chrome-extension://') &&
-          !t.url.startsWith('chrome://')
-      );
+      return targets.filter(isEligibleCdpTarget);
     } catch {
       return [];
     } finally {

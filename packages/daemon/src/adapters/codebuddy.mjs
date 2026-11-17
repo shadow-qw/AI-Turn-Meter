@@ -39,8 +39,13 @@ function extractWorkspaceFromMessageObj(msgObj) {
 
 function extractAssistantText(msgObj) {
   try {
-    const inner = typeof msgObj.message === 'string' ? JSON.parse(msgObj.message) : msgObj.message;
-    const content = inner?.content;
+    const inner =
+      msgObj?.message !== undefined
+        ? typeof msgObj.message === 'string'
+          ? JSON.parse(msgObj.message)
+          : msgObj.message
+        : msgObj;
+    const content = inner?.content ?? msgObj?.content;
     if (typeof content === 'string') return content.trim() || null;
     if (Array.isArray(content)) {
       const joined = content
@@ -220,6 +225,7 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
         toolWaitMs: 0,
         lastToolStartMs: null,
         lastEventType: 'user',
+        replyPreview: null,
       };
       continue;
     }
@@ -227,6 +233,14 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
     if (!current) continue;
     if (tsMs !== null) current.lastAtMs = tsMs;
     current.lastEventType = obj.type;
+
+    if (
+      obj.role === 'assistant' &&
+      (obj.type === 'message' || obj.content !== undefined || obj.message !== undefined)
+    ) {
+      const text = extractAssistantText(obj);
+      if (text) current.replyPreview = text;
+    }
 
     if (obj.type === 'function_call' && tsMs !== null) {
       current.lastToolStartMs = tsMs;
@@ -312,6 +326,7 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
       modelActiveMs,
       ttftMs: null,
       tpsMethod: rt.toolWaitMs > 0 ? 'e2e_minus_tools' : 'e2e_turn',
+      replyPreview: rt.replyPreview || null,
     });
   }
 

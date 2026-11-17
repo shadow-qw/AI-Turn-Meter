@@ -97,8 +97,49 @@ export function resolveAppPaths(spec, opts = {}) {
   };
 }
 
-export function isPortListening(port) {
+/**
+ * Collect all currently listening TCP ports in a single `lsof` invocation.
+ * @returns {Set<number> | null}
+ */
+export function readListeningTcpPorts() {
+  try {
+    const out = execFileSync('/usr/sbin/lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-Fn'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const ports = new Set();
+    for (const line of out.split(/\r?\n/)) {
+      if (!line.startsWith('n')) continue;
+      const m = line.match(/:(\d+)(?:\s|$)/);
+      if (m) ports.add(Number(m[1]));
+    }
+    return ports;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Collect all process command lines in a single `ps` invocation.
+ * @returns {string[] | null}
+ */
+export function readProcessCommandLines() {
+  try {
+    const out = execFileSync('/bin/ps', ['-axo', 'command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.split(/\r?\n/);
+  } catch {
+    return null;
+  }
+}
+
+export function isPortListening(port, listeningPorts = null) {
   if (!port) return false;
+  if (listeningPorts instanceof Set) {
+    return listeningPorts.has(Number(port));
+  }
   try {
     execFileSync('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], { stdio: 'ignore' });
     return true;
@@ -107,8 +148,11 @@ export function isPortListening(port) {
   }
 }
 
-export function isAppRunning(spec) {
+export function isAppRunning(spec, processLines = null) {
   if (!spec?.installed || !spec?.exePath) return false;
+  if (Array.isArray(processLines)) {
+    return processLines.some((line) => line.includes(spec.exePath));
+  }
   try {
     execFileSync('pgrep', ['-f', spec.exePath], { stdio: 'ignore' });
     return true;
@@ -117,13 +161,13 @@ export function isAppRunning(spec) {
   }
 }
 
-export function readActivePort(spec, homeDir = homedir()) {
-  if (spec.port) return isPortListening(spec.port) ? spec.port : null;
+export function readActivePort(spec, homeDir = homedir(), listeningPorts = null) {
+  if (spec.port) return isPortListening(spec.port, listeningPorts) ? spec.port : null;
   const portFile = spec.portFile || (spec.portFileRel ? join(homeDir, ...spec.portFileRel) : null);
   if (portFile && existsSync(portFile)) {
     try {
       const p = Number(readFileSync(portFile, 'utf8').trim().split(/\r?\n/)[0]);
-      return Number.isInteger(p) && isPortListening(p) ? p : null;
+      return Number.isInteger(p) && isPortListening(p, listeningPorts) ? p : null;
     } catch {
       return null;
     }
@@ -177,16 +221,12 @@ export function extractPreservableArgs(commandLine, exePath) {
  */
 export function readRunningProcessArgs(spec) {
   if (!spec?.exePath) return [];
-  try {
-    const out = execFileSync('/bin/ps', ['-axo', 'command='], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    for (const line of out.split(/\r?\n/)) {
-      const args = extractPreservableArgs(line, spec.exePath);
-      if (args.length > 0) return args;
-    }
-  } catch {}
+  const lines = readProcessCommandLines();
+  if (!lines) return [];
+  for (const line of lines) {
+    const args = extractPreservableArgs(line, spec.exePath);
+    if (args.length > 0) return args;
+  }
   return [];
 }
 
@@ -198,15 +238,8 @@ export function readRunningProcessArgs(spec) {
 export function hasAppHelpersRunning(spec) {
   if (!spec?.installed || !spec?.appPath) return false;
   const frameworksMarker = join(spec.appPath, 'Contents', 'Frameworks');
-  try {
-    const out = execFileSync('/bin/ps', ['-axo', 'command='], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return out.split(/\r?\n/).some((line) => line.includes(frameworksMarker));
-  } catch {
-    return false;
-  }
+  const lines = readProcessCommandLines();
+  return lines ? lines.some((line) => line.includes(frameworksMarker)) : false;
 }
 
 /**
