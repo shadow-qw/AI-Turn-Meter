@@ -30,7 +30,7 @@ export function getDefaultCdpSpecs() {
  */
 export function buildInjectedRuntimeSource() {
   return `(() => {
-  const RUNTIME_VERSION = 9;
+  const RUNTIME_VERSION = 10;
   if (window.__aiTurnMeterVersion === RUNTIME_VERSION) return;
   if (typeof window.__aiTurnMeterCleanup === 'function') {
     try { window.__aiTurnMeterCleanup(); } catch {}
@@ -330,18 +330,23 @@ export function buildInjectedRuntimeSource() {
         continue;
       }
 
+      const isIdeChat = activeTool === 'cursor' || activeTool === 'codebuddy';
+      const isExplicitCursorFooter =
+        activeTool === 'cursor' &&
+        (el.classList?.contains('agent-transcript-turn-actions') ||
+          el.classList?.contains('agent-transcript-turn-actions-trailing'));
+
       const rect = el.getBoundingClientRect();
       if (rect.left < cRect.left - 64 || rect.right > cRect.right + 64) continue;
-      if (rect.width < 70 || rect.width > cRect.width + 64) continue;
+      if (rect.width < (isExplicitCursorFooter ? 40 : 70) || rect.width > cRect.width + 64) continue;
       if (rect.height < 16 || rect.height > 56) continue;
       if (rect.top < minTop || rect.bottom > cRect.top + 8) continue;
 
       const btns = Array.from(el.querySelectorAll('button'));
-      const isIdeChat = activeTool === 'cursor' || activeTool === 'codebuddy';
-      const minBtns = isIdeChat ? 2 : 3;
+      const minBtns = isExplicitCursorFooter ? 1 : isIdeChat ? 2 : 3;
       if (btns.length < minBtns || btns.length > 7) continue;
       const svgBtns = btns.filter((b) => b.querySelector('svg, .codicon, [data-icon-name], .ui-icon'));
-      if (svgBtns.length < 2) continue;
+      if (svgBtns.length < (isExplicitCursorFooter ? 1 : 2)) continue;
 
       const style = window.getComputedStyle(el);
       if (!style.display.includes('flex') || style.flexDirection.startsWith('column')) continue;
@@ -350,10 +355,6 @@ export function buildInjectedRuntimeSource() {
       const text = cleanTextWithoutPill(el);
       if (text.length > 48) continue;
 
-      const isExplicitCursorFooter =
-        activeTool === 'cursor' &&
-        (el.classList?.contains('agent-transcript-turn-actions') ||
-          el.classList?.contains('agent-transcript-turn-actions-trailing'));
       const hasTimeHint = /(?:just now|ago|刚刚|秒前|分钟前|小时前|星期|今天|昨天|\\d{1,2}:\\d{2}|\\d+[smh])/i.test(text);
       if (isIdeChat && btns.length === 2 && !hasTimeHint && !isExplicitCursorFooter) continue;
 
@@ -361,6 +362,7 @@ export function buildInjectedRuntimeSource() {
       const alignRight = isIdeChat && style.justifyContent !== 'flex-end' && firstBtnOffset <= 24;
 
       const score =
+        (isExplicitCursorFooter && el.classList?.contains('agent-transcript-turn-actions') ? 1000 : 0) +
         (hasTimeHint ? 2000 : 0) +
         (btns.length >= 3 && btns.length <= 6 ? 600 : 0) +
         Math.round(rect.width * 0.2) -
@@ -394,6 +396,28 @@ export function buildInjectedRuntimeSource() {
     const footerEls = deduped.map((d) => d.el);
 
     for (const f of deduped) {
+      const vRow = f.el.closest?.('.virtualized-composer-messages-row');
+      if (vRow && vRow.parentElement) {
+        const chunks = [];
+        let totalLen = 0;
+        let prev = vRow.previousElementSibling;
+        for (let i = 0; i < 16 && prev && totalLen < 2500; i += 1) {
+          if (footerEls.some((fe) => prev === fe || prev.contains(fe))) break;
+          const hasHumanMarker =
+            prev.getAttribute?.('data-human-row') === 'true' ||
+            Boolean(prev.querySelector?.('[data-human-row="true"]'));
+          const txt = cleanTextWithoutPill(prev);
+          if (txt) {
+            chunks.unshift(txt);
+            totalLen += txt.length;
+          }
+          if (hasHumanMarker) break;
+          prev = prev.previousElementSibling;
+        }
+        f.contextText = chunks.join(' ');
+        f.msgSig = f.contextText.slice(0, 64);
+        continue;
+      }
       let msgBox = f.el.parentElement;
       let cur = msgBox;
       for (let i = 0; i < 5 && cur && cur !== scrollRoot && cur !== document.body; i += 1) {
@@ -409,12 +433,22 @@ export function buildInjectedRuntimeSource() {
     return { scrollRoot, footers: deduped };
   }
 
+  function normalizeMatchText(s) {
+    return String(s || '')
+      .replace(/[\\x60*_>#~\\[\\]]+/g, ' ')
+      .replace(/\\s+/g, ' ')
+      .trim();
+  }
+
   function matchPreview(contextText, preview) {
-    if (!contextText || !preview || preview.length < 4) return false;
+    if (!contextText || !preview) return false;
     if (contextText.includes(preview)) return true;
-    if (preview.length >= 24) {
-      return contextText.includes(preview.slice(0, 24));
-    }
+    const normCtx = normalizeMatchText(contextText);
+    const normPre = normalizeMatchText(preview);
+    if (normPre.length < 4) return false;
+    if (normCtx.includes(normPre)) return true;
+    if (normPre.length >= 24 && normCtx.includes(normPre.slice(0, 24))) return true;
+    if (normPre.length >= 12 && normCtx.includes(normPre.slice(-Math.min(24, normPre.length)))) return true;
     return false;
   }
 
@@ -462,7 +496,19 @@ export function buildInjectedRuntimeSource() {
     }
 
     // Pass 3: align remaining session turns chronologically bottom-up onto unmatched footers
-    const activeSessionId = detectedSessionId || (!urlSessionId && pool.every((t) => !t.replyPreview) ? pool[0]?.sessionId : null);
+    let workspaceSessionId = null;
+    if (!detectedSessionId && !urlSessionId) {
+      const rawTitle = (document.title || '').split(' [')[0].split(' — ')[0].trim();
+      const wsMatch = rawTitle
+        ? pool.find((t) => typeof t.workspacePath === 'string' && t.workspacePath.split('/').pop() === rawTitle)
+        : null;
+      if (wsMatch) workspaceSessionId = wsMatch.sessionId;
+      else if (new Set(pool.map((t) => t.sessionId)).size === 1) workspaceSessionId = pool[0]?.sessionId;
+    }
+    const activeSessionId =
+      detectedSessionId ||
+      workspaceSessionId ||
+      (!urlSessionId && pool.every((t) => !t.replyPreview) ? pool[0]?.sessionId : null);
     if (activeSessionId) {
       const unusedFooters = footers.filter((f) => !assignedByFooter.has(f));
       const unusedTurns = pool

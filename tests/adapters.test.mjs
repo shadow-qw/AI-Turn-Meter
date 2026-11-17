@@ -700,7 +700,7 @@ test('CdpInlineInjector resolves static ports and DevToolsActivePort files clean
 test('Injected popover script compiles and supports multi-turn non-clobbering pills', () => {
   const src = buildInjectedRuntimeSource();
   new Function(src);
-  assert.match(src, /RUNTIME_VERSION = 9/);
+  assert.match(src, /RUNTIME_VERSION = 10/);
   assert.match(src, /agent-transcript-turn-actions/);
   assert.match(src, /__aiTurnMeterUpdateTurns/);
   assert.match(src, /data-align/);
@@ -815,4 +815,240 @@ test('extractPreservableArgs preserves existing wrapper flags and drops old debu
     ),
     []
   );
+});
+
+test('Injected runtime mounts right-aligned pills onto Cursor virtualized turn-actions rows', () => {
+  class MiniEl {
+    constructor(tag, { className = '', attrs = {}, rect = {}, style = {}, text = '' } = {}) {
+      this.tagName = tag.toUpperCase();
+      this.nodeType = 1;
+      this.className = className;
+      this.attrs = { ...attrs };
+      this.dataset = {};
+      this.style = { ...style };
+      this._rect = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, ...rect };
+      this._style = { display: 'block', flexDirection: 'row', justifyContent: 'normal', visibility: 'visible', opacity: '1', overflowY: 'visible', ...style };
+      this.children = [];
+      this.childNodes = [];
+      this.parentElement = null;
+      this._text = text;
+      if (text) this.childNodes.push({ nodeType: 3, nodeValue: text });
+      const self = this;
+      this.classList = {
+        contains: (c) => self.className.split(/\s+/).includes(c),
+        add: (c) => {
+          if (!self.classList.contains(c)) self.className = `${self.className} ${c}`.trim();
+        },
+      };
+    }
+    set textContent(v) {
+      this._text = String(v);
+      this.children = [];
+      this.childNodes = v ? [{ nodeType: 3, nodeValue: String(v) }] : [];
+    }
+    get firstChild() { return this.childNodes[0] || null; }
+    get lastElementChild() { return this.children[this.children.length - 1] || null; }
+    get previousElementSibling() {
+      if (!this.parentElement) return null;
+      const idx = this.parentElement.children.indexOf(this);
+      return idx > 0 ? this.parentElement.children[idx - 1] : null;
+    }
+    appendChild(ch) {
+      ch.parentElement = this;
+      this.children.push(ch);
+      this.childNodes.push(ch);
+      return ch;
+    }
+    insertBefore(ch, ref) {
+      ch.parentElement = this;
+      const idx = ref ? this.children.indexOf(ref) : -1;
+      if (idx === -1) return this.appendChild(ch);
+      this.children.splice(idx, 0, ch);
+      this.childNodes.splice(idx, 0, ch);
+      return ch;
+    }
+    removeChild(ch) {
+      this.children = this.children.filter((c) => c !== ch);
+      this.childNodes = this.childNodes.filter((c) => c !== ch);
+      ch.parentElement = null;
+    }
+    remove() {
+      if (this.parentElement) this.parentElement.removeChild(this);
+    }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+    addEventListener() {}
+    getBoundingClientRect() { return this._rect; }
+    contains(other) {
+      if (other === this) return true;
+      return this.children.some((c) => c.contains(other));
+    }
+    closest(sel) {
+      let cur = this;
+      while (cur) {
+        if (MiniEl.matches(cur, sel)) return cur;
+        cur = cur.parentElement;
+      }
+      return null;
+    }
+    querySelectorAll(sel) {
+      const out = [];
+      const walk = (n) => {
+        for (const c of n.children) {
+          if (MiniEl.matches(c, sel)) out.push(c);
+          walk(c);
+        }
+      };
+      walk(this);
+      return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+    static matches(el, selList) {
+      return selList.split(',').some((raw) => {
+        const s = raw.replace(':scope >', '').trim();
+        if (!s) return false;
+        if (s.startsWith('.')) return el.classList.contains(s.slice(1));
+        if (s.startsWith('#')) return el.attrs.id === s.slice(1) || el.id === s.slice(1);
+        if (s.startsWith('[')) {
+          const m = s.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/);
+          if (!m) return false;
+          const val = el.getAttribute(m[1]);
+          return m[2] !== undefined ? val === m[2] : val !== null;
+        }
+        return el.tagName === s.toUpperCase();
+      });
+    }
+  }
+
+  const body = new MiniEl('body');
+  const head = new MiniEl('head');
+  const scroller = new MiniEl('div', {
+    className: 'virtualized-composer-messages-scroll-container',
+    rect: { left: 1205, top: 57, right: 1921, bottom: 925, width: 716, height: 868 },
+    style: { overflowY: 'auto' },
+  });
+  scroller.scrollHeight = 2400;
+  scroller.clientHeight = 868;
+  const plane = new MiniEl('div', { className: 'composer-react-virtual-plane', rect: { left: 1205, top: 57, right: 1921, bottom: 925, width: 716, height: 868 } });
+  scroller.appendChild(plane);
+  body.appendChild(scroller);
+
+  function addTurn(yMsg, replyText, yAct, timeText, pending = false) {
+    const uRow = new MiniEl('div', { className: 'composer-react-virtual-plane-row virtualized-composer-messages-row', attrs: { 'data-human-row': 'true' }, text: '1' });
+    plane.appendChild(uRow);
+    const mRow = new MiniEl('div', { className: 'composer-react-virtual-plane-row virtualized-composer-messages-row', text: replyText, rect: { left: 1221, top: yMsg, right: 1905, bottom: yMsg + 40, width: 684, height: 40 } });
+    plane.appendChild(mRow);
+    const aRow = new MiniEl('div', { className: 'composer-react-virtual-plane-row virtualized-composer-messages-row', rect: { left: 1221, top: yAct, right: 1905, bottom: yAct + 30, width: 684, height: 30 } });
+    const rowInner = new MiniEl('div', { className: 'agent-transcript-row agent-transcript-row-turn-actions', attrs: pending ? { 'data-pending': 'true' } : {}, rect: { left: 1221, top: yAct, right: 1905, bottom: yAct + 30, width: 684, height: 30 } });
+    const bar = new MiniEl('div', { className: 'agent-transcript-turn-actions', rect: { left: 1232, top: yAct, right: 1894, bottom: yAct + 24, width: 662, height: 24 }, style: { display: 'flex', justifyContent: 'normal' } });
+    const trailing = new MiniEl('div', { className: 'agent-transcript-turn-actions-trailing', rect: { left: 1232, top: yAct, right: 1330, bottom: yAct + 24, width: 98, height: 24 }, style: { display: 'flex' } });
+    for (const label of ['Copy message', 'Fork chat']) {
+      const btn = new MiniEl('button', { rect: { left: 1236, top: yAct + 2, right: 1254, bottom: yAct + 20, width: 18, height: 18 }, attrs: { 'aria-label': label } });
+      btn.appendChild(new MiniEl('svg', { className: 'ui-icon cursor-icon' }));
+      trailing.appendChild(btn);
+    }
+    trailing.appendChild(new MiniEl('span', { text: timeText }));
+    bar.appendChild(trailing);
+    rowInner.appendChild(bar);
+    aRow.appendChild(rowInner);
+    plane.appendChild(aRow);
+    return bar;
+  }
+
+  const bar1 = addTurn(200, '我是 **Grok 4.7**，第一轮回答。', 250, '5m ago');
+  const bar2 = addTurn(400, '第二轮已通过 **Remote-SSH** 验证完成。', 450, '1m ago');
+  const barPending = addTurn(600, 'Planning...', 650, 'now', true);
+
+  const composer = new MiniEl('div', {
+    className: 'aislash-editor-input',
+    attrs: { contenteditable: 'true', role: 'textbox', 'aria-label': 'Prompt' },
+    rect: { left: 1232, top: 961, right: 1894, bottom: 983, width: 662, height: 22 },
+  });
+  body.appendChild(composer);
+
+  const doc = {
+    title: 'workspace [SSH: example-host]',
+    head,
+    body,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    getElementById: (id) => [...head.children, ...body.children].find((e) => e.id === id || e.attrs.id === id) || null,
+    createElement: (tag) => new MiniEl(tag),
+    querySelector: (sel) => body.querySelector(sel),
+    querySelectorAll: (sel) => body.querySelectorAll(sel),
+  };
+  const win = {
+    location: { pathname: '/' },
+    innerWidth: 1920,
+    innerHeight: 1080,
+    document: doc,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    getComputedStyle: (el) => el._style,
+  };
+  win.window = win;
+  class FakeMutationObserver {
+    observe() {}
+    disconnect() {}
+  }
+  const fn = new Function(
+    'window',
+    'document',
+    'MutationObserver',
+    'setTimeout',
+    'clearTimeout',
+    buildInjectedRuntimeSource()
+  );
+  fn(win, doc, FakeMutationObserver, () => 0, () => {});
+
+  const turns = [
+    {
+      turnUid: 'cursor:ssh-1:t1',
+      tool: 'cursor',
+      sessionId: 'ssh-1',
+      workspacePath: '/data/workspace',
+      completedAtMs: 1000,
+      totalInputTokens: 16800,
+      cacheReadTokens: 6144,
+      outputTokens: 479,
+      cacheRatePct: 36.6,
+      tps: 59.6,
+      replyPreview: '我是 Grok 4.7，第一轮回答。',
+    },
+    {
+      turnUid: 'cursor:ssh-1:t2',
+      tool: 'cursor',
+      sessionId: 'ssh-1',
+      workspacePath: '/data/workspace',
+      completedAtMs: 2000,
+      totalInputTokens: 24000,
+      cacheReadTokens: 12000,
+      outputTokens: 610,
+      cacheRatePct: 50,
+      tps: 64.2,
+      replyPreview: '第二轮已通过 **Remote-SSH** 验证完成。',
+    },
+    {
+      turnUid: 'cursor:other:t9',
+      tool: 'cursor',
+      sessionId: 'other',
+      workspacePath: '/Users/dev/other',
+      completedAtMs: 3000,
+      totalInputTokens: 99999,
+      outputTokens: 999,
+      tps: 99,
+      replyPreview: '其他窗口会话内容',
+    },
+  ];
+  win.__aiTurnMeterUpdateTurns(turns, 'cursor');
+
+  assert.equal(bar1.lastElementChild.classList.contains('ai-turn-meter-inline-pill'), true);
+  assert.equal(bar1.lastElementChild.getAttribute('data-align'), 'right');
+  assert.equal(bar1.lastElementChild.dataset.atmTurnUid, 'cursor:ssh-1:t1');
+
+  assert.equal(bar2.lastElementChild.classList.contains('ai-turn-meter-inline-pill'), true);
+  assert.equal(bar2.lastElementChild.getAttribute('data-align'), 'right');
+  assert.equal(bar2.lastElementChild.dataset.atmTurnUid, 'cursor:ssh-1:t2');
+
+  assert.equal(barPending.querySelector('.ai-turn-meter-inline-pill'), null);
 });
