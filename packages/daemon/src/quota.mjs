@@ -564,33 +564,28 @@ export async function getAllQuotas(nowMs = Date.now(), { forceRefresh = false, a
 
     const overviewWindows = [];
     if (codex.quotaWindows.length > 0) {
-      const sessionWin = codex.quotaWindows[0];
-      const weeklyWin = codex.quotaWindows[1];
-      const weeklyNote = weeklyWin ? `每周剩余 ${Math.round(weeklyWin.remainingPct)}%` : null;
+      const c5h = codex.quotaWindows[0];
+      const cWk = codex.quotaWindows[1];
       overviewWindows.push({
-        ...sessionWin,
+        ...c5h,
         id: 'overview-codex',
-        title: `Codex ${sessionWin.title}`,
-        subtitle: weeklyNote
-          ? sessionWin.subtitle
-            ? `${weeklyNote} · ${sessionWin.subtitle}`
-            : weeklyNote
-          : sessionWin.subtitle,
+        title: `Codex ${c5h.title}`,
+        subtitle: c5h.subtitle
+          ? `${c5h.subtitle}${cWk ? ` · 每周 ${Math.round(cWk.remainingPct)}%` : ''}`
+          : (cWk ? `每周剩余 ${Math.round(cWk.remainingPct)}%` : null),
       });
     }
     if (antigravity.quotaWindows.length > 0) {
       const g5h = antigravity.quotaWindows[0];
       const gWk = antigravity.quotaWindows.find((w) => w.id === 'ag-gemini-weekly');
-      const argon = antigravity.quotaWindows.find((w) => w.id === 'ag-argon-weekly');
-      const parts = [];
-      if (gWk) parts.push(`每周 ${Math.round(gWk.remainingPct)}%`);
-      if (argon) parts.push(`Argon ${Math.round(argon.remainingPct)}%`);
-      const extra = parts.length > 0 ? parts.join(' · ') : null;
+      const agSub = [g5h.subtitle, gWk ? `每周 ${Math.round(gWk.remainingPct)}%` : null]
+        .filter(Boolean)
+        .join(' · ');
       overviewWindows.push({
         ...g5h,
         id: 'overview-antigravity',
-        title: 'Antigravity (Gemini)',
-        subtitle: extra ? (g5h.subtitle ? `${extra} · ${g5h.subtitle}` : extra) : g5h.subtitle,
+        title: 'Antigravity',
+        subtitle: agSub || null,
       });
     }
 

@@ -428,7 +428,7 @@ final class MeterViewModel: ObservableObject {
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
   }
 
-  @Published var version: String = "0.2.9"
+  @Published var version: String = "0.2.10"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -1288,6 +1288,34 @@ final class MeterViewModel: ObservableObject {
 }
 
 enum ToolGlyph {
+  private static let brandSvgs: [String: String] = [
+    "codex": #"""
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><path d="M83.7733 42.8087C84.6678 40.1149 84.9771 37.2613 84.6807 34.4385C84.3843 31.6156 83.489 28.8885 82.0544 26.4394C77.6908 18.8436 68.9203 14.9365 60.3548 16.7725C57.9831 14.1344 54.9591 12.1668 51.5864 11.0673C48.2137 9.96772 44.611 9.77498 41.1402 10.5084C37.6694 11.2418 34.4527 12.8755 31.8132 15.2455C29.1736 17.6155 27.204 20.6383 26.1024 24.0103C23.3212 24.5806 20.6938 25.738 18.3958 27.405C16.0977 29.0721 14.1819 31.2104 12.7765 33.6772C8.36538 41.2609 9.3669 50.8267 15.2527 57.3327C14.3549 60.0251 14.0424 62.8782 14.3361 65.7012C14.6298 68.5241 15.523 71.2518 16.9558 73.7017C21.325 81.3002 30.1011 85.207 38.6712 83.3686C40.5554 85.4904 42.8707 87.1858 45.4623 88.3416C48.0539 89.4975 50.8622 90.0871 53.6999 90.0713C62.4793 90.079 70.2575 84.4114 72.9393 76.0515C75.7201 75.4802 78.347 74.3225 80.6449 72.6555C82.9427 70.9886 84.8587 68.8507 86.2649 66.3846C90.6227 58.8145 89.6172 49.3005 83.7733 42.8087ZM53.6999 84.8356C50.1955 84.8411 46.801 83.6129 44.1116 81.3661L44.5848 81.098L60.5123 71.9043C60.9087 71.6718 61.2379 71.3402 61.4674 70.942C61.6969 70.5439 61.8189 70.0929 61.8215 69.6333V47.1769L68.5553 51.072C68.6225 51.1063 68.6694 51.1707 68.6814 51.2456V69.854C68.6641 78.1208 61.9667 84.8183 53.6999 84.8356ZM21.4977 71.0843C19.7402 68.0497 19.1092 64.4925 19.7156 61.0386L20.1885 61.3225L36.1321 70.5165C36.5266 70.748 36.9757 70.87 37.4331 70.87C37.8905 70.87 38.3396 70.748 38.7341 70.5165L58.21 59.2883V67.0628C58.2081 67.1031 58.1973 67.1424 58.1782 67.1779C58.1591 67.2134 58.1322 67.2441 58.0996 67.2678L41.9671 76.5722C34.798 80.7022 25.6388 78.2463 21.4977 71.0843ZM17.3026 36.3898C19.0723 33.3357 21.8655 31.0062 25.1878 29.8138V48.7376C25.1818 49.1949 25.2986 49.6453 25.5261 50.042C25.7535 50.4387 26.0833 50.7671 26.4809 50.9928L45.8622 62.1739L39.1283 66.069C39.0919 66.0883 39.0513 66.0984 39.0101 66.0984C38.9689 66.0984 38.9283 66.0883 38.8919 66.069L22.7908 56.7809C15.6359 52.6337 13.1822 43.4816 17.3026 36.3112V36.3898ZM72.624 49.2426L53.1792 37.9512L59.8976 34.0718C59.9341 34.0524 59.9747 34.0423 60.016 34.0423C60.0573 34.0423 60.0979 34.0524 60.1344 34.0718L76.2355 43.3761C78.6973 44.7966 80.7043 46.8882 82.0221 49.4065C83.3398 51.9249 83.914 54.7661 83.6775 57.5985C83.4411 60.431 82.4038 63.1377 80.6867 65.4027C78.9696 67.6677 76.6436 69.3975 73.9803 70.3901V51.466C73.9663 51.0096 73.834 50.5647 73.5962 50.1749C73.3584 49.7851 73.0234 49.4638 72.624 49.2426ZM79.3261 39.1657L78.8529 38.8815L62.9411 29.6089C62.5442 29.376 62.0924 29.2532 61.6322 29.2532C61.172 29.2532 60.7202 29.376 60.3233 29.6089L40.8629 40.8374V33.0628C40.8587 33.0233 40.8654 32.9834 40.882 32.9473C40.8987 32.9113 40.9248 32.8803 40.9575 32.8579L57.0586 23.5692C59.5263 22.1476 62.3478 21.458 65.193 21.5811C68.0382 21.7042 70.7896 22.6348 73.1253 24.2642C75.461 25.8936 77.2845 28.1543 78.3825 30.782C79.4806 33.4097 79.8077 36.2957 79.3257 39.1025V39.1657H79.3261ZM37.1888 52.9484L30.455 49.069C30.4213 49.0487 30.3925 49.0212 30.3707 48.9884C30.3488 48.9557 30.3345 48.9186 30.3286 48.8797V30.3188C30.3323 27.4714 31.1466 24.6839 32.6761 22.2822C34.2057 19.8805 36.3874 17.9639 38.9661 16.7564C41.5448 15.549 44.4139 15.1005 47.2381 15.4636C50.0622 15.8267 52.7247 16.9862 54.9141 18.8067L54.4409 19.0748L38.5134 28.2686C38.117 28.5011 37.7879 28.8327 37.5584 29.2308C37.329 29.629 37.207 30.0799 37.2045 30.5395L37.1888 52.9487V52.9484ZM40.8472 45.0632L49.5209 40.0643L58.21 45.0635V55.0615L49.5523 60.0608L40.8632 55.0615L40.8472 45.0632Z" fill="black"/></svg>
+"""#,
+    "cursor": #"""
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><path d="M84.0704 28.9353L51.9066 10.4454C50.8738 9.85153 49.5994 9.85153 48.5666 10.4454L16.4043 28.9353C15.536 29.4345 15 30.3576 15 31.3575V68.6425C15 69.6424 15.536 70.5655 16.4043 71.0647L48.5681 89.5546C49.6009 90.1485 50.8753 90.1485 51.9081 89.5546L84.0719 71.0647C84.9402 70.5655 85.4762 69.6424 85.4762 68.6425V31.3575C85.4762 30.3576 84.9402 29.4345 84.0719 28.9353H84.0704ZM82.0501 32.8519L51.0006 86.4003C50.7907 86.7611 50.2366 86.6138 50.2366 86.1958V51.1329C50.2366 50.4322 49.8606 49.7842 49.2506 49.4324L18.7553 31.9017C18.3929 31.6927 18.5409 31.141 18.9606 31.141H81.0595C81.9414 31.141 82.4925 32.0927 82.0516 32.8534H82.0501V32.8519Z" fill="black"/></svg>
+"""#,
+    "antigravity": #"""
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><path d="M85.2843 88.0301C90.1329 91.6664 97.4057 89.2422 90.7389 82.5755C70.7389 63.1816 74.9813 9.84827 50.1329 9.84827C25.2843 9.84827 29.5267 63.1816 9.52673 82.5755C2.25402 89.8483 10.1328 91.6664 14.9813 88.0301C33.7692 75.3028 32.5571 52.8786 50.1329 52.8786C67.7086 52.8786 66.4965 75.3028 85.2843 88.0301Z" fill="black"/></svg>
+"""#
+  ]
+
+  private static var cachedImages: [String: NSImage] = {
+    var out: [String: NSImage] = [:]
+    for (key, svg) in brandSvgs {
+      if let img = NSImage(data: Data(svg.utf8)) {
+        img.isTemplate = true
+        img.size = NSSize(width: 16, height: 16)
+        out[key] = img
+      }
+    }
+    return out
+  }()
+
+  static func brandImage(for key: String) -> NSImage? {
+    cachedImages[key]
+  }
+
   static func iconName(for key: String) -> String {
     switch key {
     case "all": return "square.grid.2x2"
@@ -1298,12 +1326,30 @@ enum ToolGlyph {
     default: return "app"
     }
   }
+
+  @ViewBuilder
+  static func iconView(for key: String, size: CGFloat = 15) -> some View {
+    if let img = brandImage(for: key) {
+      Image(nsImage: img)
+        .resizable()
+        .renderingMode(.template)
+        .interpolation(.high)
+        .scaledToFit()
+        .frame(width: size, height: size)
+    } else {
+      Image(systemName: iconName(for: key))
+        .font(.system(size: max(12, size - 2), weight: .semibold))
+        .frame(width: size, height: size)
+    }
+  }
 }
 
 private enum CodexBarPalette {
   static let cardTop = Color(red: 0.05, green: 0.43, blue: 0.96)
   static let cardBottom = Color(red: 0.02, green: 0.27, blue: 0.76)
   static let accentBlue = Color(red: 0.05, green: 0.40, blue: 0.94)
+  static let tealBar = Color(red: 0.29, green: 0.65, blue: 0.72)
+  static let paceGreen = Color(red: 0.20, green: 0.72, blue: 0.42)
 }
 
 struct ContentView: View {
@@ -1802,8 +1848,7 @@ struct ControlPanelTabView: View {
           RoundedRectangle(cornerRadius: 8, style: .continuous)
             .fill(installed ? accent.opacity(0.14) : Color.primary.opacity(0.06))
             .frame(width: 30, height: 30)
-          Image(systemName: ToolGlyph.iconName(for: key))
-            .font(.system(size: 13.5, weight: .semibold))
+          ToolGlyph.iconView(for: key, size: 15)
             .foregroundColor(installed ? accent : .secondary)
         }
 
@@ -2850,7 +2895,7 @@ private struct ProviderSwitcherBar: View {
   }
 
   var body: some View {
-    HStack(spacing: 3) {
+    HStack(spacing: 4) {
       ForEach(switcherKeys, id: \.self) { key in
         let isSelected = selection == key
         let isHovered = hoveredKey == key
@@ -2860,7 +2905,7 @@ private struct ProviderSwitcherBar: View {
         let active = !isAll && installed && vm.isActiveOverall && vm.isToolEnabled(key)
         let frac = indicatorFraction(for: key, installed: installed, active: active)
         let fillColor: Color = {
-          if isHovered { return .white.opacity(0.92) }
+          if isSelected { return .white }
           if active { return vm.toolAccentColor(for: key) }
           return Color.gray.opacity(0.45)
         }()
@@ -2868,41 +2913,42 @@ private struct ProviderSwitcherBar: View {
         Button {
           selection = key
         } label: {
-          VStack(spacing: 2.5) {
-            Image(systemName: ToolGlyph.iconName(for: key))
-              .font(.system(size: 12.5, weight: .semibold))
-              .frame(height: 14)
+          VStack(spacing: 3) {
+            ToolGlyph.iconView(for: key, size: 15)
+              .frame(height: 16)
             Text(vm.toolShortTitle(for: key))
               .font(.system(size: 9.5, weight: isSelected ? .semibold : .medium))
               .lineLimit(1)
               .minimumScaleFactor(0.72)
-              .padding(.horizontal, 1)
+              .padding(.horizontal, 2)
 
-            ZStack(alignment: .leading) {
-              Capsule()
-                .fill(isAll ? Color.clear : (isHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.14)))
-              if !isAll && frac > 0 {
+            GeometryReader { geo in
+              ZStack(alignment: .leading) {
                 Capsule()
-                  .fill(fillColor)
-                  .frame(width: max(3, 26 * CGFloat(frac)))
-              } else if isAll && isSelected && !isHovered {
-                Capsule()
-                  .fill(CodexBarPalette.accentBlue)
+                  .fill(isAll ? Color.clear : (isSelected ? Color.white.opacity(0.35) : Color.primary.opacity(0.12)))
+                if !isAll && frac > 0 {
+                  Capsule()
+                    .fill(fillColor)
+                    .frame(width: max(4, geo.size.width * CGFloat(frac)))
+                }
               }
             }
-            .frame(width: 26, height: 2)
+            .frame(height: 2)
+            .padding(.horizontal, 6)
           }
           .foregroundColor(
-            isHovered
+            isSelected
               ? .white
-              : (isSelected ? .primary : (installed ? .primary.opacity(0.82) : .secondary.opacity(0.55)))
+              : (isHovered
+                  ? .primary
+                  : (installed ? .secondary : .secondary.opacity(0.55)))
           )
           .frame(maxWidth: .infinity)
-          .padding(.vertical, 4.5)
-          .padding(.horizontal, 1)
+          .padding(.vertical, 5)
+          .padding(.horizontal, 2)
           .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-              .fill(isHovered ? CodexBarPalette.accentBlue : (isSelected ? Color.primary.opacity(0.08) : Color.clear))
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+              .fill(isSelected ? CodexBarPalette.accentBlue : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
           )
           .contentShape(Rectangle())
         }
@@ -2913,8 +2959,8 @@ private struct ProviderSwitcherBar: View {
         }
       }
     }
-    .padding(.horizontal, 8)
-    .padding(.top, 6)
+    .padding(.horizontal, 10)
+    .padding(.top, 7)
     .padding(.bottom, 5)
   }
 }
@@ -2951,48 +2997,51 @@ private struct MiniUsageBarsView: View {
       HStack {
         if let pt = hovered {
           Text("\(pt.label) · \(MeterFormat.usd(pt.costUsd)) · \(MeterFormat.tokens(pt.totalTokens))")
-            .font(.system(size: 9.5, weight: .semibold))
+            .font(.system(size: 10, weight: .medium))
             .monospacedDigit()
             .foregroundColor(cardHovered ? .white : .primary)
             .lineLimit(1)
-        } else {
-          Text("近 30 天趋势")
-            .font(.system(size: 9.5, weight: .medium))
-            .foregroundColor(cardHovered ? .white.opacity(0.78) : .secondary)
         }
         Spacer()
         Text(peakLabel)
-          .font(.system(size: 9.5, weight: .semibold))
+          .font(.system(size: 10.5, weight: .medium))
           .monospacedDigit()
-          .foregroundColor(cardHovered ? .white.opacity(0.88) : .primary.opacity(0.82))
+          .foregroundColor(cardHovered ? .white.opacity(0.88) : .secondary)
       }
+      .frame(height: 13)
 
-      HStack(alignment: .bottom, spacing: 2) {
-        ForEach(points) { pt in
-          let val = metricValue(pt)
-          let ratio = val > 0 ? CGFloat(val / maxVal) : 0
-          let isHovered = hovered?.id == pt.id
+      VStack(spacing: 0) {
+        HStack(alignment: .bottom, spacing: 2) {
+          ForEach(points) { pt in
+            let val = metricValue(pt)
+            let ratio = val > 0 ? CGFloat(val / maxVal) : 0
+            let isHovered = hovered?.id == pt.id
 
-          RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-            .fill(
-              val > 0
-                ? (cardHovered
-                    ? Color.white.opacity(isHovered ? 1.0 : 0.82)
-                    : CodexBarPalette.accentBlue.opacity(isHovered ? 1.0 : 0.78))
-                : (cardHovered
-                    ? Color.white.opacity(isHovered ? 0.55 : 0.25)
-                    : Color.primary.opacity(isHovered ? 0.35 : 0.15))
-            )
-            .frame(maxWidth: .infinity)
-            .frame(height: val > 0 ? max(4, ratio * 24) : 2.0)
-            .contentShape(Rectangle())
-            .onHover { inside in
-              if inside { hovered = pt }
-              else if hovered?.id == pt.id { hovered = nil }
-            }
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+              .fill(
+                val > 0
+                  ? (cardHovered
+                      ? Color.white.opacity(isHovered ? 1.0 : 0.88)
+                      : CodexBarPalette.tealBar.opacity(isHovered ? 1.0 : 0.88))
+                  : (cardHovered
+                      ? Color.white.opacity(isHovered ? 0.45 : 0.20)
+                      : Color.primary.opacity(isHovered ? 0.30 : 0.12))
+              )
+              .frame(maxWidth: .infinity)
+              .frame(height: val > 0 ? max(4, ratio * 24) : 2.0)
+              .contentShape(Rectangle())
+              .onHover { inside in
+                if inside { hovered = pt }
+                else if hovered?.id == pt.id { hovered = nil }
+              }
+          }
         }
+        .frame(height: 26, alignment: .bottom)
+
+        Rectangle()
+          .fill(cardHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.12))
+          .frame(height: 1)
       }
-      .frame(height: 26, alignment: .bottom)
     }
   }
 }
@@ -3061,6 +3110,12 @@ private struct CodexBarStyleCardView: View {
     card.recentWindows.filter { $0.index == 0 || $0.turnCount > 0 }
   }
 
+  private var dividerLine: some View {
+    Rectangle()
+      .fill(isCardHovered ? Color.white.opacity(0.22) : Color.primary.opacity(0.08))
+      .frame(height: 0.5)
+  }
+
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       // Card Header (CodexBar compact density: concise title + Email / Plan)
@@ -3070,7 +3125,7 @@ private struct CodexBarStyleCardView: View {
             .font(.system(size: 13.5, weight: .bold))
             .foregroundColor(primaryText)
           Text(vm.relativeUpdateLabel())
-            .font(.system(size: 9.5))
+            .font(.system(size: 10))
             .foregroundColor(secondaryText)
         }
 
@@ -3078,20 +3133,22 @@ private struct CodexBarStyleCardView: View {
 
         VStack(alignment: .trailing, spacing: 1.5) {
           Text(card.accountEmail ?? statusLabel)
-            .font(.system(size: 11, weight: .semibold))
+            .font(.system(size: 11.5, weight: .semibold))
             .foregroundColor(primaryText)
             .lineLimit(1)
           Text(card.planTitle ?? "本地监控")
-            .font(.system(size: 9.5))
+            .font(.system(size: 10))
             .foregroundColor(secondaryText)
             .lineLimit(1)
         }
       }
 
+      dividerLine
+
       // Primary Quota Windows (Remaining % + Reset countdown + Pace marker)
       let windows = card.quotaWindows ?? []
       if !windows.isEmpty {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 8) {
           ForEach(windows) { win in
             quotaBlock(win: win)
           }
@@ -3105,38 +3162,32 @@ private struct CodexBarStyleCardView: View {
                   ? "企业/团队按量模式 · 无固定个人会话限额"
                   : "未检测到该客户端安装")
           )
-          .font(.system(size: 10))
+          .font(.system(size: 10.5))
           .foregroundColor(secondaryText)
           .lineLimit(1)
           Spacer(minLength: 4)
           Text(statusLabel)
-            .font(.system(size: 9.5, weight: .medium))
+            .font(.system(size: 10, weight: .medium))
             .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
         }
       }
 
       if let resetCredits = card.resetCreditsText, !resetCredits.isEmpty {
-        HStack {
+        VStack(alignment: .leading, spacing: 2) {
           Text("限额重置额度")
-            .font(.system(size: 10.5, weight: .bold))
+            .font(.system(size: 11, weight: .semibold))
             .foregroundColor(primaryText)
-          Spacer()
           Text(resetCredits)
-            .font(.system(size: 10, weight: .medium))
-            .foregroundColor(isCardHovered ? .white.opacity(0.9) : .secondary)
+            .font(.system(size: 10.5))
+            .foregroundColor(secondaryText)
+            .lineLimit(1)
         }
       }
 
-      Rectangle()
-        .fill(isCardHovered ? Color.white.opacity(0.2) : Color.primary.opacity(0.09))
-        .frame(height: 1)
+      dividerLine
 
       // Cost & Usage 3x2 Dual-Column Grid
-      VStack(alignment: .leading, spacing: 5.5) {
-        Text("费用与用量")
-          .font(.system(size: 11, weight: .bold))
-          .foregroundColor(primaryText)
-
+      VStack(alignment: .leading, spacing: 6) {
         metricGridRow(
           leftLabel: "今日",
           leftVal: MeterFormat.usd(card.today.costUsd),
@@ -3144,7 +3195,7 @@ private struct CodexBarStyleCardView: View {
           rightVal: MeterFormat.usd(card.currentWindow.costUsd)
         )
         metricGridRow(
-          leftLabel: "今日 token 用量",
+          leftLabel: "最近 token 用量",
           leftVal: MeterFormat.tokens(card.today.totalTokens),
           rightLabel: "估算：当前窗口 token 用量",
           rightVal: MeterFormat.tokens(card.currentWindow.totalTokens)
@@ -3164,56 +3215,61 @@ private struct CodexBarStyleCardView: View {
 
       // Recent Rolling 7-day Windows
       if !visibleWindows.isEmpty {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 5) {
           Text("最近窗口")
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundColor(isCardHovered ? .white.opacity(0.92) : .primary.opacity(0.9))
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundColor(secondaryText)
 
           ForEach(visibleWindows) { win in
-            HStack(alignment: .top) {
-              VStack(alignment: .leading, spacing: 0.5) {
+            VStack(alignment: .leading, spacing: 1) {
+              HStack(spacing: 6) {
                 Text(win.title)
-                  .font(.system(size: 10.5, weight: .semibold))
+                  .font(.system(size: 11, weight: .semibold))
                   .foregroundColor(primaryText)
-                Text("估算：\(win.rangeText)")
-                  .font(.system(size: 9))
-                  .foregroundColor(secondaryText)
+                  .lineLimit(1)
+                Spacer()
+                Text("\(MeterFormat.usd(win.costUsd)) · \(MeterFormat.tokens(win.totalTokens))")
+                  .font(.system(size: 11, weight: .semibold))
+                  .monospacedDigit()
+                  .foregroundColor(primaryText)
               }
-              Spacer()
-              Text("\(MeterFormat.usd(win.costUsd)) · \(MeterFormat.tokens(win.totalTokens))")
-                .font(.system(size: 10.5, weight: .semibold))
-                .monospacedDigit()
-                .foregroundColor(primaryText)
+              Text("估算：\(win.rangeText)")
+                .font(.system(size: 10))
+                .foregroundColor(secondaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
             }
           }
         }
       }
 
-      // HIG Sub-label Pill Badges + Disclaimer
-      VStack(alignment: .leading, spacing: 4) {
-        if card.topModel != nil || resolvedTpsBadge != nil || card.latestCacheText != nil {
-          HStack(spacing: 4) {
-            if let topModel = card.topModel {
-              footerBadge(icon: "cpu", text: topModel)
-            }
-            if let tps = resolvedTpsBadge {
-              footerBadge(icon: "bolt.fill", text: tps)
-                .layoutPriority(1)
-            }
-            if let cache = card.latestCacheText {
-              footerBadge(icon: "checkmark.seal", text: cache)
-                .layoutPriority(1)
-            }
-            Spacer(minLength: 0)
-          }
+      // Clean Unboxed Footer Lines
+      VStack(alignment: .leading, spacing: 2) {
+        if let topModel = card.topModel {
+          Text("最常用模型: \(topModel)")
+            .font(.system(size: 10.5))
+            .foregroundColor(secondaryText)
+            .lineLimit(1)
+            .truncationMode(.middle)
         }
-
+        let speedParts: [String] = [
+          resolvedTpsBadge.map { $0.hasPrefix("均 ") ? "今日均速: \(String($0.dropFirst(2)))" : "最近速率: \($0)" },
+          card.latestCacheText,
+        ].compactMap { $0 }
+        if !speedParts.isEmpty {
+          Text(speedParts.joined(separator: " · "))
+            .font(.system(size: 10.5))
+            .monospacedDigit()
+            .foregroundColor(secondaryText)
+            .lineLimit(1)
+        }
         Text("根据 Token 用量估算 · 不是订阅账单")
-          .font(.system(size: 9))
+          .font(.system(size: 10))
           .foregroundColor(secondaryText)
       }
     }
-    .padding(11)
+    .padding(.horizontal, 10)
+    .padding(.vertical, 8)
     .background(
       Group {
         if isCardHovered {
@@ -3223,58 +3279,39 @@ private struct CodexBarStyleCardView: View {
             endPoint: .bottomTrailing
           )
         } else {
-          Color(nsColor: .controlBackgroundColor)
+          Color.clear
         }
       }
     )
-    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-    .overlay(
-      RoundedRectangle(cornerRadius: 10, style: .continuous)
-        .stroke(isCardHovered ? Color.clear : Color.primary.opacity(0.08), lineWidth: 1)
-    )
+    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    .contentShape(Rectangle())
     .onHover { isCardHovered = $0 }
-    .padding(.horizontal, 8)
-  }
-
-  private func footerBadge(icon: String, text: String) -> some View {
-    HStack(spacing: 3) {
-      Image(systemName: icon)
-        .font(.system(size: 8.5, weight: .semibold))
-      Text(text)
-        .font(.system(size: 9.5, weight: .medium))
-        .monospacedDigit()
-        .lineLimit(1)
-        .truncationMode(.middle)
-    }
-    .foregroundColor(isCardHovered ? .white.opacity(0.92) : .secondary)
     .padding(.horizontal, 6)
-    .padding(.vertical, 2)
-    .background(
-      Capsule().fill(isCardHovered ? Color.white.opacity(0.16) : Color.primary.opacity(0.06))
-    )
   }
 
   private func quotaBlock(win: CardQuotaWindow) -> some View {
     let clamped = min(1.0, max(0.0, win.remainingPct / 100.0))
     let pctRounded = Int(win.remainingPct.rounded())
-    let trackColor = isCardHovered ? Color.white.opacity(0.22) : Color.primary.opacity(0.10)
-    let fillColor = isCardHovered ? Color.white.opacity(0.95) : CodexBarPalette.accentBlue
-    let tickColor = isCardHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.16)
-    let paceTickColor = isCardHovered ? Color.white.opacity(0.95) : Color.primary.opacity(0.65)
+    let trackColor = isCardHovered ? Color.white.opacity(0.24) : Color.primary.opacity(0.10)
+    let fillColor = isCardHovered ? Color.white.opacity(0.95) : CodexBarPalette.tealBar
+    let tickColor = isCardHovered ? Color.white.opacity(0.26) : Color.primary.opacity(0.14)
 
-    return VStack(alignment: .leading, spacing: 3) {
-      HStack {
+    return VStack(alignment: .leading, spacing: 3.5) {
+      HStack(spacing: 6) {
         Text("\(win.title) 剩余 \(pctRounded)%")
-          .font(.system(size: 11.5, weight: .bold))
+          .font(.system(size: 12, weight: .semibold))
           .monospacedDigit()
           .foregroundColor(primaryText)
-        Spacer()
+          .lineLimit(1)
+          .minimumScaleFactor(0.85)
+        Spacer(minLength: 4)
         if let resetText = win.resetText, !resetText.isEmpty {
           Text(resetText)
-            .font(.system(size: 9.5, weight: .medium))
+            .font(.system(size: 10))
             .monospacedDigit()
             .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
             .lineLimit(1)
+            .minimumScaleFactor(0.85)
         }
       }
 
@@ -3290,34 +3327,55 @@ private struct CodexBarStyleCardView: View {
           // Subtle 25/50/75 tick marks
           HStack {
             Spacer()
-            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
+            Rectangle().fill(tickColor).frame(width: 1, height: 6)
             Spacer()
-            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
+            Rectangle().fill(tickColor).frame(width: 1, height: 6)
             Spacer()
-            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
+            Rectangle().fill(tickColor).frame(width: 1, height: 6)
             Spacer()
           }
-          // Expected remaining pace marker
+          // Linear pace marker with crisp background punch-out border
           if let pacePct = win.pacePct {
             let paceFrac = min(1.0, max(0.0, pacePct / 100.0))
-            let paceX = min(geo.size.width - 2.0, max(0, geo.size.width * CGFloat(paceFrac) - 1.0))
-            RoundedRectangle(cornerRadius: 1)
-              .fill(paceTickColor)
-              .frame(width: 2.0, height: 8.5)
-              .offset(x: paceX)
+            let paceX = min(max(0, geo.size.width - 5.0), max(0, geo.size.width * CGFloat(paceFrac) - 2.5))
+            ZStack {
+              RoundedRectangle(cornerRadius: 1)
+                .fill(isCardHovered ? CodexBarPalette.cardTop : Color.white.opacity(0.94))
+                .frame(width: 5.0, height: 7.5)
+              RoundedRectangle(cornerRadius: 0.75)
+                .fill(isCardHovered ? Color.white : CodexBarPalette.paceGreen)
+                .frame(width: 2.0, height: 7.5)
+            }
+            .offset(x: paceX)
           }
         }
       }
-      .frame(height: 5.5)
+      .frame(height: 6)
 
       if let sub = win.subtitle, !sub.isEmpty {
         Text(sub)
-          .font(.system(size: 9.5))
+          .font(.system(size: 10))
           .monospacedDigit()
           .foregroundColor(secondaryText)
           .lineLimit(1)
+          .minimumScaleFactor(0.85)
       }
     }
+  }
+
+  private func metricColumn(label: String, value: String) -> some View {
+    VStack(alignment: .leading, spacing: 1.5) {
+      Text(label)
+        .font(.system(size: 10))
+        .foregroundColor(secondaryText)
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
+      Text(value)
+        .font(.system(size: 13.5, weight: .bold))
+        .monospacedDigit()
+        .foregroundColor(primaryText)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
   }
 
   private func metricGridRow(
@@ -3327,31 +3385,8 @@ private struct CodexBarStyleCardView: View {
     rightVal: String
   ) -> some View {
     HStack(alignment: .top, spacing: 8) {
-      VStack(alignment: .leading, spacing: 1) {
-        Text(leftLabel)
-          .font(.system(size: 9.5, weight: .medium))
-          .foregroundColor(secondaryText)
-          .lineLimit(1)
-          .minimumScaleFactor(0.85)
-        Text(leftVal)
-          .font(.system(size: 13, weight: .bold))
-          .monospacedDigit()
-          .foregroundColor(primaryText)
-      }
-      .frame(maxWidth: .infinity, alignment: .leading)
-
-      VStack(alignment: .leading, spacing: 1) {
-        Text(rightLabel)
-          .font(.system(size: 9.5, weight: .medium))
-          .foregroundColor(secondaryText)
-          .lineLimit(1)
-          .minimumScaleFactor(0.85)
-        Text(rightVal)
-          .font(.system(size: 13, weight: .bold))
-          .monospacedDigit()
-          .foregroundColor(primaryText)
-      }
-      .frame(maxWidth: .infinity, alignment: .leading)
+      metricColumn(label: leftLabel, value: leftVal)
+      metricColumn(label: rightLabel, value: rightVal)
     }
   }
 }
@@ -3454,17 +3489,19 @@ struct MenuBarPopoverView: View {
     VStack(alignment: .leading, spacing: 0) {
       ProviderSwitcherBar(vm: vm, selection: $vm.popoverSelection)
 
+      Divider().padding(.horizontal, 12).padding(.bottom, 2)
+
       CodexBarStyleCardView(vm: vm, selection: vm.popoverSelection, card: activeCard)
 
       if showsContextStrip {
         quickContextSection
-          .padding(.horizontal, 10)
+          .padding(.horizontal, 12)
           .padding(.vertical, 5)
       } else {
-        Spacer().frame(height: 5)
+        Spacer().frame(height: 4)
       }
 
-      Divider().padding(.horizontal, 8)
+      Divider().padding(.horizontal, 10)
 
       VStack(spacing: 1) {
         PopoverActionRow(
