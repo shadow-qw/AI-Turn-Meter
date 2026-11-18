@@ -270,7 +270,7 @@ enum MenuBarDisplayMode: String, CaseIterable {
   var title: String {
     switch self {
     case .iconOnly: return "仅图标"
-    case .quotaRemaining: return "剩余额度"
+    case .quotaRemaining: return "配额百分比"
     case .todayCost: return "今日费用"
     case .todayTokensAndCost: return "今日用量 + 费用"
     case .tps: return "实时速度"
@@ -288,6 +288,43 @@ enum MenuBarIconStyle: String, CaseIterable {
     case .dualBar: return "双条配额（默认）"
     case .gauge: return "仪表盘"
     }
+  }
+}
+
+enum QuotaDisplayMode: String, CaseIterable {
+  case remaining = "remaining"
+  case used = "used"
+
+  var title: String {
+    switch self {
+    case .remaining: return "按剩余比例（默认）"
+    case .used: return "按已用用量"
+    }
+  }
+
+  var verbLabel: String {
+    switch self {
+    case .remaining: return "剩余"
+    case .used: return "已用"
+    }
+  }
+
+  var compactPrefix: String {
+    switch self {
+    case .remaining: return "剩"
+    case .used: return "用"
+    }
+  }
+
+  func displayPct(fromRemaining remainingPct: Double) -> Double {
+    let clamped = min(100.0, max(0.0, remainingPct))
+    return self == .used ? max(0.0, min(100.0, 100.0 - clamped)) : clamped
+  }
+
+  func displayPacePct(fromRemainingPace pacePct: Double?) -> Double? {
+    guard let pacePct = pacePct else { return nil }
+    let clamped = min(100.0, max(0.0, pacePct))
+    return self == .used ? max(0.0, min(100.0, 100.0 - clamped)) : clamped
   }
 }
 
@@ -489,11 +526,13 @@ final class MeterViewModel: ObservableObject {
     static let showMenuBarSummary = "aiTurnMeter.showMenuBarSummary"
     static let menuBarDisplayMode = "atm.menuBarDisplayMode.v3"
     static let menuBarIconStyle = "atm.menuBarIconStyle.v1"
+    static let menuBarProvider = "atm.menuBarProvider.v1"
+    static let quotaDisplayMode = "atm.quotaDisplayMode.v1"
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.20"
+  @Published var version: String = "0.2.21"
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
@@ -535,6 +574,18 @@ final class MeterViewModel: ObservableObject {
     }
     return .dualBar
   }()
+  @Published var menuBarProvider: String = {
+    let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarProvider) ?? "auto"
+    let allowed: Set<String> = ["auto", "codex", "cursor", "antigravity", "codebuddy"]
+    return allowed.contains(raw) ? raw : "auto"
+  }()
+  @Published var quotaDisplayMode: QuotaDisplayMode = {
+    if let raw = UserDefaults.standard.string(forKey: PrefKey.quotaDisplayMode),
+       let mode = QuotaDisplayMode(rawValue: raw) {
+      return mode
+    }
+    return .remaining
+  }()
   @Published var hideDockIcon: Bool = UserDefaults.standard.bool(forKey: PrefKey.hideDockIcon)
   @Published var showRecentWindowsInMenu: Bool = UserDefaults.standard.bool(forKey: PrefKey.showRecentWindowsInMenu)
   @Published var launchAtLogin: Bool = FileManager.default.fileExists(
@@ -543,7 +594,13 @@ final class MeterViewModel: ObservableObject {
 
   @Published var settingsPane: SettingsPane = .provider("antigravity")
   @Published var activeTab: MainTab = .control
-  @Published var popoverSelection: String = "all"
+  @Published var popoverSelection: String = "all" {
+    didSet {
+      if oldValue != popoverSelection {
+        onStateUpdated?()
+      }
+    }
+  }
   @Published var lastSyncedAt: Date? = nil
   @Published var todaySummary: UsageTotals? = nil
   @Published var usageDays: Int = 7
@@ -632,6 +689,18 @@ final class MeterViewModel: ObservableObject {
   func setMenuBarIconStyle(_ style: MenuBarIconStyle) {
     menuBarIconStyle = style
     UserDefaults.standard.set(style.rawValue, forKey: PrefKey.menuBarIconStyle)
+    onPreferencesChanged?()
+  }
+
+  func setMenuBarProvider(_ provider: String) {
+    menuBarProvider = provider
+    UserDefaults.standard.set(provider, forKey: PrefKey.menuBarProvider)
+    onPreferencesChanged?()
+  }
+
+  func setQuotaDisplayMode(_ mode: QuotaDisplayMode) {
+    quotaDisplayMode = mode
+    UserDefaults.standard.set(mode.rawValue, forKey: PrefKey.quotaDisplayMode)
     onPreferencesChanged?()
   }
 
@@ -2215,12 +2284,13 @@ private struct ProviderSettingsDetailView: View {
   }
 
   private func providerQuotaRow(win: CardQuotaWindow) -> some View {
-    let clamped = min(1.0, max(0.0, win.remainingPct / 100.0))
-    let pctRounded = Int(win.remainingPct.rounded())
+    let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
+    let clamped = min(1.0, max(0.0, pct / 100.0))
+    let pctRounded = Int(pct.rounded())
 
     return VStack(alignment: .leading, spacing: 6) {
       HStack {
-        Text("\(win.title) 剩余 \(pctRounded)%")
+        Text("\(win.title) \(vm.quotaDisplayMode.verbLabel) \(pctRounded)%")
           .font(.system(size: 12.5, weight: .medium))
           .monospacedDigit()
         Spacer()
@@ -2241,7 +2311,7 @@ private struct ProviderSettingsDetailView: View {
               .fill(CodexBarPalette.tealBar)
               .frame(width: max(5, geo.size.width * CGFloat(clamped)))
           }
-          if let pacePct = win.pacePct {
+          if let pacePct = vm.quotaDisplayMode.displayPacePct(fromRemainingPace: win.pacePct) {
             let paceFrac = min(1.0, max(0.0, pacePct / 100.0))
             let paceX = min(max(0, geo.size.width - 5.0), max(0, geo.size.width * CGFloat(paceFrac) - 2.5))
             ZStack {
@@ -2385,6 +2455,21 @@ private struct MenuBarSettingsPaneView: View {
 
           if vm.showMenuBarExtra {
             Divider().padding(.leading, 14)
+            settingsControlRow(title: "展示软件") {
+              Picker("", selection: Binding(
+                get: { vm.menuBarProvider },
+                set: { vm.setMenuBarProvider($0) }
+              )) {
+                Text("自动（默认）").tag("auto")
+                ForEach(["codex", "cursor", "antigravity", "codebuddy"], id: \.self) { key in
+                  Text(vm.toolShortTitle(for: key)).tag(key)
+                }
+              }
+              .labelsHidden()
+              .frame(width: 160)
+              .controlSize(.small)
+            }
+            Divider().padding(.leading, 14)
             settingsControlRow(title: "菜单栏图标") {
               Picker("", selection: Binding(
                 get: { vm.menuBarIconStyle },
@@ -2412,6 +2497,21 @@ private struct MenuBarSettingsPaneView: View {
               .frame(width: 160)
               .controlSize(.small)
             }
+          }
+
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "配额展示方式") {
+            Picker("", selection: Binding(
+              get: { vm.quotaDisplayMode },
+              set: { vm.setQuotaDisplayMode($0) }
+            )) {
+              ForEach(QuotaDisplayMode.allCases, id: \.self) { mode in
+                Text(mode.title).tag(mode)
+              }
+            }
+            .labelsHidden()
+            .frame(width: 160)
+            .controlSize(.small)
           }
 
           Divider().padding(.leading, 14)
@@ -3489,7 +3589,8 @@ private struct ProviderSwitcherBar: View {
   private func indicatorFraction(for key: String, installed: Bool, active: Bool) -> Double {
     guard key != "all", installed, active else { return 0 }
     if let rem = vm.usageData?.cards?[key]?.quotaWindows?.first?.remainingPct {
-      return max(0.08, min(1.0, rem / 100.0))
+      let pct = vm.quotaDisplayMode.displayPct(fromRemaining: rem)
+      return max(0.08, min(1.0, pct / 100.0))
     }
     return 1.0
   }
@@ -4368,15 +4469,16 @@ private struct CodexBarStyleCardView: View {
   }
 
   private func quotaBlock(win: CardQuotaWindow) -> some View {
-    let clamped = min(1.0, max(0.0, win.remainingPct / 100.0))
-    let pctRounded = Int(win.remainingPct.rounded())
+    let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
+    let clamped = min(1.0, max(0.0, pct / 100.0))
+    let pctRounded = Int(pct.rounded())
     let trackColor = isCardHovered ? Color.white.opacity(0.24) : Color.primary.opacity(0.10)
     let fillColor = isCardHovered ? Color.white.opacity(0.95) : CodexBarPalette.tealBar
     let tickColor = isCardHovered ? Color.white.opacity(0.26) : Color.primary.opacity(0.14)
 
     return VStack(alignment: .leading, spacing: 3.5) {
       HStack(spacing: 6) {
-        Text("\(win.title) 剩余 \(pctRounded)%")
+        Text("\(win.title) \(vm.quotaDisplayMode.verbLabel) \(pctRounded)%")
           .font(.system(size: 12, weight: .semibold))
           .monospacedDigit()
           .foregroundColor(primaryText)
@@ -4413,7 +4515,7 @@ private struct CodexBarStyleCardView: View {
             Spacer()
           }
           // Linear pace marker with crisp background punch-out border
-          if let pacePct = win.pacePct {
+          if let pacePct = vm.quotaDisplayMode.displayPacePct(fromRemainingPace: win.pacePct) {
             let paceFrac = min(1.0, max(0.0, pacePct / 100.0))
             let paceX = min(max(0, geo.size.width - 5.0), max(0, geo.size.width * CGFloat(paceFrac) - 2.5))
             ZStack {
@@ -4650,6 +4752,8 @@ struct MenuBarPopoverView: View {
 final class StatusBarController: NSObject, NSPopoverDelegate {
   private struct IconCacheKey: Equatable {
     let style: MenuBarIconStyle
+    let provider: String
+    let quotaMode: QuotaDisplayMode
     let active: Bool
     let stale: Bool
     let primaryTenths: Int?
@@ -4744,7 +4848,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
   func updateButtonAppearance() {
     guard let btn = statusItem?.button else { return }
     btn.image = resolvedMenuBarIcon()
-    btn.appearsDisabled = !vm.isActiveOverall
+    let pinnedPaused = vm.menuBarProvider != "auto" && !vm.isToolEnabled(vm.menuBarProvider)
+    btn.appearsDisabled = !vm.isActiveOverall || pinnedPaused
 
     let summary = compactMenuBarTitle()
     if summary.isEmpty {
@@ -4763,7 +4868,12 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       return (nil, nil, true)
     }
     let candidateKeys: [String]
-    if vm.popoverSelection != "all", vm.isToolEnabled(vm.popoverSelection) {
+    if vm.menuBarProvider != "auto" {
+      guard vm.isToolEnabled(vm.menuBarProvider) else {
+        return (nil, nil, true)
+      }
+      candidateKeys = [vm.menuBarProvider]
+    } else if vm.popoverSelection != "all", vm.isToolEnabled(vm.popoverSelection) {
       candidateKeys = [vm.popoverSelection] + ["codex", "cursor", "antigravity", "codebuddy"].filter { $0 != vm.popoverSelection }
     } else {
       candidateKeys = ["codex", "cursor", "antigravity", "codebuddy"]
@@ -4772,8 +4882,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       guard vm.isToolEnabled(key) else { continue }
       if let entry = vm.apps[key], !entry.installed { continue }
       if let windows = vm.usageData?.cards?[key]?.quotaWindows, !windows.isEmpty {
-        let primary = windows[0].remainingPct
-        let secondary = windows.count > 1 ? windows[1].remainingPct : nil
+        let primary = vm.quotaDisplayMode.displayPct(fromRemaining: windows[0].remainingPct)
+        let secondary = windows.count > 1 ? vm.quotaDisplayMode.displayPct(fromRemaining: windows[1].remainingPct) : nil
         return (primary, secondary, !vm.daemonOnline)
       }
     }
@@ -4789,6 +4899,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     let sTenths = secondary.map { Int((min(100.0, max(0.0, $0)) * 10.0).rounded()) }
     let key = IconCacheKey(
       style: vm.menuBarIconStyle,
+      provider: vm.menuBarProvider == "auto" ? vm.popoverSelection : vm.menuBarProvider,
+      quotaMode: vm.quotaDisplayMode,
       active: vm.isActiveOverall,
       stale: stale,
       primaryTenths: pTenths,
@@ -4807,10 +4919,11 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     return img
   }
 
-  private func latestActiveTurn() -> (key: String, turn: TurnSummary)? {
+  private func latestActiveTurn(for providerFilter: String = "auto") -> (key: String, turn: TurnSummary)? {
     guard vm.isActiveOverall else { return nil }
+    let keys = providerFilter == "auto" ? vm.orderedKeys : [providerFilter]
     var best: (key: String, turn: TurnSummary, ts: Double)? = nil
-    for key in vm.orderedKeys {
+    for key in keys {
       guard vm.isToolEnabled(key),
             let entry = vm.apps[key],
             entry.installed,
@@ -4823,36 +4936,50 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     return best.map { ($0.key, $0.turn) }
   }
 
+  private func menuBarLabel(for key: String) -> String {
+    key == "antigravity" ? "AGY" : vm.toolShortTitle(for: key)
+  }
+
+  private func scopedTodayMetrics() -> (tokens: Int, costUsd: Double?)? {
+    if vm.menuBarProvider != "auto" {
+      guard vm.isToolEnabled(vm.menuBarProvider),
+            let today = vm.usageData?.cards?[vm.menuBarProvider]?.today else { return nil }
+      return (today.totalTokens, today.costUsd)
+    }
+    guard let today = vm.todaySummary else { return nil }
+    return (today.totalTokens, today.estimatedCostUsd)
+  }
+
   private func compactMenuBarTitle() -> String {
     guard vm.isActiveOverall else { return "" }
     switch vm.menuBarDisplayMode {
     case .iconOnly:
       return ""
     case .quotaRemaining:
+      let keys = vm.menuBarProvider != "auto"
+        ? [vm.menuBarProvider]
+        : ["codex", "cursor", "antigravity", "codebuddy"]
       var parts: [String] = []
-      if vm.isToolEnabled("codex"), let codexPct = vm.usageData?.cards?["codex"]?.quotaWindows?.first?.remainingPct {
-        parts.append("Codex \(Int(codexPct.rounded()))%")
-      }
-      if vm.isToolEnabled("cursor"), let cursorPct = vm.usageData?.cards?["cursor"]?.quotaWindows?.first?.remainingPct {
-        parts.append("Cursor \(Int(cursorPct.rounded()))%")
-      }
-      if vm.isToolEnabled("antigravity"), let agyPct = vm.usageData?.cards?["antigravity"]?.quotaWindows?.first?.remainingPct {
-        parts.append("AGY \(Int(agyPct.rounded()))%")
+      for key in keys {
+        guard vm.isToolEnabled(key),
+              let rem = vm.usageData?.cards?[key]?.quotaWindows?.first?.remainingPct else { continue }
+        let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: rem).rounded())
+        parts.append("\(menuBarLabel(for: key)) \(vm.quotaDisplayMode.compactPrefix)\(pct)%")
       }
       if !parts.isEmpty { return parts.joined(separator: " · ") }
-      guard let today = vm.todaySummary else { return "" }
-      return MeterFormat.usd(today.estimatedCostUsd)
+      guard let today = scopedTodayMetrics() else { return "" }
+      return MeterFormat.usd(today.costUsd)
     case .tps:
-      guard let (_, turn) = latestActiveTurn(), let tps = turn.tps, tps > 0 else { return "" }
+      guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider), let tps = turn.tps, tps > 0 else { return "" }
       return MeterFormat.tps(tps)
     case .todayCost:
-      guard let today = vm.todaySummary else { return "" }
-      return MeterFormat.usd(today.estimatedCostUsd)
+      guard let today = scopedTodayMetrics() else { return "" }
+      return MeterFormat.usd(today.costUsd)
     case .todayTokensAndCost:
-      guard let today = vm.todaySummary else { return "" }
-      return "\(MeterFormat.tokens(today.totalTokens)) · \(MeterFormat.usd(today.estimatedCostUsd))"
+      guard let today = scopedTodayMetrics() else { return "" }
+      return "\(MeterFormat.tokens(today.tokens)) · \(MeterFormat.usd(today.costUsd))"
     case .latestInline:
-      guard let (_, turn) = latestActiveTurn() else { return "" }
+      guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider) else { return "" }
       let inTok = MeterFormat.tokens(turn.totalInputTokens)
       if let tps = turn.tps, tps > 0 {
         return "\(inTok) · \(MeterFormat.tps(tps))"
