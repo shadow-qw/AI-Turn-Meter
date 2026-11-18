@@ -283,9 +283,11 @@ async function cmdCost(flags, jsonMode = false) {
 
   if (!usage) {
     const { TurnStore } = await import('../src/store.mjs');
+    const { getAllQuotas } = await import('../src/quota.mjs');
     const store = new TurnStore();
     try {
-      usage = store.getUsageSummary({ days, tool });
+      const quotasByTool = await getAllQuotas().catch(() => null);
+      usage = store.getUsageSummary({ days, tool, quotasByTool });
     } finally {
       store.close();
     }

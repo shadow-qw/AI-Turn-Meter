@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { formatInlineSummary, normalizeTurn, TOOL_LABELS } from './format.mjs';
+import { formatCacheRate, formatInlineSummary, formatTps, normalizeTurn, TOOL_LABELS } from './format.mjs';
 import { defaultCustomPricingPath, estimateTurnCost, loadCustomPricing } from './pricing.mjs';
 
 function startOfLocalDayMs(nowMs = Date.now()) {
@@ -471,9 +471,9 @@ export class TurnStore {
 
   /**
    * Aggregate usage, cost, and cache savings over `days` local calendar days (0 or 'all' = all history).
-   * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number }} [opts]
+   * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number, quotasByTool?: Record<string, any> | null }} [opts]
    */
-  getUsageSummary({ days = 7, tool = null, nowMs = Date.now() } = {}) {
+  getUsageSummary({ days = 7, tool = null, nowMs = Date.now(), quotasByTool = null } = {}) {
     const todayStartMs = startOfLocalDayMs(nowMs);
     const resolvedDays =
       days === 'all' || days === 0 || days === '0' || days === null
@@ -581,7 +581,7 @@ export class TurnStore {
         ...finalizeAccumulator(acc),
       }));
 
-    const cards = this.buildCardsByTool(nowMs, customRates);
+    const cards = this.buildCardsByTool(nowMs, customRates, quotasByTool);
 
     return {
       days: resolvedDays,
@@ -597,7 +597,24 @@ export class TurnStore {
     };
   }
 
-  buildCodexBarCardSnapshot(rows, nowMs = Date.now(), customRates = null) {
+  buildLatestTurnSubline(rows, todayFin) {
+    const latestRow = rows.length > 0 ? rows[rows.length - 1] : null;
+    const parts = [];
+    if (latestRow && typeof latestRow.tps === 'number' && Number.isFinite(latestRow.tps) && latestRow.tps > 0) {
+      parts.push(`最近速率 ${formatTps(latestRow.tps)}`);
+    } else if (todayFin && typeof todayFin.avgTps === 'number' && Number.isFinite(todayFin.avgTps) && todayFin.avgTps > 0) {
+      parts.push(`今日均速 ${formatTps(todayFin.avgTps)}`);
+    }
+    if (latestRow) {
+      const cacheStr = formatCacheRate(latestRow.cache_read_tokens, latestRow.total_input_tokens);
+      if (cacheStr !== '--') {
+        parts.push(`缓存 ${cacheStr}`);
+      }
+    }
+    return parts.length > 0 ? parts.join(' · ') : null;
+  }
+
+  buildCodexBarCardSnapshot(rows, nowMs = Date.now(), customRates = null, quotaInfo = null) {
     const todayStartMs = startOfLocalDayMs(nowMs);
     const nowDate = new Date(nowMs);
     const days30StartMs = new Date(
@@ -696,6 +713,11 @@ export class TurnStore {
     });
 
     return {
+      accountEmail: quotaInfo?.accountEmail ?? null,
+      planTitle: quotaInfo?.planTitle ?? null,
+      quotaWindows: Array.isArray(quotaInfo?.quotaWindows) ? quotaInfo.quotaWindows : [],
+      resetCreditsText: quotaInfo?.resetCreditsText ?? null,
+      latestTurnSubline: this.buildLatestTurnSubline(rows, todayFin),
       today: {
         costUsd: todayFin.estimatedCostUsd,
         totalTokens: todayFin.totalTokens,
@@ -723,7 +745,7 @@ export class TurnStore {
     };
   }
 
-  buildCardsByTool(nowMs = Date.now(), customRates = null) {
+  buildCardsByTool(nowMs = Date.now(), customRates = null, quotasByTool = null) {
     const nowDate = new Date(nowMs);
     const days30StartMs = new Date(
       nowDate.getFullYear(),
@@ -741,10 +763,15 @@ export class TurnStore {
     }
 
     const cards = {
-      all: this.buildCodexBarCardSnapshot(rows, nowMs, customRates),
+      all: this.buildCodexBarCardSnapshot(rows, nowMs, customRates, quotasByTool?.all || null),
     };
     for (const k of CARD_TOOL_KEYS) {
-      cards[k] = this.buildCodexBarCardSnapshot(byTool.get(k) || [], nowMs, customRates);
+      cards[k] = this.buildCodexBarCardSnapshot(
+        byTool.get(k) || [],
+        nowMs,
+        customRates,
+        quotasByTool?.[k] || null
+      );
     }
     return cards;
   }

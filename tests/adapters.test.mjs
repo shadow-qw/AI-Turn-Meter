@@ -48,6 +48,7 @@ import {
   patchCursorHooks,
 } from '../packages/daemon/src/installer.mjs';
 import { estimateTurnCost, resolveModelPricing } from '../packages/daemon/src/pricing.mjs';
+import { computeQuotaWindow } from '../packages/daemon/src/quota.mjs';
 
 test('formatting helpers match specification', () => {
   assert.equal(formatTokens(341), '341');
@@ -1733,6 +1734,79 @@ test('TurnStore.getUsageSummary & /v1/usage aggregate today, 7d, byTool, byModel
     assert.equal(stateRes.todaySummary.turnCount, 1);
   } finally {
     await meter.stop();
+  }
+});
+
+test('computeQuotaWindow calculates pace/reserve and getUsageSummary binds quota metadata & latestTurnSubline', () => {
+  const nowMs = Date.UTC(2026, 10, 18, 12, 0, 0);
+  // 5h window: 3h left (2h elapsed = 40% elapsed => expected remaining 60%), 90% remaining => 30% reserve
+  const qReserve = computeQuotaWindow({
+    id: 'session',
+    title: '会话',
+    remainingPct: 90,
+    windowSeconds: 18000,
+    resetAtMs: nowMs + 3 * 3600 * 1000,
+    nowMs,
+  });
+  assert.equal(qReserve.remainingPct, 90);
+  assert.equal(qReserve.pacePct, 60);
+  assert.equal(qReserve.resetText, '3 小时后重置');
+  assert.match(qReserve.subtitle, /余量 30% · 持续到重置 · \d+\.\d 倍余量/);
+
+  // 5h window: 3h left (60% expected remaining), 30% remaining => deficit & predicted exhaustion
+  const qDeficit = computeQuotaWindow({
+    id: 'session-low',
+    title: '会话',
+    usedPct: 70,
+    windowSeconds: 18000,
+    resetAtMs: nowMs + 3 * 3600 * 1000,
+    nowMs,
+  });
+  assert.equal(qDeficit.remainingPct, 30);
+  assert.equal(qDeficit.pacePct, 60);
+  assert.match(qDeficit.subtitle, /已多用 30% · 预计 .*后耗尽/);
+
+  const store = new TurnStore(':memory:');
+  try {
+    store.upsertTurn({
+      turnUid: 'codex:q1:t1',
+      tool: 'codex',
+      sessionId: 'q1',
+      turnId: 't1',
+      model: 'gpt-6-astra',
+      completedAtMs: nowMs - 1000,
+      totalInputTokens: 100_000,
+      cacheReadTokens: 90_000,
+      outputTokens: 1_500,
+      tps: 180,
+    });
+    const summary = store.getUsageSummary({
+      days: 7,
+      nowMs,
+      quotasByTool: {
+        all: {
+          accountEmail: '1 个已登录账号',
+          planTitle: '多客户端额度总览',
+          quotaWindows: [qReserve],
+          resetCreditsText: '3 次可用',
+        },
+        codex: {
+          accountEmail: 'user@example.com',
+          planTitle: 'Plus',
+          quotaWindows: [qReserve],
+          resetCreditsText: '3 次可用',
+        },
+      },
+    });
+    assert.equal(summary.cards.codex.accountEmail, 'user@example.com');
+    assert.equal(summary.cards.codex.planTitle, 'Plus');
+    assert.equal(summary.cards.codex.quotaWindows.length, 1);
+    assert.equal(summary.cards.codex.resetCreditsText, '3 次可用');
+    assert.equal(summary.cards.codex.latestTurnSubline, '最近速率 180 tok/s · 缓存 90%');
+    assert.equal(summary.cards.all.accountEmail, '1 个已登录账号');
+    assert.equal(summary.cards.cursor.quotaWindows.length, 0);
+  } finally {
+    store.close();
   }
 });
 

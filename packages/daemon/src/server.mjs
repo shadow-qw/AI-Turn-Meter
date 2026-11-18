@@ -8,6 +8,7 @@ import { CodeBuddyAdapter } from './adapters/codebuddy.mjs';
 import { drainCursorSpool, processCursorHookPayload } from './adapters/cursor.mjs';
 import { CdpInlineInjector } from './cdp-injector.mjs';
 import { getPackageMeta } from './installer.mjs';
+import { getAllQuotas } from './quota.mjs';
 import { TurnStore } from './store.mjs';
 
 const TOOL_KEYS = ['antigravity', 'codex', 'cursor', 'codebuddy'];
@@ -40,6 +41,7 @@ export function createMeterServer({
   enableWatchers = true,
   enableCdp = process.env.AI_TURN_METER_DISABLE_CDP !== '1',
   enableAntigravityRpc = true,
+  enableQuotaProbe = enableWatchers,
 } = {}) {
   const store = new TurnStore(dbPath);
   const hookStateDir = stateDir || (dbPath && dbPath !== ':memory:' ? dirname(dbPath) : undefined);
@@ -150,8 +152,17 @@ export function createMeterServer({
             ? Math.max(1, Math.round(Number(rawDays) || 7))
             : 7;
       const tool = url.searchParams.get('tool') || null;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(store.getUsageSummary({ days, tool })));
+      const sendUsage = async () => {
+        const quotasByTool = enableQuotaProbe ? await getAllQuotas().catch(() => null) : null;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(store.getUsageSummary({ days, tool, quotasByTool })));
+      };
+      sendUsage().catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(store.getUsageSummary({ days, tool })));
+        }
+      });
       return;
     }
 
@@ -291,6 +302,9 @@ export function createMeterServer({
       spoolTimer.unref?.();
     }
     cdpInjector?.start();
+    if (enableQuotaProbe) {
+      getAllQuotas().catch(() => {});
+    }
 
     return server.address();
   }

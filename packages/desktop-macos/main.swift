@@ -127,7 +127,21 @@ struct CardRecentWindow: Decodable, Identifiable {
   let turnCount: Int
 }
 
+struct CardQuotaWindow: Decodable, Identifiable {
+  let id: String
+  let title: String
+  let remainingPct: Double
+  let resetText: String?
+  let pacePct: Double?
+  let subtitle: String?
+}
+
 struct CodexBarCardSnapshot: Decodable {
+  let accountEmail: String?
+  let planTitle: String?
+  let quotaWindows: [CardQuotaWindow]?
+  let resetCreditsText: String?
+  let latestTurnSubline: String?
   let today: CardTodayMetrics
   let currentWindow: CardWindowMetrics
   let days30: CardWindowMetrics
@@ -194,17 +208,19 @@ enum MainTab: String, CaseIterable {
 
 enum MenuBarDisplayMode: String, CaseIterable {
   case iconOnly = "iconOnly"
-  case tps = "tps"
+  case quotaRemaining = "quotaRemaining"
   case todayCost = "todayCost"
   case todayTokensAndCost = "todayTokensAndCost"
+  case tps = "tps"
   case latestInline = "latestInline"
 
   var title: String {
     switch self {
     case .iconOnly: return "仅图标"
-    case .tps: return "实时速度"
+    case .quotaRemaining: return "剩余额度"
     case .todayCost: return "今日费用"
     case .todayTokensAndCost: return "今日用量 + 费用"
+    case .tps: return "实时速度"
     case .latestInline: return "最近一轮简报"
     }
   }
@@ -410,7 +426,7 @@ final class MeterViewModel: ObservableObject {
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
   }
 
-  @Published var version: String = "0.2.7"
+  @Published var version: String = "0.2.8"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -482,6 +498,7 @@ final class MeterViewModel: ObservableObject {
   private var pollTimer: Timer?
   private var didBootstrap = false
   private var hasStarted = false
+  private var lastUsageRefreshAt: Date = .distantPast
 
   let orderedKeys = ["antigravity", "codex", "cursor", "codebuddy"]
 
@@ -593,6 +610,9 @@ final class MeterViewModel: ObservableObject {
       }
     } else if showMenuBarExtra {
       fetchDaemonStateLight()
+      if Date().timeIntervalSince(lastUsageRefreshAt) >= 45 {
+        fetchUsageSummary(silent: true)
+      }
     }
   }
 
@@ -760,7 +780,7 @@ final class MeterViewModel: ObservableObject {
       string: "http://127.0.0.1:\(daemonPort)/v1/usage?days=\(usageDays)\(usageToolFilter == "all" ? "" : "&tool=\(usageToolFilter)")"
     ) else { return }
     if !silent { usageLoading = true }
-    var req = URLRequest(url: url, timeoutInterval: 4)
+    var req = URLRequest(url: url, timeoutInterval: 6)
     req.cachePolicy = .reloadIgnoringLocalCacheData
 
     URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
@@ -774,6 +794,7 @@ final class MeterViewModel: ObservableObject {
         }
         self.usageData = parsed
         self.lastSyncedAt = Date()
+        self.lastUsageRefreshAt = Date()
         if self.usageToolFilter == "all" {
           self.todaySummary = parsed.today
         }
@@ -2936,7 +2957,7 @@ private struct CodexBarStyleCardView: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 11) {
-      // Card Header
+      // Card Header (CodexBar style: Email / Plan on the right)
       HStack(alignment: .top) {
         VStack(alignment: .leading, spacing: 2) {
           Text(headerTitle)
@@ -2950,46 +2971,55 @@ private struct CodexBarStyleCardView: View {
         Spacer()
 
         VStack(alignment: .trailing, spacing: 2) {
-          Text(statusLabel)
+          Text(card.accountEmail ?? statusLabel)
             .font(.system(size: 11.5, weight: .semibold))
             .foregroundColor(primaryText)
-          Text(
-            latestTurn?.model != nil && latestTurn?.model != "unknown"
-              ? latestTurn!.model!
-              : "本地 Token 统计"
-          )
-          .font(.system(size: 10))
-          .foregroundColor(secondaryText)
-          .lineLimit(1)
+            .lineLimit(1)
+          Text(card.planTitle ?? "本地监控")
+            .font(.system(size: 10))
+            .foregroundColor(secondaryText)
+            .lineLimit(1)
         }
       }
 
-      // Bar 1: Latest Turn Cache Hit + TPS
-      progressBlock(
-        title: "最近一轮缓存",
-        pct: latestTurn?.cacheRatePct,
-        rightText: (latestTurn?.tps ?? 0) > 0 ? MeterFormat.tps(latestTurn?.tps) : "等待采样",
-        subtitle: {
-          if let t = latestTurn {
-            let costStr = t.estimatedCostUsd != nil ? " · 本轮 \(MeterFormat.usd(t.estimatedCostUsd))" : ""
-            return "入 \(MeterFormat.tokens(t.totalInputTokens)) · 出 \(MeterFormat.tokens(t.outputTokens))\(costStr)"
+      // Primary Quota Windows (CodexBar style: Remaining % + Reset countdown + Pace marker)
+      let windows = card.quotaWindows ?? []
+      if !windows.isEmpty {
+        VStack(alignment: .leading, spacing: 10) {
+          ForEach(windows) { win in
+            quotaBlock(win: win)
           }
-          return "完成下一轮 AI 回复后自动更新速率与缓存命中"
-        }()
-      )
+        }
+      } else {
+        HStack(spacing: 6) {
+          Text(
+            isAll
+              ? "正在同步客户端登录与额度信息…"
+              : ((vm.apps[selection]?.installed ?? false)
+                  ? "企业/团队或按量模式 · 无固定个人会话限额"
+                  : "未检测到该客户端安装")
+          )
+          .font(.system(size: 11))
+          .foregroundColor(secondaryText)
+          .lineLimit(1)
+          Spacer()
+          Text(statusLabel)
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
+        }
+        .padding(.vertical, 2)
+      }
 
-      // Bar 2: Today Cache Efficiency & Savings
-      progressBlock(
-        title: "今日缓存效率",
-        pct: card.today.cacheRatePct,
-        rightText: "\(card.today.turnCount) 轮 · \(card.today.callCount) 次",
-        subtitle: {
-          if let saved = card.today.cacheSavingsUsd, saved > 0 {
-            return "今日已省 \(MeterFormat.usd(saved)) · 均速 \(MeterFormat.tps(card.today.avgTps))"
-          }
-          return "今日平均速度 \(MeterFormat.tps(card.today.avgTps)) · 共 \(MeterFormat.tokens(card.today.totalTokens))"
-        }()
-      )
+      if let resetCredits = card.resetCreditsText, !resetCredits.isEmpty {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("限额重置额度")
+            .font(.system(size: 11.5, weight: .bold))
+            .foregroundColor(primaryText)
+          Text(resetCredits)
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundColor(isCardHovered ? .white.opacity(0.88) : .primary.opacity(0.85))
+        }
+      }
 
       Rectangle()
         .fill(isCardHovered ? Color.white.opacity(0.2) : Color.primary.opacity(0.09))
@@ -3053,12 +3083,25 @@ private struct CodexBarStyleCardView: View {
         }
       }
 
-      // Footer Model & Disclaimer
+      // Footer Model, TPS Sub-label & Disclaimer
       VStack(alignment: .leading, spacing: 1.5) {
         if let topModel = card.topModel {
           Text("最常用模型：\(topModel)")
             .font(.system(size: 10.5, weight: .medium))
             .foregroundColor(isCardHovered ? .white.opacity(0.9) : .primary.opacity(0.85))
+            .lineLimit(1)
+        }
+        if let subline = card.latestTurnSubline, !subline.isEmpty {
+          Text(subline)
+            .font(.system(size: 9.5))
+            .monospacedDigit()
+            .foregroundColor(secondaryText)
+            .lineLimit(1)
+        } else if let tps = latestTurn?.tps, tps > 0 {
+          Text("最近速率 \(MeterFormat.tps(tps))")
+            .font(.system(size: 9.5))
+            .monospacedDigit()
+            .foregroundColor(secondaryText)
             .lineLimit(1)
         }
         Text("根据 Token 用量估算 · 不是订阅账单")
@@ -3089,24 +3132,28 @@ private struct CodexBarStyleCardView: View {
     .padding(.horizontal, 10)
   }
 
-  private func progressBlock(title: String, pct: Double?, rightText: String, subtitle: String) -> some View {
-    let clamped = min(1.0, max(0.0, (pct ?? 0) / 100.0))
-    let headline = pct != nil ? "\(title) \(MeterFormat.pct(pct))" : title
+  private func quotaBlock(win: CardQuotaWindow) -> some View {
+    let clamped = min(1.0, max(0.0, win.remainingPct / 100.0))
+    let pctRounded = Int(win.remainingPct.rounded())
     let trackColor = isCardHovered ? Color.white.opacity(0.22) : Color.primary.opacity(0.10)
     let fillColor = isCardHovered ? Color.white.opacity(0.95) : CodexBarPalette.accentBlue
     let tickColor = isCardHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.16)
+    let paceTickColor = isCardHovered ? Color.white.opacity(0.95) : Color.primary.opacity(0.65)
 
     return VStack(alignment: .leading, spacing: 4) {
       HStack {
-        Text(headline)
+        Text("\(win.title) 剩余 \(pctRounded)%")
           .font(.system(size: 12, weight: .bold))
+          .monospacedDigit()
           .foregroundColor(primaryText)
         Spacer()
-        Text(rightText)
-          .font(.system(size: 10.5, weight: .medium))
-          .monospacedDigit()
-          .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
-          .lineLimit(1)
+        if let resetText = win.resetText, !resetText.isEmpty {
+          Text(resetText)
+            .font(.system(size: 10.5, weight: .medium))
+            .monospacedDigit()
+            .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
+            .lineLimit(1)
+        }
       }
 
       GeometryReader { geo in
@@ -3128,14 +3175,26 @@ private struct CodexBarStyleCardView: View {
             Rectangle().fill(tickColor).frame(width: 1, height: 7)
             Spacer()
           }
+          // Expected remaining pace marker
+          if let pacePct = win.pacePct {
+            let paceFrac = min(1.0, max(0.0, pacePct / 100.0))
+            let paceX = min(geo.size.width - 2.2, max(0, geo.size.width * CGFloat(paceFrac) - 1.1))
+            RoundedRectangle(cornerRadius: 1)
+              .fill(paceTickColor)
+              .frame(width: 2.2, height: 10)
+              .offset(x: paceX)
+          }
         }
       }
-      .frame(height: 6.5)
+      .frame(height: 7)
 
-      Text(subtitle)
-        .font(.system(size: 10))
-        .foregroundColor(secondaryText)
-        .lineLimit(1)
+      if let sub = win.subtitle, !sub.isEmpty {
+        Text(sub)
+          .font(.system(size: 10))
+          .monospacedDigit()
+          .foregroundColor(secondaryText)
+          .lineLimit(1)
+      }
     }
   }
 
@@ -3248,6 +3307,11 @@ struct MenuBarPopoverView: View {
       turnCount: todayTotals?.turnCount ?? 0
     )
     return CodexBarCardSnapshot(
+      accountEmail: nil,
+      planTitle: nil,
+      quotaWindows: nil,
+      resetCreditsText: nil,
+      latestTurnSubline: nil,
       today: emptyToday,
       currentWindow: emptyWin,
       days30: emptyWin,
@@ -3586,6 +3650,17 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     switch vm.menuBarDisplayMode {
     case .iconOnly:
       return ""
+    case .quotaRemaining:
+      var parts: [String] = []
+      if let codexPct = vm.usageData?.cards?["codex"]?.quotaWindows?.first?.remainingPct {
+        parts.append("Codex \(Int(codexPct.rounded()))%")
+      }
+      if let agyPct = vm.usageData?.cards?["antigravity"]?.quotaWindows?.first?.remainingPct {
+        parts.append("AGY \(Int(agyPct.rounded()))%")
+      }
+      if !parts.isEmpty { return parts.joined(separator: " · ") }
+      guard let today = vm.todaySummary else { return "" }
+      return MeterFormat.usd(today.estimatedCostUsd)
     case .tps:
       guard let (_, turn) = latestActiveTurn(), let tps = turn.tps, tps > 0 else { return "" }
       return MeterFormat.tps(tps)
