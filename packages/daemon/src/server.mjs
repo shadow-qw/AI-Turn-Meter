@@ -105,7 +105,7 @@ export function createMeterServer({
 
   function onTurnsChanged(records) {
     if (!records || records.length === 0) return;
-    const state = { ...store.getState(), config: publicConfig(config) };
+    const state = { ...store.getState(20, config.tools), config: publicConfig(config) };
     broadcast('state', state);
     for (const r of records) {
       broadcast('turn', r);
@@ -153,7 +153,7 @@ export function createMeterServer({
     if (req.method === 'GET' && url.pathname === '/v1/state') {
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ...store.getState(limit), config: publicConfig(config) }));
+      res.end(JSON.stringify({ ...store.getState(limit, config.tools), config: publicConfig(config) }));
       return;
     }
 
@@ -183,15 +183,25 @@ export function createMeterServer({
       const forceRefresh = url.searchParams.get('refresh') === '1';
       const sendUsage = async () => {
         const quotasByTool = enableQuotaProbe
-          ? await getAllQuotas(Date.now(), { forceRefresh, cursorCookie: config.cursorCookie }).catch(() => null)
+          ? await getAllQuotas(Date.now(), {
+              forceRefresh,
+              cursorCookie: config.cursorCookie,
+              enabledTools: config.tools,
+            }).catch(() => null)
           : null;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(store.getUsageSummary({ days, tool, quotasByTool })));
+        res.end(
+          JSON.stringify(
+            store.getUsageSummary({ days, tool, quotasByTool, enabledTools: config.tools })
+          )
+        );
       };
       sendUsage().catch(() => {
         if (!res.headersSent) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(store.getUsageSummary({ days, tool })));
+          res.end(
+            JSON.stringify(store.getUsageSummary({ days, tool, enabledTools: config.tools }))
+          );
         }
       });
       return;
@@ -219,7 +229,9 @@ export function createMeterServer({
         Connection: 'keep-alive',
       });
       sseClients.add(res);
-      res.write(`event: state\ndata: ${JSON.stringify({ ...store.getState(), config: publicConfig(config) })}\n\n`);
+      res.write(
+        `event: state\ndata: ${JSON.stringify({ ...store.getState(20, config.tools), config: publicConfig(config) })}\n\n`
+      );
       const keepAlive = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -278,7 +290,7 @@ export function createMeterServer({
             }
             persistConfig();
             const pubCfg = publicConfig(config);
-            broadcast('state', { ...store.getState(), config: pubCfg });
+            broadcast('state', { ...store.getState(20, config.tools), config: pubCfg });
             if (cdpInjector) {
               for (const k of TOOL_KEYS) {
                 const was = prevInline[k];

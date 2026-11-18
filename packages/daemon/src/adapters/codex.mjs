@@ -1,6 +1,19 @@
 import { readdirSync, readFileSync, statSync, watch } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+
+const CODEX_OPENAI_MODEL_RE = /^(?:openai\/)?(?:gpt-|o1|o3|o4|codex-|chatgpt-)/i;
+
+/**
+ * Return true when `model` is an OpenAI / Codex model rather than a third-party gateway proxy.
+ * @param {string} model
+ */
+export function isCodexOpenAiModel(model) {
+  if (typeof model !== 'string') return false;
+  const trimmed = model.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'unknown') return false;
+  return CODEX_OPENAI_MODEL_RE.test(trimmed);
+}
 
 function parseIsoMs(ts) {
   if (typeof ts !== 'string') return null;
@@ -36,16 +49,27 @@ function mergeIntervalsMs(intervals) {
  * Parse a Codex session rollout JSONL string into completed TurnRecord inputs.
  * @param {string} content
  * @param {string} filePath
+ * @param {{ flushOpenTurns?: boolean, onlyOpenAiModels?: boolean }} [opts]
  */
-export function parseCodexSessionContent(content, filePath = '') {
+export function parseCodexSessionContent(
+  content,
+  filePath = '',
+  { flushOpenTurns = false, onlyOpenAiModels = true } = {}
+) {
   const lines = content.split(/\r?\n/);
   let sessionId = filePath.split('/').pop()?.replace(/\.jsonl$/, '') || 'codex-session';
+  let hasSessionMetaId = false;
+  let isForkedRollout = /_[0-9a-f-]{20,}\.jsonl$/i.test(filePath);
   let workspacePath = null;
   let currentModel = 'unknown';
 
   /** @type {Map<string, any>} */
   const turns = new Map();
   const completedTurns = [];
+
+  let fileLastTotalSig = null;
+  let hasSeenTokenUsageRecord = false;
+  let skippedForkBaseline = false;
 
   function ensureTurn(turnId, startedAtMs = null) {
     if (!turnId) return null;
@@ -54,7 +78,9 @@ export function parseCodexSessionContent(content, filePath = '') {
       t = {
         turnId,
         model: currentModel,
+        hasTurnContextModel: false,
         startedAtMs,
+        lastEventMs: startedAtMs,
         calls: [],
         seenResponseIds: new Set(),
         lastCallEndMs: null,
@@ -64,21 +90,149 @@ export function parseCodexSessionContent(content, filePath = '') {
         promptAnchorMs: null,
         firstGenStartMs: null,
         genIntervals: [],
-        lastTokenCountTotal: null,
         fallbackTurnUsage: { input: 0, cached: 0, cacheWrite: 0, output: 0, thinking: 0, calls: 0 },
+        lastAgentText: null,
+        flushed: false,
       };
       turns.set(turnId, t);
     }
     if (startedAtMs !== null && t.startedAtMs === null) {
       t.startedAtMs = startedAtMs;
     }
-    if (t.model === 'unknown' && currentModel !== 'unknown') {
+    if (startedAtMs !== null) {
+      t.lastEventMs = startedAtMs;
+    }
+    if (!t.hasTurnContextModel && t.model === 'unknown' && currentModel !== 'unknown') {
       t.model = currentModel;
     }
     return t;
   }
 
+  function finalizeTurn(t, { completedAtMs, explicitDurationMs = null, rawTtftMs = null, lastAgentMessage = null } = {}) {
+    if (!t || t.flushed) return;
+    t.flushed = true;
+
+    const effectiveModel = t.model !== 'unknown' ? t.model : currentModel;
+    if (onlyOpenAiModels && !isCodexOpenAiModel(effectiveModel)) {
+      return;
+    }
+
+    let totalInputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheWriteTokens = 0;
+    let outputTokens = 0;
+    let thinkingTokens = 0;
+    let callCount = t.calls.length;
+
+    if (t.calls.length > 0) {
+      const lastTurnUsage = [...t.calls].reverse().find((c) => c.turnUsage)?.turnUsage;
+      if (lastTurnUsage) {
+        totalInputTokens = Number(lastTurnUsage.input_tokens) || 0;
+        cacheReadTokens = Number(lastTurnUsage.cached_input_tokens) || 0;
+        cacheWriteTokens = Number(lastTurnUsage.cache_write_input_tokens) || 0;
+        outputTokens = Number(lastTurnUsage.output_tokens) || 0;
+        thinkingTokens = Number(lastTurnUsage.reasoning_output_tokens) || 0;
+      } else {
+        for (const c of t.calls) {
+          if (!c.usage) continue;
+          totalInputTokens += Number(c.usage.input_tokens) || 0;
+          cacheReadTokens += Number(c.usage.cached_input_tokens) || 0;
+          cacheWriteTokens += Number(c.usage.cache_write_input_tokens) || 0;
+          outputTokens += Number(c.usage.output_tokens) || 0;
+          thinkingTokens += Number(c.usage.reasoning_output_tokens) || 0;
+        }
+      }
+    } else if (t.fallbackTurnUsage.calls > 0) {
+      totalInputTokens = t.fallbackTurnUsage.input;
+      cacheReadTokens = t.fallbackTurnUsage.cached;
+      cacheWriteTokens = t.fallbackTurnUsage.cacheWrite;
+      outputTokens = t.fallbackTurnUsage.output;
+      thinkingTokens = t.fallbackTurnUsage.thinking;
+      callCount = t.fallbackTurnUsage.calls;
+    }
+
+    if (totalInputTokens <= 0 && outputTokens <= 0) return;
+
+    const resolvedCompletedMs = completedAtMs ?? t.lastEventMs ?? t.startedAtMs ?? Date.now();
+    const durationMs =
+      explicitDurationMs !== null && explicitDurationMs >= 0
+        ? explicitDurationMs
+        : t.startedAtMs !== null
+          ? Math.max(0, resolvedCompletedMs - t.startedAtMs)
+          : null;
+
+    const genMs = mergeIntervalsMs(t.genIntervals);
+    const anchorMs = t.promptAnchorMs ?? t.startedAtMs;
+    let ttftMs = rawTtftMs;
+    if (genMs >= 150 && t.firstGenStartMs !== null) {
+      ttftMs =
+        anchorMs !== null && t.firstGenStartMs >= anchorMs
+          ? Math.round(t.firstGenStartMs - anchorMs)
+          : thinkingTokens === 0
+            ? rawTtftMs
+            : null;
+    }
+
+    let modelActiveMs = null;
+    let tpsMethod = 'e2e_turn';
+    if (genMs >= 150) {
+      modelActiveMs = Math.round(genMs);
+      tpsMethod = 'streaming_decode';
+    } else if (durationMs !== null) {
+      const withoutTools = Math.max(0, durationMs - t.toolWaitMs);
+      // Only subtract Codex time_to_first_token_ms when no hidden reasoning ran,
+      // because Codex sets it at the first visible AgentMessage token after Reasoning.
+      if (callCount === 1 && thinkingTokens === 0 && ttftMs !== null && withoutTools - ttftMs >= 150) {
+        modelActiveMs = withoutTools - ttftMs;
+        tpsMethod = 'active_model';
+      } else if (t.toolWaitMs > 0 && withoutTools >= 150) {
+        modelActiveMs = withoutTools;
+        tpsMethod = 'active_model';
+      } else {
+        modelActiveMs = durationMs;
+        tpsMethod = ttftMs !== null && callCount > 1 ? 'active_model' : 'e2e_turn';
+      }
+    }
+
+    completedTurns.push({
+      turnUid: `codex:${sessionId}:${t.turnId}`,
+      tool: 'codex',
+      host: 'codex-desktop',
+      sessionId,
+      turnId: t.turnId,
+      model: effectiveModel,
+      workspacePath,
+      startedAtMs: t.startedAtMs,
+      completedAtMs: resolvedCompletedMs,
+      callCount,
+      totalInputTokens,
+      uncachedInputTokens: Math.max(0, totalInputTokens - cacheReadTokens - cacheWriteTokens),
+      cacheReadTokens,
+      cacheWriteTokens,
+      outputTokens,
+      thinkingTokens,
+      durationMs,
+      modelActiveMs,
+      ttftMs,
+      tpsMethod,
+      replyPreview:
+        typeof lastAgentMessage === 'string' && lastAgentMessage.trim()
+          ? lastAgentMessage
+          : t.lastAgentText || null,
+    });
+  }
+
   let activeTurnId = null;
+
+  function switchActiveTurn(newTurnId, tsMs) {
+    if (activeTurnId && newTurnId && activeTurnId !== newTurnId) {
+      const prev = turns.get(activeTurnId);
+      if (prev && !prev.flushed) {
+        finalizeTurn(prev, { completedAtMs: prev.lastEventMs ?? tsMs });
+      }
+    }
+    if (newTurnId) activeTurnId = newTurnId;
+  }
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -95,7 +249,14 @@ export function parseCodexSessionContent(content, filePath = '') {
     if (!p || typeof p !== 'object') continue;
 
     if (topType === 'session_meta') {
-      if (typeof p.id === 'string' && p.id) sessionId = p.id;
+      const metaId = typeof p.id === 'string' && p.id ? p.id : typeof p.session_id === 'string' && p.session_id ? p.session_id : null;
+      if (metaId) {
+        sessionId = metaId;
+        hasSessionMetaId = true;
+      }
+      if (p.forked_from_id || p.history_base || p.subagent_history_start_ordinal) {
+        isForkedRollout = true;
+      }
       if (typeof p.cwd === 'string' && p.cwd) workspacePath = p.cwd;
       continue;
     }
@@ -104,25 +265,34 @@ export function parseCodexSessionContent(content, filePath = '') {
       if (typeof p.model === 'string' && p.model) currentModel = p.model;
       if (typeof p.cwd === 'string' && p.cwd && !workspacePath) workspacePath = p.cwd;
       if (typeof p.turn_id === 'string' && p.turn_id) {
-        activeTurnId = p.turn_id;
+        switchActiveTurn(p.turn_id, tsMs);
         const t = ensureTurn(activeTurnId, tsMs);
-        if (t && currentModel !== 'unknown') t.model = currentModel;
+        if (t && typeof p.model === 'string' && p.model) {
+          t.model = p.model;
+          t.hasTurnContextModel = true;
+        }
       }
       continue;
     }
 
     if (topType === 'token_usage_record') {
+      hasSeenTokenUsageRecord = true;
       const turnId = p.turn_id || activeTurnId;
       const t = ensureTurn(turnId, tsMs);
       if (!t) continue;
-      if (typeof p.session_id === 'string' && p.session_id) sessionId = p.session_id;
+      if (!hasSessionMetaId && typeof p.session_id === 'string' && p.session_id) {
+        sessionId = p.session_id;
+      }
 
       // Flush any completed tool execution window before this API call finished
       if (t.lastCallEndMs !== null && t.lastToolEndMs !== null && t.lastToolEndMs > t.lastCallEndMs) {
         t.toolWaitMs += t.lastToolEndMs - t.lastCallEndMs;
       }
       t.lastToolEndMs = null;
-      if (tsMs !== null) t.lastCallEndMs = tsMs;
+      if (tsMs !== null) {
+        t.lastCallEndMs = tsMs;
+        t.lastEventMs = tsMs;
+      }
 
       const respId = typeof p.response_id === 'string' ? p.response_id : null;
       if (!respId || !t.seenResponseIds.has(respId)) {
@@ -139,6 +309,7 @@ export function parseCodexSessionContent(content, filePath = '') {
     if (topType === 'response_item') {
       const t = ensureTurn(activeTurnId, tsMs);
       if (t && tsMs !== null) {
+        t.lastEventMs = tsMs;
         if (p.type === 'function_call_output' || p.type === 'custom_tool_call_output') {
           t.lastToolEndMs = tsMs;
         }
@@ -151,14 +322,21 @@ export function parseCodexSessionContent(content, filePath = '') {
 
     if (pt === 'thread_settings_applied') {
       const m = p.thread_settings?.model;
-      if (typeof m === 'string' && m) currentModel = m;
+      if (typeof m === 'string' && m) {
+        currentModel = m;
+        // Only backfill if current active turn had no turn_context model yet
+        const activeTurn = activeTurnId ? turns.get(activeTurnId) : null;
+        if (activeTurn && !activeTurn.hasTurnContextModel && activeTurn.model === 'unknown') {
+          activeTurn.model = m;
+        }
+      }
       const cwd = p.thread_settings?.cwd;
       if (typeof cwd === 'string' && cwd && !workspacePath) workspacePath = cwd;
       continue;
     }
 
     if (pt === 'task_started') {
-      activeTurnId = p.turn_id || activeTurnId;
+      switchActiveTurn(p.turn_id, tsMs);
       const startedMs =
         tsMs ?? (typeof p.started_at === 'number' ? p.started_at * 1000 : null);
       ensureTurn(activeTurnId, startedMs);
@@ -171,14 +349,28 @@ export function parseCodexSessionContent(content, filePath = '') {
       const total = p.info?.total_token_usage;
       if (t && last && typeof last === 'object') {
         const sig = JSON.stringify(total || last);
-        if (t.lastTokenCountTotal !== sig) {
-          t.lastTokenCountTotal = sig;
-          t.fallbackTurnUsage.input += Number(last.input_tokens) || 0;
-          t.fallbackTurnUsage.cached += Number(last.cached_input_tokens) || 0;
-          t.fallbackTurnUsage.cacheWrite += Number(last.cache_write_input_tokens) || 0;
-          t.fallbackTurnUsage.output += Number(last.output_tokens) || 0;
-          t.fallbackTurnUsage.thinking += Number(last.reasoning_output_tokens) || 0;
-          t.fallbackTurnUsage.calls += 1;
+        if (fileLastTotalSig !== sig) {
+          fileLastTotalSig = sig;
+          const totalIn = Number(total?.input_tokens) || 0;
+          const lastIn = Number(last.input_tokens) || 0;
+          // In forked/resumed rollouts, initial token_count before any new call reflects the inherited parent baseline.
+          if (
+            isForkedRollout &&
+            !hasSeenTokenUsageRecord &&
+            !skippedForkBaseline &&
+            t.fallbackTurnUsage.calls === 0 &&
+            t.calls.length === 0 &&
+            totalIn > lastIn
+          ) {
+            skippedForkBaseline = true;
+          } else {
+            t.fallbackTurnUsage.input += lastIn;
+            t.fallbackTurnUsage.cached += Number(last.cached_input_tokens) || 0;
+            t.fallbackTurnUsage.cacheWrite += Number(last.cache_write_input_tokens) || 0;
+            t.fallbackTurnUsage.output += Number(last.output_tokens) || 0;
+            t.fallbackTurnUsage.thinking += Number(last.reasoning_output_tokens) || 0;
+            t.fallbackTurnUsage.calls += 1;
+          }
         }
       }
       continue;
@@ -221,114 +413,29 @@ export function parseCodexSessionContent(content, filePath = '') {
       const completedAtMs =
         tsMs ??
         (typeof p.completed_at === 'number' ? p.completed_at * 1000 : Date.now());
-      const durationMs =
-        typeof p.duration_ms === 'number' && p.duration_ms >= 0
-          ? p.duration_ms
-          : t.startedAtMs !== null
-            ? Math.max(0, completedAtMs - t.startedAtMs)
-            : null;
+      const explicitDurationMs =
+        typeof p.duration_ms === 'number' && p.duration_ms >= 0 ? p.duration_ms : null;
       const rawTtftMs =
         typeof p.time_to_first_token_ms === 'number' && p.time_to_first_token_ms >= 0
           ? p.time_to_first_token_ms
           : null;
 
-      let totalInputTokens = 0;
-      let cacheReadTokens = 0;
-      let cacheWriteTokens = 0;
-      let outputTokens = 0;
-      let thinkingTokens = 0;
-      let callCount = t.calls.length;
-
-      if (t.calls.length > 0) {
-        const lastTurnUsage = [...t.calls].reverse().find((c) => c.turnUsage)?.turnUsage;
-        if (lastTurnUsage) {
-          totalInputTokens = Number(lastTurnUsage.input_tokens) || 0;
-          cacheReadTokens = Number(lastTurnUsage.cached_input_tokens) || 0;
-          cacheWriteTokens = Number(lastTurnUsage.cache_write_input_tokens) || 0;
-          outputTokens = Number(lastTurnUsage.output_tokens) || 0;
-          thinkingTokens = Number(lastTurnUsage.reasoning_output_tokens) || 0;
-        } else {
-          for (const c of t.calls) {
-            if (!c.usage) continue;
-            totalInputTokens += Number(c.usage.input_tokens) || 0;
-            cacheReadTokens += Number(c.usage.cached_input_tokens) || 0;
-            cacheWriteTokens += Number(c.usage.cache_write_input_tokens) || 0;
-            outputTokens += Number(c.usage.output_tokens) || 0;
-            thinkingTokens += Number(c.usage.reasoning_output_tokens) || 0;
-          }
-        }
-      } else if (t.fallbackTurnUsage.calls > 0) {
-        totalInputTokens = t.fallbackTurnUsage.input;
-        cacheReadTokens = t.fallbackTurnUsage.cached;
-        cacheWriteTokens = t.fallbackTurnUsage.cacheWrite;
-        outputTokens = t.fallbackTurnUsage.output;
-        thinkingTokens = t.fallbackTurnUsage.thinking;
-        callCount = t.fallbackTurnUsage.calls;
-      }
-
-      if (totalInputTokens > 0 || outputTokens > 0) {
-        const genMs = mergeIntervalsMs(t.genIntervals);
-        const anchorMs = t.promptAnchorMs ?? t.startedAtMs;
-        let ttftMs = rawTtftMs;
-        if (genMs >= 150 && t.firstGenStartMs !== null) {
-          ttftMs =
-            anchorMs !== null && t.firstGenStartMs >= anchorMs
-              ? Math.round(t.firstGenStartMs - anchorMs)
-              : thinkingTokens === 0
-                ? rawTtftMs
-                : null;
-        }
-
-        let modelActiveMs = null;
-        let tpsMethod = 'e2e_turn';
-        if (genMs >= 150) {
-          modelActiveMs = Math.round(genMs);
-          tpsMethod = 'streaming_decode';
-        } else if (durationMs !== null) {
-          const withoutTools = Math.max(0, durationMs - t.toolWaitMs);
-          // Only subtract Codex time_to_first_token_ms when no hidden reasoning ran,
-          // because Codex sets it at the first visible AgentMessage token after Reasoning.
-          if (callCount === 1 && thinkingTokens === 0 && ttftMs !== null && withoutTools - ttftMs >= 150) {
-            modelActiveMs = withoutTools - ttftMs;
-            tpsMethod = 'active_model';
-          } else if (t.toolWaitMs > 0 && withoutTools >= 150) {
-            modelActiveMs = withoutTools;
-            tpsMethod = 'active_model';
-          } else {
-            modelActiveMs = durationMs;
-            tpsMethod = ttftMs !== null && callCount > 1 ? 'active_model' : 'e2e_turn';
-          }
-        }
-
-        completedTurns.push({
-          turnUid: `codex:${sessionId}:${turnId}`,
-          tool: 'codex',
-          host: 'codex-desktop',
-          sessionId,
-          turnId,
-          model: t.model || currentModel,
-          workspacePath,
-          startedAtMs: t.startedAtMs,
-          completedAtMs,
-          callCount,
-          totalInputTokens,
-          uncachedInputTokens: Math.max(0, totalInputTokens - cacheReadTokens - cacheWriteTokens),
-          cacheReadTokens,
-          cacheWriteTokens,
-          outputTokens,
-          thinkingTokens,
-          durationMs,
-          modelActiveMs,
-          ttftMs,
-          tpsMethod,
-          replyPreview:
-            typeof p.last_agent_message === 'string' && p.last_agent_message.trim()
-              ? p.last_agent_message
-              : t.lastAgentText || null,
-        });
-      }
+      finalizeTurn(t, {
+        completedAtMs,
+        explicitDurationMs,
+        rawTtftMs,
+        lastAgentMessage: p.last_agent_message,
+      });
 
       if (activeTurnId === turnId) activeTurnId = null;
+    }
+  }
+
+  if (flushOpenTurns) {
+    for (const t of turns.values()) {
+      if (!t.flushed) {
+        finalizeTurn(t, { completedAtMs: t.lastEventMs });
+      }
     }
   }
 
@@ -336,7 +443,7 @@ export function parseCodexSessionContent(content, filePath = '') {
 }
 
 function collectJsonlFiles(dir, out = [], maxFiles = Infinity) {
-  if (out.length >= maxFiles) return out;
+  if (!dir || out.length >= maxFiles) return out;
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -357,17 +464,36 @@ function collectJsonlFiles(dir, out = [], maxFiles = Infinity) {
 }
 
 export class CodexAdapter {
-  constructor({ store, onTurns, sessionsDir = join(homedir(), '.codex', 'sessions') }) {
+  constructor({
+    store,
+    onTurns,
+    sessionsDir = join(homedir(), '.codex', 'sessions'),
+    archivedDir,
+  }) {
     this.store = store;
     this.onTurns = onTurns;
     this.sessionsDir = sessionsDir;
+    this.archivedDir =
+      archivedDir !== undefined
+        ? archivedDir
+        : basename(sessionsDir) === 'sessions'
+          ? join(dirname(sessionsDir), 'archived_sessions')
+          : null;
     this.fileMtimes = new Map();
-    this.watcher = null;
+    this.watchers = [];
     this.timer = null;
   }
 
   scan({ maxRecentFiles = 30 } = {}) {
-    const files = collectJsonlFiles(this.sessionsDir, [], Math.max(maxRecentFiles * 2, 40))
+    const collectLimit = Math.max(maxRecentFiles * 2, 60);
+    const rawPaths = [];
+    collectJsonlFiles(this.sessionsDir, rawPaths, collectLimit);
+    if (this.archivedDir) {
+      collectJsonlFiles(this.archivedDir, rawPaths, collectLimit * 2);
+    }
+
+    const nowMs = Date.now();
+    const files = rawPaths
       .map((fp) => {
         try {
           return { fp, mtimeMs: statSync(fp).mtimeMs };
@@ -390,7 +516,8 @@ export class CodexAdapter {
       } catch {
         continue;
       }
-      const turns = parseCodexSessionContent(content, fp);
+      const flushOpenTurns = nowMs - mtimeMs > 120_000;
+      const turns = parseCodexSessionContent(content, fp, { flushOpenTurns, onlyOpenAiModels: true });
       for (const t of turns) {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
@@ -403,13 +530,16 @@ export class CodexAdapter {
   }
 
   start() {
-    this.scan();
-    try {
-      this.watcher = watch(this.sessionsDir, { recursive: true }, () => {
-        this.scheduleScan();
-      });
-    } catch {
-      // Directory may not exist yet; poll fallback covers it
+    this.scan({ maxRecentFiles: 150 });
+    for (const dir of [this.sessionsDir, this.archivedDir].filter(Boolean)) {
+      try {
+        const w = watch(dir, { recursive: true }, () => {
+          this.scheduleScan();
+        });
+        this.watchers.push(w);
+      } catch {
+        // Directory may not exist yet; poll fallback covers it
+      }
     }
     this.timer = setInterval(() => this.scan({ maxRecentFiles: 12 }), 2000);
     this.timer.unref?.();
@@ -424,7 +554,8 @@ export class CodexAdapter {
   }
 
   stop() {
-    this.watcher?.close();
+    for (const w of this.watchers) w.close();
+    this.watchers = [];
     if (this.timer) clearInterval(this.timer);
     if (this.pending) clearTimeout(this.pending);
   }

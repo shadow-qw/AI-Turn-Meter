@@ -149,7 +149,7 @@ export function parseAntigravityTranscriptContent(
     let outputTokens = 0;
     let thinkingTokens = 0;
     let hasThinking = false;
-    let model = 'unknown';
+    const modelWeights = new Map();
 
     let sumStreamingMs = 0;
     let sumStreamOut = 0;
@@ -171,7 +171,10 @@ export function parseAntigravityTranscriptContent(
       if (speedIndex instanceof Map) {
         const sp = speedIndex.get(ps.step_index);
         if (sp) {
-          if (sp.model) model = sp.model;
+          if (sp.model) {
+            const stepWeight = Math.max(1, inp + cr + out);
+            modelWeights.set(sp.model, (modelWeights.get(sp.model) || 0) + stepWeight);
+          }
           if (!seenEntries.has(sp)) {
             seenEntries.add(sp);
             if (firstTtftMs === null && sp.ttftMs !== null) firstTtftMs = sp.ttftMs;
@@ -190,6 +193,15 @@ export function parseAntigravityTranscriptContent(
             }
           }
         }
+      }
+    }
+
+    let model = 'unknown';
+    let bestModelWeight = -1;
+    for (const [m, w] of modelWeights.entries()) {
+      if (w > bestModelWeight) {
+        bestModelWeight = w;
+        model = m;
       }
     }
 

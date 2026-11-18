@@ -116,13 +116,15 @@ export function parseCodeBuddyIdeSessionDir(sessionDir, workspaceHash = null) {
         const mObj = JSON.parse(readFileSync(mp, 'utf8'));
         const extra = typeof mObj.extra === 'string' ? JSON.parse(mObj.extra) : mObj.extra;
         if (mObj.role === 'assistant') {
-          lastMsg = mObj;
-          lastExtra = extra;
-          lastCreatedMs = parseIsoMs(mObj.createdAt);
-          if (extra?.modelName || extra?.modelId) {
+          if (!lastMsg) {
+            lastMsg = mObj;
+            lastExtra = extra;
+            lastCreatedMs = parseIsoMs(mObj.createdAt);
+          }
+          if (model === 'unknown' && (extra?.modelName || extra?.modelId)) {
             model = extra.modelName || extra.modelId;
           }
-          break;
+          if (lastMsg && model !== 'unknown') break;
         }
       } catch {
         // ignore
@@ -193,7 +195,6 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
   const lines = content.split(/\r?\n/);
   let sessionId = basename(filePath, '.jsonl') || 'codebuddy-cli';
   let workspacePath = null;
-  let model = 'unknown';
 
   const rawTurns = [];
   let current = null;
@@ -219,6 +220,7 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
       }
       current = {
         turnId: obj.id || `turn-${rawTurns.length + 1}`,
+        model: 'unknown',
         startedAtMs: tsMs,
         lastAtMs: tsMs,
         calls: new Map(),
@@ -253,7 +255,7 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
 
     const pd = obj.providerData;
     if (pd && typeof pd === 'object') {
-      if (pd.requestModelName || pd.model) model = pd.requestModelName || pd.model;
+      if (pd.requestModelName || pd.model) current.model = pd.requestModelName || pd.model;
       const raw = pd.rawUsage;
       if (raw && typeof raw === 'object') {
         const key = pd.messageId || `${pd.conversationRequestId || ''}:${pd.stepSeq || ''}` || obj.id;
@@ -310,7 +312,7 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
       host: 'codebuddy-cli',
       sessionId,
       turnId: rt.turnId,
-      model,
+      model: rt.model,
       workspacePath,
       workspaceHash: workspacePath ? workspaceMd5(workspacePath) : null,
       startedAtMs: rt.startedAtMs,

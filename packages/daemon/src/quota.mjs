@@ -534,6 +534,8 @@ async function cursorApiJson(url, cookieHeader, { method = 'GET', body = null } 
       Accept: 'application/json',
       Origin: 'https://cursor.com',
       Referer: 'https://cursor.com/dashboard?tab=usage',
+      'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
     };
     if (body !== null) {
       headers['Content-Type'] = 'application/json';
@@ -609,6 +611,12 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
   if (!cookieHeader) {
     cookieHeader = readCodexBarCursorSessionCookie();
   }
+  if (!userId && cookieHeader) {
+    try {
+      const m = decodeURIComponent(cookieHeader).match(/WorkosCursorSessionToken=([^;\s]+?)::/);
+      if (m?.[1]) userId = m[1];
+    } catch {}
+  }
   if (!cookieHeader || !allowNetwork) {
     return { accountEmail, planTitle, quotaWindows: [], resetCreditsText: null };
   }
@@ -645,7 +653,12 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
     if (typeof targetTeamId === 'number') {
       const spendRes = await cursorApiJson('https://cursor.com/api/dashboard/get-team-spend', cookieHeader, {
         method: 'POST',
-        body: { teamId: targetTeamId, page: 1, pageSize: 50 },
+        body: {
+          teamId: targetTeamId,
+          page: 1,
+          pageSize: 50,
+          ...(accountEmail ? { search: accountEmail } : {}),
+        },
       });
       const members = Array.isArray(spendRes?.teamMemberSpend) ? spendRes.teamMemberSpend : [];
       const me = members.find(
@@ -785,16 +798,75 @@ export function fetchCodeBuddyQuota() {
   }
 }
 
+function assembleAllQuotas(raw, enabledTools = null) {
+  const isEnabled = (k) => !enabledTools || enabledTools[k] !== false;
+  const { codex, antigravity, cursor, codebuddy } = raw;
+
+  const overviewWindows = [];
+  if (isEnabled('codex') && codex.quotaWindows.length > 0) {
+    const c5h = codex.quotaWindows[0];
+    const cWk = codex.quotaWindows[1];
+    overviewWindows.push({
+      ...c5h,
+      id: 'overview-codex',
+      title: `Codex ${c5h.title}`,
+      subtitle: c5h.subtitle
+        ? `${c5h.subtitle}${cWk ? ` · 每周 ${Math.round(cWk.remainingPct)}%` : ''}`
+        : cWk
+          ? `每周剩余 ${Math.round(cWk.remainingPct)}%`
+          : null,
+    });
+  }
+  if (isEnabled('cursor') && cursor.quotaWindows.length > 0) {
+    const curWin = cursor.quotaWindows[0];
+    overviewWindows.push({
+      ...curWin,
+      id: 'overview-cursor',
+      title: 'Cursor',
+    });
+  }
+  if (isEnabled('antigravity') && antigravity.quotaWindows.length > 0) {
+    const g5h = antigravity.quotaWindows[0];
+    const gWk = antigravity.quotaWindows.find((w) => w.id === 'ag-gemini-weekly');
+    const agSub = [g5h.subtitle, gWk ? `每周 ${Math.round(gWk.remainingPct)}%` : null]
+      .filter(Boolean)
+      .join(' · ');
+    overviewWindows.push({
+      ...g5h,
+      id: 'overview-antigravity',
+      title: 'Antigravity',
+      subtitle: agSub || null,
+    });
+  }
+
+  const activeAccounts = [
+    isEnabled('codex') ? codex : null,
+    isEnabled('antigravity') ? antigravity : null,
+    isEnabled('cursor') ? cursor : null,
+    isEnabled('codebuddy') ? codebuddy : null,
+  ].filter((q) => q && q.accountEmail).length;
+
+  const all = {
+    accountEmail: activeAccounts > 0 ? `${activeAccounts} 个已登录账号` : null,
+    planTitle: '多客户端额度总览',
+    quotaWindows: overviewWindows,
+    resetCreditsText: isEnabled('codex') ? codex.resetCreditsText : null,
+  };
+
+  return { all, codex, antigravity, cursor, codebuddy };
+}
+
 export async function getAllQuotas(
   nowMs = Date.now(),
-  { forceRefresh = false, allowNetwork = true, cursorCookie = null } = {}
+  { forceRefresh = false, allowNetwork = true, cursorCookie = null, enabledTools = null } = {}
 ) {
   const cookieKey = cursorCookie ? String(cursorCookie).trim() : '';
   if (!forceRefresh && cachedResult && cachedCookieKey === cookieKey && nowMs - cachedAtMs < CACHE_TTL_MS) {
-    return cachedResult;
+    return assembleAllQuotas(cachedResult, enabledTools);
   }
   if (!forceRefresh && inflightPromise && cachedCookieKey === cookieKey) {
-    return inflightPromise;
+    const raw = await inflightPromise;
+    return assembleAllQuotas(raw, enabledTools);
   }
   cachedCookieKey = cookieKey;
 
@@ -806,56 +878,14 @@ export async function getAllQuotas(
     ]);
     const codebuddy = fetchCodeBuddyQuota();
 
-    const overviewWindows = [];
-    if (codex.quotaWindows.length > 0) {
-      const c5h = codex.quotaWindows[0];
-      const cWk = codex.quotaWindows[1];
-      overviewWindows.push({
-        ...c5h,
-        id: 'overview-codex',
-        title: `Codex ${c5h.title}`,
-        subtitle: c5h.subtitle
-          ? `${c5h.subtitle}${cWk ? ` · 每周 ${Math.round(cWk.remainingPct)}%` : ''}`
-          : (cWk ? `每周剩余 ${Math.round(cWk.remainingPct)}%` : null),
-      });
-    }
-    if (cursor.quotaWindows.length > 0) {
-      const curWin = cursor.quotaWindows[0];
-      overviewWindows.push({
-        ...curWin,
-        id: 'overview-cursor',
-        title: 'Cursor',
-      });
-    }
-    if (antigravity.quotaWindows.length > 0) {
-      const g5h = antigravity.quotaWindows[0];
-      const gWk = antigravity.quotaWindows.find((w) => w.id === 'ag-gemini-weekly');
-      const agSub = [g5h.subtitle, gWk ? `每周 ${Math.round(gWk.remainingPct)}%` : null]
-        .filter(Boolean)
-        .join(' · ');
-      overviewWindows.push({
-        ...g5h,
-        id: 'overview-antigravity',
-        title: 'Antigravity',
-        subtitle: agSub || null,
-      });
-    }
-
-    const activeAccounts = [codex, antigravity, cursor, codebuddy].filter((q) => q.accountEmail).length;
-    const all = {
-      accountEmail: activeAccounts > 0 ? `${activeAccounts} 个已登录账号` : null,
-      planTitle: '多客户端额度总览',
-      quotaWindows: overviewWindows,
-      resetCreditsText: codex.resetCreditsText,
-    };
-
-    const result = { all, codex, antigravity, cursor, codebuddy };
-    cachedResult = result;
+    const raw = { codex, antigravity, cursor, codebuddy };
+    cachedResult = raw;
     cachedAtMs = Date.now();
-    return result;
+    return raw;
   })().finally(() => {
     inflightPromise = null;
   });
 
-  return inflightPromise;
+  const raw = await inflightPromise;
+  return assembleAllQuotas(raw, enabledTools);
 }

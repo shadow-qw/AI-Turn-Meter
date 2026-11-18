@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { isCodexOpenAiModel } from './adapters/codex.mjs';
 import { formatCacheRate, formatInlineSummary, formatTps, normalizeTurn, TOOL_LABELS } from './format.mjs';
 import { defaultCustomPricingPath, estimateTurnCost, loadCustomPricing } from './pricing.mjs';
 
@@ -204,6 +205,16 @@ export class TurnStore {
       this.db.exec('ALTER TABLE turns ADD COLUMN reply_preview TEXT;');
     } catch {
       // Column already exists on initialized databases
+    }
+
+    // Purge any legacy third-party gateway proxy turns (e.g. workbuddy/claude-opus-5.5) recorded under Codex.
+    const existingCodexRows = this.db.prepare(`SELECT turn_uid, model FROM turns WHERE tool = 'codex'`).all();
+    const staleCodexUids = existingCodexRows.filter((r) => !isCodexOpenAiModel(r.model)).map((r) => r.turn_uid);
+    if (staleCodexUids.length > 0) {
+      const delStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
+      for (const uid of staleCodexUids) {
+        delStmt.run(uid);
+      }
     }
 
     this.upsertStmt = this.db.prepare(`
@@ -452,16 +463,18 @@ export class TurnStore {
     return this.getRecentTurns(1)[0] || null;
   }
 
-  getTodaySummary(nowMs = Date.now(), tool = null) {
+  getTodaySummary(nowMs = Date.now(), tool = null, enabledTools = null) {
     const startMs = startOfLocalDayMs(nowMs);
     const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
-    const rows = tool
+    const rawRows = tool
       ? this.db
           .prepare(`SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ?`)
           .all(tool, startMs)
       : this.db
           .prepare(`SELECT * FROM turns WHERE completed_at_ms >= ?`)
           .all(startMs);
+    const rows =
+      !tool && enabledTools ? rawRows.filter((r) => enabledTools[r.tool] !== false) : rawRows;
     const acc = createUsageAccumulator();
     for (const row of rows) {
       addTurnToAccumulator(acc, row, customRates);
@@ -471,9 +484,9 @@ export class TurnStore {
 
   /**
    * Aggregate usage, cost, and cache savings over `days` local calendar days (0 or 'all' = all history).
-   * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number, quotasByTool?: Record<string, any> | null }} [opts]
+   * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number, quotasByTool?: Record<string, any> | null, enabledTools?: Record<string, boolean> | null }} [opts]
    */
-  getUsageSummary({ days = 7, tool = null, nowMs = Date.now(), quotasByTool = null } = {}) {
+  getUsageSummary({ days = 7, tool = null, nowMs = Date.now(), quotasByTool = null, enabledTools = null } = {}) {
     const todayStartMs = startOfLocalDayMs(nowMs);
     const resolvedDays =
       days === 'all' || days === 0 || days === '0' || days === null
@@ -491,13 +504,15 @@ export class TurnStore {
     }
 
     const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
-    const rows = tool
+    const rawRows = tool
       ? this.db
           .prepare(`SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
           .all(tool, sinceMs)
       : this.db
           .prepare(`SELECT * FROM turns WHERE completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
           .all(sinceMs);
+    const rows =
+      !tool && enabledTools ? rawRows.filter((r) => enabledTools[r.tool] !== false) : rawRows;
 
     const totalsAcc = createUsageAccumulator();
     const todayAcc = createUsageAccumulator();
@@ -612,7 +627,7 @@ export class TurnStore {
         ...finalizeAccumulator(acc),
       }));
 
-    const cards = this.buildCardsByTool(nowMs, customRates, quotasByTool);
+    const cards = this.buildCardsByTool(nowMs, customRates, quotasByTool, enabledTools);
 
     return {
       days: resolvedDays,
@@ -740,7 +755,7 @@ export class TurnStore {
     let topScore = null;
     for (const [modelName, acc] of modelMap.entries()) {
       const fin = finalizeAccumulator(acc);
-      const score = [fin.estimatedCostUsd ?? -1, fin.totalTokens, fin.turnCount];
+      const score = [fin.totalTokens, fin.turnCount, fin.estimatedCostUsd ?? -1];
       if (
         !topScore ||
         score[0] > topScore[0] ||
@@ -842,7 +857,7 @@ export class TurnStore {
     };
   }
 
-  buildCardsByTool(nowMs = Date.now(), customRates = null, quotasByTool = null) {
+  buildCardsByTool(nowMs = Date.now(), customRates = null, quotasByTool = null, enabledTools = null) {
     const nowDate = new Date(nowMs);
     const days30StartMs = new Date(
       nowDate.getFullYear(),
@@ -859,8 +874,10 @@ export class TurnStore {
       if (byTool.has(r.tool)) byTool.get(r.tool).push(r);
     }
 
+    const enabledRows = enabledTools ? rows.filter((r) => enabledTools[r.tool] !== false) : rows;
+
     const cards = {
-      all: this.buildCodexBarCardSnapshot(rows, nowMs, customRates, quotasByTool?.all || null),
+      all: this.buildCodexBarCardSnapshot(enabledRows, nowMs, customRates, quotasByTool?.all || null),
     };
     for (const k of CARD_TOOL_KEYS) {
       cards[k] = this.buildCodexBarCardSnapshot(
@@ -873,13 +890,13 @@ export class TurnStore {
     return cards;
   }
 
-  getState(limit = 20) {
+  getState(limit = 20, enabledTools = null) {
     const recent = this.getRecentTurns(limit);
     return {
       updatedAtMs: Date.now(),
       latest: recent[0] || null,
       byTool: this.getLatestByTool(),
-      todaySummary: this.getTodaySummary(),
+      todaySummary: this.getTodaySummary(Date.now(), null, enabledTools),
       recent,
     };
   }

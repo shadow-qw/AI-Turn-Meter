@@ -14,7 +14,7 @@ import {
   normalizeTurn,
 } from '../packages/daemon/src/format.mjs';
 import { TurnStore } from '../packages/daemon/src/store.mjs';
-import { parseCodexSessionContent } from '../packages/daemon/src/adapters/codex.mjs';
+import { isCodexOpenAiModel, parseCodexSessionContent } from '../packages/daemon/src/adapters/codex.mjs';
 import {
   AntigravityAdapter,
   buildAntigravitySpeedIndex,
@@ -1619,7 +1619,9 @@ test('Pricing engine computes standard, long-context, cache savings, custom over
   // Route prefixes, minor revisions & date snapshots resolve cleanly
   assert.ok(resolveModelPricing('workbuddy/kimi-k3.1-pro'));
   assert.ok(resolveModelPricing('claude-opus-4-5-20251101'));
-  assert.ok(resolveModelPricing('gpt-6.2-astra'));
+  const astra62 = resolveModelPricing('gpt-6.2-astra');
+  assert.equal(astra62.input, 8.0);
+  assert.equal(astra62.output, 40.0);
 
   // Unknown models stay unpriced
   const unknownCost = estimateTurnCost({
@@ -1887,5 +1889,161 @@ test('applyLocalSshConfig is idempotent for existing and new Host blocks and bui
     assert.match(appPlist, /com\.local\.ai-turn-meter\.app/);
   } finally {
     rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test('Codex adapter filters third-party proxy models, recovers superseded turns, skips fork baseline, and purges legacy DB rows', async () => {
+  assert.equal(isCodexOpenAiModel('gpt-6-astra'), true);
+  assert.equal(isCodexOpenAiModel('gpt-6.2-astra'), true);
+  assert.equal(isCodexOpenAiModel('codex-auto-review'), true);
+  assert.equal(isCodexOpenAiModel('workbuddy/claude-opus-5.5'), false);
+  assert.equal(isCodexOpenAiModel('workbuddy/kimi-k3.1-pro'), false);
+
+  const mixedJsonl = [
+    JSON.stringify({ timestamp: '2026-11-12T06:59:05.000Z', type: 'session_meta', payload: { id: 'sess-mix', cwd: '/tmp/proj' } }),
+    JSON.stringify({ timestamp: '2026-11-12T06:59:06.000Z', type: 'turn_context', payload: { turn_id: 't-opus', model: 'workbuddy/claude-opus-5.5' } }),
+    JSON.stringify({
+      timestamp: '2026-11-12T06:59:10.000Z',
+      type: 'token_usage_record',
+      payload: { turn_id: 't-opus', response_id: 'r-op', usage: { input_tokens: 50000, cached_input_tokens: 0, output_tokens: 500 } },
+    }),
+    JSON.stringify({ timestamp: '2026-11-12T06:59:11.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't-opus', duration_ms: 4000 } }),
+    // Second turn interrupted (no task_complete) when third turn starts -> must be recovered!
+    JSON.stringify({ timestamp: '2026-11-12T07:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't-astra-interrupted' } }),
+    JSON.stringify({ timestamp: '2026-11-12T07:00:01.000Z', type: 'turn_context', payload: { turn_id: 't-astra-interrupted', model: 'gpt-6-astra' } }),
+    JSON.stringify({
+      timestamp: '2026-11-12T07:01:00.000Z',
+      type: 'token_usage_record',
+      payload: {
+        turn_id: 't-astra-interrupted',
+        response_id: 'r-as1',
+        usage: { input_tokens: 100000, cached_input_tokens: 80000, output_tokens: 800 },
+        turn_token_usage: { input_tokens: 100000, cached_input_tokens: 80000, output_tokens: 800 },
+      },
+    }),
+    // thread_settings_applied UI change must not overwrite active turn_context model
+    JSON.stringify({ timestamp: '2026-11-12T07:01:30.000Z', type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { model: 'workbuddy/kimi-k3.1-pro' } } }),
+    JSON.stringify({ timestamp: '2026-11-12T07:02:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't-kimi' } }),
+    JSON.stringify({ timestamp: '2026-11-12T07:02:01.000Z', type: 'turn_context', payload: { turn_id: 't-kimi', model: 'workbuddy/kimi-k3.1-pro' } }),
+  ].join('\n');
+
+  const turns = parseCodexSessionContent(mixedJsonl, 'rollout-mix.jsonl');
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].turnId, 't-astra-interrupted');
+  assert.equal(turns[0].model, 'gpt-6-astra');
+  assert.equal(turns[0].totalInputTokens, 100000);
+
+  // Forked rollout with only inherited baseline token_count and no new API call emits 0 turns
+  const forkedBaselineJsonl = [
+    JSON.stringify({ timestamp: '2026-11-12T09:08:32.000Z', type: 'session_meta', payload: { id: 'sess-fork', history_base: 10 } }),
+    JSON.stringify({ timestamp: '2026-11-12T09:08:33.000Z', type: 'turn_context', payload: { turn_id: 't-fork', model: 'gpt-6-astra' } }),
+    JSON.stringify({
+      timestamp: '2026-11-12T09:09:40.000Z',
+      type: 'event_msg',
+      payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 295974, output_tokens: 10439 }, last_token_usage: { input_tokens: 65433, output_tokens: 3000 } } },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-12T09:09:50.000Z',
+      type: 'event_msg',
+      payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 295974, output_tokens: 10439 }, last_token_usage: { input_tokens: 65433, output_tokens: 3000 } } },
+    }),
+  ].join('\n');
+  assert.equal(parseCodexSessionContent(forkedBaselineJsonl, 'rollout_fork.jsonl', { flushOpenTurns: true }).length, 0);
+
+  // Disabled provider excluded from Overview (cards.all + todaySummary) & topModel ranked by token volume
+  const meter = createMeterServer({
+    port: 0,
+    dbPath: ':memory:',
+    enableWatchers: false,
+    enableCdp: false,
+    enableQuotaProbe: false,
+  });
+  const addr = await meter.start();
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+  try {
+    const now = Date.now();
+    meter.store.upsertTurn({
+      turnUid: 'codex:s1:t1',
+      tool: 'codex',
+      sessionId: 's1',
+      turnId: 't1',
+      model: 'gpt-6-astra',
+      completedAtMs: now - 1000,
+      totalInputTokens: 500_000,
+      cacheReadTokens: 450_000,
+      outputTokens: 5_000,
+    });
+    meter.store.upsertTurn({
+      turnUid: 'codex:s1:t2',
+      tool: 'codex',
+      sessionId: 's1',
+      turnId: 't2',
+      model: 'gpt-6.1-sol',
+      completedAtMs: now - 500,
+      totalInputTokens: 2_000_000,
+      cacheReadTokens: 1_900_000,
+      outputTokens: 10_000,
+    });
+    meter.store.upsertTurn({
+      turnUid: 'codebuddy:s2:t1',
+      tool: 'codebuddy',
+      sessionId: 's2',
+      turnId: 't1',
+      model: 'Claude-Opus-5.5',
+      completedAtMs: now - 200,
+      totalInputTokens: 3_000_000,
+      cacheReadTokens: 2_000_000,
+      outputTokens: 20_000,
+    });
+
+    await fetch(`${baseUrl}/v1/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tools: { codebuddy: false } }),
+    });
+
+    const usageAll = await (await fetch(`${baseUrl}/v1/usage?days=7`)).json();
+    assert.equal(usageAll.cards.all.today.turnCount, 2);
+    assert.equal(usageAll.cards.all.topModel, 'gpt-6.1-sol'); // Highest token volume among enabled tools
+    assert.equal(usageAll.cards.codex.topModel, 'gpt-6.1-sol');
+    assert.equal(usageAll.cards.codebuddy.today.turnCount, 1);
+  } finally {
+    await meter.stop();
+  }
+
+  // Reopening an existing SQLite DB with legacy proxy rows under tool='codex' purges non-OpenAI models
+  const dbDir = mkdtempSync(join(tmpdir(), 'atm-purge-'));
+  try {
+    const dbPath = join(dbDir, 'meter.db');
+    const s1 = new TurnStore(dbPath);
+    s1.upsertTurn({
+      turnUid: 'codex:legacy:opus',
+      tool: 'codex',
+      sessionId: 'legacy',
+      turnId: 'opus',
+      model: 'workbuddy/claude-opus-5.5',
+      completedAtMs: Date.now() - 1000,
+      totalInputTokens: 100_000,
+      outputTokens: 1_000,
+    });
+    s1.upsertTurn({
+      turnUid: 'codex:legacy:gpt6',
+      tool: 'codex',
+      sessionId: 'legacy',
+      turnId: 'gpt6',
+      model: 'gpt-6-astra',
+      completedAtMs: Date.now() - 500,
+      totalInputTokens: 100_000,
+      outputTokens: 1_000,
+    });
+    s1.close();
+
+    const s2 = new TurnStore(dbPath);
+    const codexTurns = s2.getRecentTurns(20, 'codex');
+    assert.equal(codexTurns.length, 1);
+    assert.equal(codexTurns[0].model, 'gpt-6-astra');
+    s2.close();
+  } finally {
+    rmSync(dbDir, { recursive: true, force: true });
   }
 });

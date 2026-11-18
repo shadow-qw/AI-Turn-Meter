@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
+import WebKit
 
 struct TurnSummary: Decodable, Identifiable {
   var id: String { turnUid ?? "\(tool ?? "turn")-\(completedAtMs ?? 0)-\(inlineText ?? "")" }
@@ -475,10 +476,10 @@ final class MeterViewModel: ObservableObject {
     static let showMenuBarSummary = "aiTurnMeter.showMenuBarSummary"
     static let menuBarDisplayMode = "aiTurnMeter.menuBarDisplayMode"
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
-    static let showRecentWindowsInMenu = "aiTurnMeter.showRecentWindowsInMenu"
+    static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.14"
+  @Published var version: String = "0.2.15"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -501,6 +502,7 @@ final class MeterViewModel: ObservableObject {
   ]
   @Published var hasCursorCookie: Bool = false
   @Published var showCursorCookieSheet: Bool = false
+  @Published var showCursorLoginSheet: Bool = false
   @Published var cursorCookieDraft: String = ""
 
   @Published var showMenuBarExtra: Bool = UserDefaults.standard.object(forKey: PrefKey.showMenuBarExtra) as? Bool ?? true
@@ -824,6 +826,9 @@ final class MeterViewModel: ObservableObject {
   private func applyDaemonConfig(_ cfg: MeterConfigPayload) {
     self.masterEnabled = cfg.enabled
     for (k, v) in cfg.tools { self.toolToggles[k] = v }
+    if self.popoverSelection != "all" && !self.isToolEnabled(self.popoverSelection) {
+      self.popoverSelection = "all"
+    }
     if let ie = cfg.inlineEnabled { self.inlineMasterEnabled = ie }
     if let it = cfg.inlineTools {
       for (k, v) in it { self.inlineToolToggles[k] = v }
@@ -1013,6 +1018,9 @@ final class MeterViewModel: ObservableObject {
   func setToolEnabled(_ key: String, enabled: Bool) {
     guard !busy, !runtime.runningFromDmg else { return }
     toolToggles[key] = enabled
+    if !enabled && popoverSelection == key {
+      popoverSelection = "all"
+    }
     if enabled && (!launchAgentExists || !daemonOnline) {
       masterEnabled = true
       let args = launchAgentExists ? ["start-daemon"] : ["install"]
@@ -1110,6 +1118,8 @@ final class MeterViewModel: ObservableObject {
             self.statusBanner = bannerText
           }
           self.pollStatusOnly()
+          self.fetchUsageSummary(silent: true)
+          self.onStateUpdated?()
         }
       }
     }.resume()
@@ -1645,11 +1655,11 @@ struct ContentView: View {
 
                   sidebarRow(pane: .provider(key), isSelected: isSelected) {
                     ToolGlyph.iconView(for: key, size: 14)
-                      .foregroundColor(installed ? .primary : .secondary.opacity(0.6))
+                      .foregroundColor(installed && enabled && vm.isActiveOverall ? .primary : .secondary.opacity(0.6))
                       .frame(width: 18)
                     Text(vm.toolShortTitle(for: key))
                       .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
-                      .foregroundColor(installed ? .primary : .secondary)
+                      .foregroundColor(installed && enabled && vm.isActiveOverall ? .primary : .secondary)
                       .lineLimit(1)
                     Spacer(minLength: 4)
                     Circle()
@@ -1718,11 +1728,14 @@ struct ContentView: View {
     .sheet(isPresented: $vm.showSshSheet) {
       RemoteSshSheetView(vm: vm)
     }
+    .sheet(isPresented: $vm.showCursorLoginSheet) {
+      CursorWebLoginSheetView(vm: vm)
+    }
     .sheet(isPresented: $vm.showCursorCookieSheet) {
       VStack(alignment: .leading, spacing: 12) {
         Text("配置 Cursor 会话 Cookie")
           .font(.headline)
-        Text("在浏览器打开 cursor.com/dashboard?tab=usage，复制任意请求头中的 Cookie（含 WorkosCursorSessionToken）粘贴至此。")
+        Text("1. 点击下方「网页登录同步…」或浏览器打开 cursor.com/dashboard?tab=usage 完成登录；\n2. 若手动粘贴，请打开开发者工具（⌥⌘I）→ Network，复制任意请求头中的 Cookie（含 WorkosCursorSessionToken）；\n3. 粘贴保存后即可同步 Cursor 套餐剩余额度。")
           .font(.system(size: 12))
           .foregroundColor(.secondary)
           .fixedSize(horizontal: false, vertical: true)
@@ -1730,8 +1743,13 @@ struct ContentView: View {
           .textFieldStyle(.roundedBorder)
           .font(.system(size: 11.5, design: .monospaced))
         HStack {
+          Button("网页登录同步…") {
+            vm.showCursorCookieSheet = false
+            vm.showCursorLoginSheet = true
+          }
+          .controlSize(.small)
           if let url = URL(string: "https://cursor.com/dashboard?tab=usage") {
-            Button("打开 Cursor 网页") { NSWorkspace.shared.open(url) }
+            Button("浏览器打开") { NSWorkspace.shared.open(url) }
               .controlSize(.small)
           }
           if vm.hasCursorCookie {
@@ -1752,7 +1770,7 @@ struct ContentView: View {
         }
       }
       .padding(18)
-      .frame(width: 460)
+      .frame(width: 490)
     }
     .sheet(isPresented: $vm.showUpdateSheet) {
       VStack(alignment: .leading, spacing: 14) {
@@ -1870,6 +1888,7 @@ private struct ProviderSettingsDetailView: View {
     let installed = entry?.installed ?? false
     let enabled = vm.isToolEnabled(key)
     let active = installed && vm.isActiveOverall && enabled
+    let isDimmed = !installed || !enabled || !vm.masterEnabled
     let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
     let card = vm.usageData?.cards?[key]
     let latestTurn = entry?.latestTurn
@@ -1890,11 +1909,12 @@ private struct ProviderSettingsDetailView: View {
         SettingsGroupCard {
           HStack(spacing: 10) {
             ToolGlyph.iconView(for: key, size: 20)
-              .foregroundColor(installed ? .primary : .secondary)
+              .foregroundColor(installed && enabled && vm.masterEnabled ? .primary : .secondary)
               .frame(width: 24, height: 24)
 
             Text(vm.displayTitle(for: key))
               .font(.system(size: 14.5, weight: .semibold))
+              .foregroundColor(enabled && vm.masterEnabled ? .primary : .secondary)
 
             Spacer()
 
@@ -1921,93 +1941,68 @@ private struct ProviderSettingsDetailView: View {
           .padding(.horizontal, 14)
           .padding(.vertical, 11)
 
-          Divider().padding(.leading, 14)
-
-          HStack(spacing: 8) {
-            Text("状态")
-              .font(.system(size: 12.5))
-            Spacer()
-            if needsInline && !vm.runtime.runningFromDmg {
-              Button("开启消息旁") {
-                vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
-              }
-              .buttonStyle(.bordered)
-              .controlSize(.mini)
-              .disabled(vm.busy)
-            } else if installed, let appPath = entry?.appPath {
-              Button("打开") {
-                NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
-              }
-              .buttonStyle(.bordered)
-              .controlSize(.mini)
-            }
-            Text(statusText)
-              .font(.system(size: 12.5))
-              .foregroundColor(active ? .secondary : .orange)
-          }
-          .padding(.horizontal, 14)
-          .padding(.vertical, 10)
-
-          Divider().padding(.leading, 14)
-          settingsControlRow(title: "软件内置 TPS 显示") {
-            Toggle("", isOn: Binding(
-              get: { installed && vm.inlineMasterEnabled && vm.isInlineToolEnabled(key) && vm.isActiveOverall },
-              set: { vm.setInlineToolEnabled(key, enabled: $0) }
-            ))
-            .toggleStyle(.switch)
-            .labelsHidden()
-            .controlSize(.small)
-            .disabled(!installed || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
-          }
-
-          if card?.accountEmail != nil || card?.planTitle != nil {
+          VStack(spacing: 0) {
             Divider().padding(.leading, 14)
-            settingsKVRow(
-              title: "账户",
-              value: [card?.accountEmail, card?.planTitle].compactMap { $0 }.joined(separator: " · ")
-            )
-          }
 
-          if key == "cursor" {
-            Divider().padding(.leading, 14)
             HStack(spacing: 8) {
-              Text("会话 Cookie")
+              Text("状态")
                 .font(.system(size: 12.5))
               Spacer()
-              if let url = URL(string: "https://cursor.com/dashboard?tab=usage") {
-                Button("打开网页") { NSWorkspace.shared.open(url) }
-                  .buttonStyle(.borderless)
-                  .font(.system(size: 12))
-                  .foregroundColor(CodexBarPalette.accentBlue)
+              if needsInline && !vm.runtime.runningFromDmg {
+                Button("开启消息旁") {
+                  vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(vm.busy)
+              } else if installed, let appPath = entry?.appPath {
+                Button("打开") {
+                  NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
               }
-              Button(vm.hasCursorCookie ? "已配置 · 修改" : "配置…") {
-                vm.cursorCookieDraft = ""
-                vm.showCursorCookieSheet = true
-              }
-              .buttonStyle(.bordered)
-              .controlSize(.mini)
+              Text(statusText)
+                .font(.system(size: 12.5))
+                .foregroundColor(!enabled || !vm.masterEnabled ? .secondary : (active ? .secondary : .orange))
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-          }
 
-          if let turn = latestTurn {
-            let summaryText = turn.inlineText ?? turn.tps.map { MeterFormat.tps($0) }
-            if let summary = summaryText, !summary.isEmpty {
+            Divider().padding(.leading, 14)
+            settingsControlRow(title: "软件内置 TPS 显示") {
+              Toggle("", isOn: Binding(
+                get: { installed && vm.inlineMasterEnabled && vm.isInlineToolEnabled(key) && vm.isActiveOverall },
+                set: { vm.setInlineToolEnabled(key, enabled: $0) }
+              ))
+              .toggleStyle(.switch)
+              .labelsHidden()
+              .controlSize(.small)
+              .disabled(!installed || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
+            }
+
+            if card?.accountEmail != nil || card?.planTitle != nil {
+              Divider().padding(.leading, 14)
+              settingsKVRow(
+                title: "账户",
+                value: [card?.accountEmail, card?.planTitle].compactMap { $0 }.joined(separator: " · ")
+              )
+            }
+
+            if key == "cursor" {
               Divider().padding(.leading, 14)
               HStack(spacing: 8) {
-                Text("最近轮次")
+                Text("会话授权")
                   .font(.system(size: 12.5))
                 Spacer()
-                Text(summary)
-                  .font(.system(size: 12))
-                  .monospacedDigit()
-                  .foregroundColor(.secondary)
-                  .lineLimit(1)
-                  .truncationMode(.middle)
-                Button("查看") {
-                  vm.recentTurnsFilterTool = key
-                  vm.openSettingsPane(.turns)
+                Button(vm.hasCursorCookie ? "已连接 · 重新登录…" : "网页登录同步…") {
+                  vm.showCursorLoginSheet = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                Button("Cookie…") {
+                  vm.cursorCookieDraft = ""
+                  vm.showCursorCookieSheet = true
                 }
                 .buttonStyle(.borderless)
                 .font(.system(size: 12))
@@ -2016,7 +2011,36 @@ private struct ProviderSettingsDetailView: View {
               .padding(.horizontal, 14)
               .padding(.vertical, 10)
             }
+
+            if let turn = latestTurn {
+              let summaryText = turn.inlineText ?? turn.tps.map { MeterFormat.tps($0) }
+              if let summary = summaryText, !summary.isEmpty {
+                Divider().padding(.leading, 14)
+                HStack(spacing: 8) {
+                  Text("最近轮次")
+                    .font(.system(size: 12.5))
+                  Spacer()
+                  Text(summary)
+                    .font(.system(size: 12))
+                    .monospacedDigit()
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                  Button("查看") {
+                    vm.recentTurnsFilterTool = key
+                    vm.openSettingsPane(.turns)
+                  }
+                  .buttonStyle(.borderless)
+                  .font(.system(size: 12))
+                  .foregroundColor(CodexBarPalette.accentBlue)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+              }
+            }
           }
+          .opacity(isDimmed ? 0.42 : 1.0)
+          .disabled(isDimmed)
         }
 
         // Card 2: Quota & Spend (Core Focus)
@@ -2034,6 +2058,47 @@ private struct ProviderSettingsDetailView: View {
                 }
                 providerQuotaRow(win: win)
               }
+              if let resetCredits = card?.resetCreditsText, !resetCredits.isEmpty {
+                Divider().padding(.leading, 14)
+                settingsKVRow(title: "附加额度", value: resetCredits)
+              }
+              Divider().padding(.leading, 14)
+            } else if key == "cursor" {
+              HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text("套餐剩余额度")
+                    .font(.system(size: 12.5))
+                    .foregroundColor(.primary)
+                  Text(
+                    vm.hasCursorCookie
+                      ? "未读取到套餐限额，可重新登录或更新会话 Cookie"
+                      : "需连接 cursor.com 会话，才可同步套餐剩余百分比与重置时间"
+                  )
+                  .font(.system(size: 11))
+                  .foregroundColor(.secondary)
+                  .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                Button(vm.hasCursorCookie ? "重新登录…" : "登录同步…") {
+                  vm.showCursorLoginSheet = true
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+                .tint(CodexBarPalette.accentBlue)
+
+                Button("Cookie…") {
+                  vm.cursorCookieDraft = ""
+                  vm.showCursorCookieSheet = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 10)
+              if let resetCredits = card?.resetCreditsText, !resetCredits.isEmpty {
+                Divider().padding(.leading, 14)
+                settingsKVRow(title: "按量支出", value: resetCredits)
+              }
               Divider().padding(.leading, 14)
             }
             settingsKVRow(
@@ -2047,6 +2112,8 @@ private struct ProviderSettingsDetailView: View {
             )
           }
         }
+        .opacity(isDimmed ? 0.42 : 1.0)
+        .disabled(isDimmed)
       }
       .padding(24)
     }
@@ -3076,12 +3143,224 @@ struct RemoteSshSheetView: View {
   }
 }
 
+struct CursorAuthWebView: NSViewRepresentable {
+  let clearExistingCookies: Bool
+  let manualCheckToken: Int
+  let onStatusChanged: (String) -> Void
+  let onCapturedCookie: (String) -> Void
+
+  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    var parent: CursorAuthWebView
+    weak var webView: WKWebView?
+    var didCapture = false
+    var lastManualToken = 0
+    var pollTimer: Timer?
+
+    init(_ parent: CursorAuthWebView) {
+      self.parent = parent
+      self.lastManualToken = parent.manualCheckToken
+    }
+
+    deinit {
+      pollTimer?.invalidate()
+    }
+
+    func startPolling() {
+      pollTimer?.invalidate()
+      pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        self?.checkCookies(force: false)
+      }
+    }
+
+    func stopPolling() {
+      pollTimer?.invalidate()
+      pollTimer = nil
+    }
+
+    func checkCookies(force: Bool) {
+      guard !didCapture, let wv = webView else { return }
+      let store = wv.configuration.websiteDataStore.httpCookieStore
+      let currentUrl = wv.url
+      let onDashboard: Bool = {
+        guard let url = currentUrl, let host = url.host?.lowercased(), host.contains("cursor.com") else {
+          return false
+        }
+        let path = url.path.lowercased()
+        return !path.contains("login") && !path.contains("auth") && !path.contains("sign-in")
+      }()
+      guard force || onDashboard else { return }
+
+      store.getAllCookies { [weak self] cookies in
+        guard let self = self, !self.didCapture else { return }
+        let cursorCookies = cookies.filter { $0.domain.lowercased().contains("cursor.com") && !$0.value.isEmpty }
+        let hasSession = cursorCookies.contains { $0.name == "WorkosCursorSessionToken" }
+        guard hasSession else {
+          if force {
+            DispatchQueue.main.async {
+              self.parent.onStatusChanged("尚未检测到登录凭证，请在下方完成 Cursor 账号登录后再试。")
+            }
+          }
+          return
+        }
+        let header = cursorCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+        self.didCapture = true
+        DispatchQueue.main.async {
+          self.stopPolling()
+          self.parent.onCapturedCookie(header)
+        }
+      }
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+      if let host = webView.url?.host {
+        parent.onStatusChanged("正在打开 \(host)…")
+      }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+      parent.onStatusChanged("请在下方登录 Cursor 账号；登录完成后将自动同步额度。")
+      checkCookies(force: false)
+    }
+
+    func webView(
+      _ webView: WKWebView,
+      createWebViewWith configuration: WKWebViewConfiguration,
+      for navigationAction: WKNavigationAction,
+      windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+      if navigationAction.targetFrame == nil {
+        webView.load(navigationAction.request)
+      }
+      return nil
+    }
+  }
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(self)
+  }
+
+  func makeNSView(context: Context) -> WKWebView {
+    let cfg = WKWebViewConfiguration()
+    cfg.websiteDataStore = .default()
+    let wv = WKWebView(frame: .zero, configuration: cfg)
+    wv.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+    wv.navigationDelegate = context.coordinator
+    wv.uiDelegate = context.coordinator
+    context.coordinator.webView = wv
+    context.coordinator.startPolling()
+
+    let target = URL(string: "https://cursor.com/dashboard?tab=usage")!
+    if clearExistingCookies {
+      let cookieStore = cfg.websiteDataStore.httpCookieStore
+      cookieStore.getAllCookies { cookies in
+        let toDelete = cookies.filter {
+          $0.domain.lowercased().contains("cursor.com") && $0.name == "WorkosCursorSessionToken"
+        }
+        let group = DispatchGroup()
+        for c in toDelete {
+          group.enter()
+          cookieStore.delete(c) { group.leave() }
+        }
+        group.notify(queue: .main) {
+          wv.load(URLRequest(url: target))
+        }
+      }
+    } else {
+      wv.load(URLRequest(url: target))
+    }
+    return wv
+  }
+
+  func updateNSView(_ nsView: WKWebView, context: Context) {
+    context.coordinator.parent = self
+    if manualCheckToken != context.coordinator.lastManualToken {
+      context.coordinator.lastManualToken = manualCheckToken
+      context.coordinator.checkCookies(force: true)
+    }
+  }
+
+  static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
+    coordinator.stopPolling()
+    nsView.navigationDelegate = nil
+    nsView.uiDelegate = nil
+  }
+}
+
+struct CursorWebLoginSheetView: View {
+  @ObservedObject var vm: MeterViewModel
+  @State private var statusText: String = "正在加载 cursor.com 登录页…"
+  @State private var manualCheckToken: Int = 0
+  @State private var clearOnOpen: Bool = false
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 10) {
+        Image(systemName: "person.badge.key")
+          .foregroundColor(CodexBarPalette.accentBlue)
+        VStack(alignment: .leading, spacing: 2) {
+          Text("连接 Cursor 网页会话")
+            .font(.system(size: 13.5, weight: .semibold))
+          Text(statusText)
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+        }
+        Spacer()
+        Button("同步当前登录态") {
+          manualCheckToken += 1
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+
+        Button("粘贴 Cookie…") {
+          vm.showCursorLoginSheet = false
+          vm.cursorCookieDraft = ""
+          vm.showCursorCookieSheet = true
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+
+        Button("关闭") {
+          vm.showCursorLoginSheet = false
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+      }
+      .padding(.horizontal, 14)
+      .padding(.vertical, 10)
+
+      Divider()
+
+      CursorAuthWebView(
+        clearExistingCookies: clearOnOpen,
+        manualCheckToken: manualCheckToken,
+        onStatusChanged: { msg in statusText = msg },
+        onCapturedCookie: { cookieHeader in
+          vm.showCursorLoginSheet = false
+          vm.saveCursorCookie(cookieHeader)
+        }
+      )
+    }
+    .frame(width: 720, height: 560)
+    .onAppear {
+      clearOnOpen = vm.hasCursorCookie
+    }
+  }
+}
+
 private struct ProviderSwitcherBar: View {
   @ObservedObject var vm: MeterViewModel
   @Binding var selection: String
   @State private var hoveredKey: String? = nil
 
-  private let switcherKeys = ["all", "codex", "cursor", "antigravity", "codebuddy"]
+  private var switcherKeys: [String] {
+    let useFallback = vm.apps.isEmpty
+    let tools = ["codex", "cursor", "antigravity", "codebuddy"].filter { key in
+      let installed = useFallback ? true : (vm.apps[key]?.installed ?? false)
+      return installed && vm.isToolEnabled(key)
+    }
+    return ["all"] + tools
+  }
 
   private func indicatorFraction(for key: String, installed: Bool, active: Bool) -> Double {
     guard key != "all", installed, active else { return 0 }
@@ -3159,6 +3438,11 @@ private struct ProviderSwitcherBar: View {
     .padding(.horizontal, 10)
     .padding(.top, 7)
     .padding(.bottom, 5)
+    .onChange(of: switcherKeys) { keys in
+      if !keys.contains(selection) {
+        selection = "all"
+      }
+    }
   }
 }
 
@@ -3502,13 +3786,7 @@ private struct CostHistoryDetailFlyoutView: View {
 
       // Selected day detail + per-model breakdown
       if let pt = selectedPt {
-        let dayModels: [CardDailyModelItem] = {
-          if let explicit = pt.models, !explicit.isEmpty { return Array(explicit.prefix(4)) }
-          if let top = card.topModel, pt.totalTokens > 0 {
-            return [CardDailyModelItem(model: top, costUsd: pt.costUsd, totalTokens: pt.totalTokens)]
-          }
-          return []
-        }()
+        let dayModels: [CardDailyModelItem] = Array((pt.models ?? []).prefix(4))
 
         VStack(alignment: .leading, spacing: 6) {
           Text("\(pt.label): \(MeterFormat.usd(pt.costUsd)) · \(MeterFormat.tokens(pt.totalTokens)) tokens")
@@ -3740,7 +4018,11 @@ private struct CodexBarStyleCardView: View {
             isAll
               ? "正在同步客户端登录与额度信息…"
               : ((vm.apps[selection]?.installed ?? false)
-                  ? "企业/团队按量模式 · 无固定个人会话限额"
+                  ? (selection == "cursor"
+                      ? (vm.hasCursorCookie
+                          ? "未读取到套餐限额 · 请重新登录"
+                          : "需在「设置 → Cursor」登录同步额度")
+                      : "企业/团队按量模式 · 无固定个人会话限额")
                   : "未检测到该客户端安装")
           )
           .font(.system(size: 10.5))
@@ -4027,8 +4309,15 @@ struct MenuBarPopoverView: View {
   let onCheckUpdates: () -> Void
   let onClosePopover: () -> Void
 
+  private var effectiveSelection: String {
+    let candidate = vm.popoverSelection
+    if candidate == "all" { return "all" }
+    let installed = vm.apps.isEmpty ? true : (vm.apps[candidate]?.installed ?? false)
+    return (installed && vm.isToolEnabled(candidate)) ? candidate : "all"
+  }
+
   private var activeCard: CodexBarCardSnapshot {
-    if let snapshot = vm.usageData?.cards?[vm.popoverSelection] {
+    if let snapshot = vm.usageData?.cards?[effectiveSelection] {
       return snapshot
     }
     let todayTotals = vm.todaySummary
@@ -4076,7 +4365,7 @@ struct MenuBarPopoverView: View {
 
       Divider().padding(.horizontal, 12).padding(.bottom, 2)
 
-      CodexBarStyleCardView(vm: vm, selection: vm.popoverSelection, card: activeCard)
+      CodexBarStyleCardView(vm: vm, selection: effectiveSelection, card: activeCard)
 
       if showsContextStrip {
         HStack {
@@ -4270,10 +4559,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       return ""
     case .quotaRemaining:
       var parts: [String] = []
-      if let codexPct = vm.usageData?.cards?["codex"]?.quotaWindows?.first?.remainingPct {
+      if vm.isToolEnabled("codex"), let codexPct = vm.usageData?.cards?["codex"]?.quotaWindows?.first?.remainingPct {
         parts.append("Codex \(Int(codexPct.rounded()))%")
       }
-      if let agyPct = vm.usageData?.cards?["antigravity"]?.quotaWindows?.first?.remainingPct {
+      if vm.isToolEnabled("antigravity"), let agyPct = vm.usageData?.cards?["antigravity"]?.quotaWindows?.first?.remainingPct {
         parts.append("AGY \(Int(agyPct.rounded()))%")
       }
       if !parts.isEmpty { return parts.joined(separator: " · ") }

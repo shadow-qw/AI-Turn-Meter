@@ -8,6 +8,22 @@ import { join } from 'node:path';
  */
 const MODEL_PRICING_PER_M = {
   // OpenAI / Codex
+  'gpt-6.2-sol': {
+    input: 2.0,
+    cacheRead: 0.1,
+    cacheWrite: 2.5,
+    output: 10.0,
+    thresholdTokens: 272_000,
+    above: { input: 4.0, cacheRead: 0.2, cacheWrite: 5.0, output: 15.0 },
+  },
+  'gpt-6.2-astra': {
+    input: 8.0,
+    cacheRead: 0.4,
+    cacheWrite: 10.0,
+    output: 40.0,
+    thresholdTokens: 272_000,
+    above: { input: 16.0, cacheRead: 0.8, cacheWrite: 20.0, output: 60.0 },
+  },
   'gpt-6.1-sol': {
     input: 2.0,
     cacheRead: 0.1,

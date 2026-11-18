@@ -213,6 +213,8 @@ execFileSync(
     'SwiftUI',
     '-framework',
     'Foundation',
+    '-framework',
+    'WebKit',
   ],
   { stdio: 'inherit' }
 );
