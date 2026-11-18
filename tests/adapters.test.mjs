@@ -1,3 +1,4 @@
+import { createCipheriv, pbkdf2Sync } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -49,7 +50,16 @@ import {
   patchCursorHooks,
 } from '../packages/daemon/src/installer.mjs';
 import { estimateTurnCost, resolveModelPricing } from '../packages/daemon/src/pricing.mjs';
-import { computeQuotaWindow, fetchCodexQuota, parseCursorQuotaSummary } from '../packages/daemon/src/quota.mjs';
+import {
+  computeQuotaWindow,
+  decryptCursorSafeStorageToken,
+  fetchCodexQuota,
+  parseCursorQuotaSummary,
+  parseSystemProxyInfo,
+  resetQuotaCacheForTests,
+  resolveCodexUsageUrl,
+  resolveCursorCookieCandidates,
+} from '../packages/daemon/src/quota.mjs';
 
 test('formatting helpers match specification', () => {
   assert.equal(formatTokens(341), '341');
@@ -2327,5 +2337,155 @@ test('fetchCodexQuota falls back to compressed .jsonl.zst rate_limits without au
       process.env.CODEX_HOME = prevCodexHome;
     }
     rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('decryptCursorSafeStorageToken decrypts Chromium v10 AES-128-CBC JWT tokens', () => {
+  const sampleJwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdXRoMHx1c2VyXzEyMyIsImV4cCI6MTk5OTk5OTk5OX0.sig';
+  const password = 'secret-cursor-safe-storage-pw';
+  const key = pbkdf2Sync(Buffer.from(password, 'utf8'), Buffer.from('saltysalt', 'utf8'), 1003, 16, 'sha1');
+  const iv = Buffer.alloc(16, 0x20);
+  const cipher = createCipheriv('aes-128-cbc', key, iv);
+  const encrypted = Buffer.concat([Buffer.from('v10', 'utf8'), cipher.update(sampleJwt, 'utf8'), cipher.final()]);
+  const token = `cursor-safe-storage:v1:${encrypted.toString('base64')}`;
+
+  assert.equal(decryptCursorSafeStorageToken(token, ['wrong-pw', password]), sampleJwt);
+  assert.equal(decryptCursorSafeStorageToken(token, ['wrong-pw']), null);
+  assert.equal(decryptCursorSafeStorageToken('plain-jwt', [password]), null);
+});
+
+test('parseSystemProxyInfo and resolveCodexUsageUrl handle macOS proxy configs and chatgpt_base_url', () => {
+  const pac = parseSystemProxyInfo(
+    `<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n  ProxyAutoConfigEnable : 1\n  ProxyAutoConfigURLString : http://proxy.corp/pac\n}`,
+    {}
+  );
+  assert.equal(pac.hasSystemProxy, true);
+  assert.equal(pac.fallbackProxyUrl, null);
+
+  const httpsProxy = parseSystemProxyInfo(
+    `<dictionary> {\n  HTTPSEnable : 1\n  HTTPSProxy : 127.0.0.1\n  HTTPSPort : 7890\n}`,
+    {}
+  );
+  assert.equal(httpsProxy.hasSystemProxy, true);
+  assert.equal(httpsProxy.fallbackProxyUrl, 'http://127.0.0.1:7890');
+
+  const off = parseSystemProxyInfo(`<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n}`, {});
+  assert.equal(off.hasSystemProxy, false);
+
+  assert.equal(
+    resolveCodexUsageUrl(null, 'chatgpt_base_url = "https://chat.openai.com" # comment\n').usageUrl,
+    'https://chat.openai.com/backend-api/wham/usage'
+  );
+  assert.equal(
+    resolveCodexUsageUrl(null, "chatgpt_base_url = 'https://proxy.example.com'\n").usageUrl,
+    'https://proxy.example.com/api/codex/usage'
+  );
+});
+
+test('fetchCodexQuota deep scan finds rate_limits past >10 empty files & >400 lines, resets expired window, and surfaces API-key hint', async () => {
+  const prevCodexHome = process.env.CODEX_HOME;
+  const codexHome = mkdtempSync(join(tmpdir(), 'atm-codex-deep-'));
+  try {
+    const sessionsDir = join(codexHome, 'sessions', '2026', '11', '18');
+    mkdirSync(sessionsDir, { recursive: true });
+    const nowMs = Date.UTC(2026, 10, 18, 10, 0, 0);
+
+    // 1. Write 12 newer empty sessions with no rate_limits
+    for (let i = 0; i < 12; i += 1) {
+      writeFileSync(
+        join(sessionsDir, `rollout-empty-${String(i).padStart(2, '0')}.jsonl`),
+        `${JSON.stringify({ timestamp: new Date(nowMs - i * 1000).toISOString(), type: 'session_meta', payload: { id: `e-${i}` } })}\n`
+      );
+    }
+
+    // 2. Write older session where rate_limits sits 600 lines before EOF, with primary already reset & secondary active
+    const targetPath = join(sessionsDir, 'rollout-deep-00.jsonl');
+    const lines = [
+      JSON.stringify({
+        timestamp: new Date(nowMs - 600_000).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          rate_limits: {
+            limit_id: 'codex',
+            primary: { used_percent: 82, window_minutes: 300, resets_at: Math.floor((nowMs - 300_000) / 1000) },
+            secondary: { used_percent: 25, window_minutes: 10080, resets_at: Math.floor((nowMs + 3 * 86400 * 1000) / 1000) },
+          },
+        },
+      }),
+    ];
+    for (let j = 0; j < 600; j += 1) {
+      lines.push(JSON.stringify({ type: 'response_item', payload: { idx: j } }));
+    }
+    writeFileSync(targetPath, `${lines.join('\n')}\n`);
+
+    process.env.CODEX_HOME = codexHome;
+    const quota = await fetchCodexQuota(nowMs, { allowNetwork: false });
+    assert.equal(quota.quotaWindows.length, 2);
+    assert.equal(quota.quotaWindows[0].remainingPct, 100); // expired primary window clamped back to 100%
+    assert.equal(Math.round(quota.quotaWindows[1].remainingPct), 75);
+
+    // 3. Verify API-key-only auth gives explicit quotaHint when no rate_limits exist
+    const apiKeyHome = mkdtempSync(join(tmpdir(), 'atm-codex-apikey-'));
+    try {
+      writeFileSync(join(apiKeyHome, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'sk-test-123' }));
+      process.env.CODEX_HOME = apiKeyHome;
+      const apiQuota = await fetchCodexQuota(nowMs, { allowNetwork: false });
+      assert.equal(apiQuota.quotaWindows.length, 0);
+      assert.match(apiQuota.quotaHint || '', /API Key/);
+    } finally {
+      rmSync(apiKeyHome, { recursive: true, force: true });
+    }
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('parseCursorQuotaSummary supports unified weekly Sand pool and v2/usage-status spend, and resolveCursorCookieCandidates deduplicates sources', async () => {
+  resetQuotaCacheForTests();
+  const nowMs = Date.UTC(2026, 10, 18, 10, 0, 0);
+  const parsed = parseCursorQuotaSummary(
+    {
+      email: 'unified@example.com',
+      membershipType: 'pro',
+      limitType: 'user',
+      isUnlimited: false,
+      individualUsage: { plan: {} },
+    },
+    {
+      nowMs,
+      sandUsage: {
+        isUnified: true,
+        includedLimitZero: false,
+        usagePercent: 22.5,
+        nextResetTimestampUtc: new Date(nowMs + 4 * 86400 * 1000).toISOString(),
+      },
+      unifiedUsage: {
+        usedCents: 1250,
+        limitCents: 5000,
+      },
+    }
+  );
+  assert.equal(parsed.quotaWindows.length, 1);
+  assert.equal(parsed.quotaWindows[0].id, 'cursor-weekly');
+  assert.equal(parsed.quotaWindows[0].remainingPct, 77.5);
+  assert.equal(parsed.resetCreditsText, '$12.50 / $50.00');
+
+  const tmpHome = mkdtempSync(join(tmpdir(), 'atm-cursor-cand-'));
+  try {
+    mkdirSync(join(tmpHome, '.config', 'cursor'), { recursive: true });
+    const jwt = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: 'auth0|user_agent_99', exp: Math.floor((nowMs + 86400_000) / 1000) })).toString('base64url')}.sig`;
+    writeFileSync(join(tmpHome, '.config', 'cursor', 'auth.json'), JSON.stringify({ accessToken: jwt }));
+    const res = await resolveCursorCookieCandidates({
+      cursorCookie: 'WorkosCursorSessionToken=stale_user%3A%3Astale_tok',
+      homeDir: tmpHome,
+    });
+    assert.equal(res.candidates.length, 2);
+    assert.equal(res.candidates[0].source, 'config');
+    assert.equal(res.candidates[1].source, 'cursor-agent');
+  } finally {
+    rmSync(tmpHome, { recursive: true, force: true });
   }
 });

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { cursorApiJson, resolveCursorCookieHeader } from '../quota.mjs';
+import { cursorApiJson, resolveCursorCookieCandidates, resolveCursorCookieHeader } from '../quota.mjs';
 
 export function defaultStateDir() {
   return process.env.AI_TURN_METER_STATE_DIR || join(homedir(), '.local', 'share', 'ai-turn-meter');
@@ -319,8 +319,12 @@ export async function syncCursorHistoryEvents(
     fetchPageFn = null,
   } = {}
 ) {
-  const cookieHeader = fetchPageFn ? cursorCookie : resolveCursorCookieHeader(cursorCookie);
-  if (!cookieHeader && !fetchPageFn) return { synced: 0, completed: false };
+  const candidates = fetchPageFn
+    ? [{ cookieHeader: cursorCookie }]
+    : (await resolveCursorCookieCandidates({ cursorCookie, allowSilentKeychain: true })).candidates;
+  if (candidates.length === 0 && !fetchPageFn) return { synced: 0, completed: false };
+
+  let activeCookie = candidates[0]?.cookieHeader || cursorCookie;
 
   const backfilled = store.getMeta?.('cursor_history_backfilled_v1') === '1';
   const latestSavedMs = Number(store.getMeta?.('cursor_history_latest_ms')) || 0;
@@ -331,22 +335,36 @@ export async function syncCursorHistoryEvents(
   let totalChanged = 0;
   let completed = false;
 
-  const doFetchPage =
-    fetchPageFn ||
-    ((page) =>
-      cursorApiJson('https://cursor.com/api/dashboard/get-filtered-usage-events', cookieHeader, {
-        method: 'POST',
-        timeoutMs: 20_000,
-        body: {
-          page,
-          pageSize,
-          startDate: String(startDateMs),
-          endDate: String(nowMs + 60_000),
-        },
-      }));
+  const doFetchPageWithCookie = (page, hdr) =>
+    fetchPageFn
+      ? fetchPageFn(page)
+      : cursorApiJson('https://cursor.com/api/dashboard/get-filtered-usage-events', hdr, {
+          method: 'POST',
+          timeoutMs: 20_000,
+          body: {
+            page,
+            pageSize,
+            startDate: String(startDateMs),
+            endDate: String(nowMs + 60_000),
+          },
+        });
+
+  let page1Res = null;
+  if (fetchPageFn) {
+    page1Res = await doFetchPageWithCookie(1, activeCookie);
+  } else {
+    for (const c of candidates) {
+      const r = await doFetchPageWithCookie(1, c.cookieHeader);
+      if (r && Array.isArray(r.usageEventsDisplay)) {
+        activeCookie = c.cookieHeader;
+        page1Res = r;
+        break;
+      }
+    }
+  }
 
   for (let page = 1; page <= maxPages; page += 1) {
-    const res = await doFetchPage(page);
+    const res = page === 1 ? page1Res : await doFetchPageWithCookie(page, activeCookie);
     if (!res || !Array.isArray(res.usageEventsDisplay)) break;
     const events = res.usageEventsDisplay;
     if (events.length === 0) {

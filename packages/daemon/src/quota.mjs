@@ -1,19 +1,284 @@
+import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import https from 'node:https';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { zstdDecompressSync } from 'node:zlib';
 
 const execFileAsync = promisify(execFile);
 
 const CACHE_TTL_MS = 45_000;
+const ERROR_RETRY_TTL_MS = 5_000;
+const STALE_GRACE_MS = 15 * 60 * 1000;
+const PROXY_CACHE_TTL_MS = 15_000;
+
 let cachedResult = null;
 let cachedAtMs = 0;
 let cachedCookieKey = '';
+let cachedTtlMs = CACHE_TTL_MS;
 let inflightPromise = null;
+let lastGoodByTool = {
+  codex: null,
+  cursor: null,
+  antigravity: null,
+};
+let cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
+
+export function resetQuotaCacheForTests() {
+  cachedResult = null;
+  cachedAtMs = 0;
+  cachedCookieKey = '';
+  cachedTtlMs = CACHE_TTL_MS;
+  inflightPromise = null;
+  lastGoodByTool = { codex: null, cursor: null, antigravity: null };
+  cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
+}
+
+export function parseSystemProxyInfo(scutilOutput = '', env = process.env) {
+  const envProxy =
+    env.HTTPS_PROXY ||
+    env.https_proxy ||
+    env.ALL_PROXY ||
+    env.all_proxy ||
+    env.HTTP_PROXY ||
+    env.http_proxy ||
+    null;
+
+  const text = String(scutilOutput || '');
+  const getBool = (key) => new RegExp(`\\b${key}\\s*:\\s*1\\b`).test(text);
+  const getVal = (key) => {
+    const m = text.match(new RegExp(`\\b${key}\\s*:\\s*([^\\s\\n]+)`));
+    return m?.[1] || null;
+  };
+
+  const httpEnabled = getBool('HTTPEnable');
+  const httpsEnabled = getBool('HTTPSEnable');
+  const socksEnabled = getBool('SOCKSEnable');
+  const pacEnabled = getBool('ProxyAutoConfigEnable') || getBool('ProxyAutoDiscoveryEnable');
+  const hasSystemProxy = Boolean(envProxy || httpEnabled || httpsEnabled || socksEnabled || pacEnabled);
+
+  let fallbackProxyUrl = envProxy ? String(envProxy).trim() : null;
+  if (!fallbackProxyUrl && httpsEnabled) {
+    const host = getVal('HTTPSProxy');
+    const port = getVal('HTTPSPort');
+    if (host && port) fallbackProxyUrl = `http://${host}:${port}`;
+  }
+  if (!fallbackProxyUrl && httpEnabled) {
+    const host = getVal('HTTPProxy');
+    const port = getVal('HTTPPort');
+    if (host && port) fallbackProxyUrl = `http://${host}:${port}`;
+  }
+  if (!fallbackProxyUrl && socksEnabled) {
+    const host = getVal('SOCKSProxy');
+    const port = getVal('SOCKSPort');
+    if (host && port) fallbackProxyUrl = `socks5h://${host}:${port}`;
+  }
+
+  return { hasSystemProxy, fallbackProxyUrl };
+}
+
+function resolveAppHelperBin() {
+  if (process.env.AI_TURN_METER_DISABLE_NATIVE_NET === '1' || process.env.NODE_TEST_CONTEXT) {
+    return null;
+  }
+  const candidates = [];
+  if (process.env.AI_TURN_METER_HELPER_BIN) {
+    candidates.push(process.env.AI_TURN_METER_HELPER_BIN);
+  }
+  if (process.env.AI_TURN_METER_STABLE_ROOT) {
+    candidates.push(join(process.env.AI_TURN_METER_STABLE_ROOT, '..', '..', 'MacOS', 'AITurnMeter'));
+  }
+  try {
+    const srcDir = dirname(fileURLToPath(import.meta.url));
+    candidates.push(join(srcDir, '..', '..', '..', '..', 'MacOS', 'AITurnMeter'));
+  } catch {}
+  candidates.push('/Applications/AI Turn Meter.app/Contents/MacOS/AITurnMeter');
+  candidates.push(join(homedir(), 'Applications', 'AI Turn Meter.app', 'Contents', 'MacOS', 'AITurnMeter'));
+  for (const p of candidates) {
+    try {
+      if (p && existsSync(p)) return p;
+    } catch {}
+  }
+  return null;
+}
+
+async function getProxyState(nowMs = Date.now()) {
+  if (process.env.AI_TURN_METER_DISABLE_NATIVE_NET === '1' || process.env.NODE_TEST_CONTEXT) {
+    return parseSystemProxyInfo('', process.env);
+  }
+  if (nowMs - cachedProxyState.checkedAt < PROXY_CACHE_TTL_MS) {
+    return cachedProxyState;
+  }
+  let scutilOut = '';
+  if (process.platform === 'darwin') {
+    try {
+      const { stdout } = await execFileAsync('/usr/sbin/scutil', ['--proxy'], { timeout: 1000 });
+      scutilOut = stdout || '';
+    } catch {}
+  }
+  const parsed = parseSystemProxyInfo(scutilOut, process.env);
+  cachedProxyState = { checkedAt: nowMs, ...parsed };
+  return cachedProxyState;
+}
+
+function runProcessWithStdin(bin, args, inputStr, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = execFile(
+      bin,
+      args,
+      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          resolve({ ok: false, stdout: stdout || '', error: err.message });
+          return;
+        }
+        resolve({ ok: true, stdout: stdout || '' });
+      }
+    );
+    if (child.stdin) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(inputStr || '');
+    }
+  });
+}
+
+async function nativeUrlSessionFetchJson(helperBin, url, { method = 'GET', headers = {}, body = null, timeoutMs = 8000 }) {
+  const payload = JSON.stringify({
+    url,
+    method,
+    headers,
+    body: body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
+    timeoutMs,
+  });
+  const res = await runProcessWithStdin(helperBin, ['--net-fetch-json'], payload, timeoutMs + 3000);
+  if (!res.ok || !res.stdout.trim()) {
+    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: res.error || 'native helper failed' };
+  }
+  try {
+    const out = JSON.parse(res.stdout);
+    const status = typeof out.status === 'number' ? out.status : null;
+    if (!status) {
+      return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: out.error || 'network error' };
+    }
+    if (status === 401 || status === 403) {
+      return { ok: false, status, data: null, errorKind: 'unauthorized', errorMessage: `HTTP ${status}` };
+    }
+    if (status < 200 || status >= 300) {
+      return { ok: false, status, data: null, errorKind: 'http', errorMessage: `HTTP ${status}` };
+    }
+    try {
+      return { ok: true, status, data: out.body ? JSON.parse(out.body) : null, errorKind: 'ok', errorMessage: null };
+    } catch {
+      return { ok: false, status, data: null, errorKind: 'parse', errorMessage: 'invalid json' };
+    }
+  } catch (e) {
+    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: e?.message || 'native parse error' };
+  }
+}
+
+async function curlFetchJson(url, { method = 'GET', headers = {}, body = null, timeoutMs = 8000, proxyUrl = null }) {
+  if (!existsSync('/usr/bin/curl')) {
+    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: 'curl unavailable' };
+  }
+  const args = [
+    '-sS',
+    '--max-time',
+    String(Math.max(2, Math.ceil(timeoutMs / 1000))),
+    '-X',
+    method,
+    '-w',
+    '\n__ATM_HTTP:%{http_code}',
+  ];
+  if (proxyUrl) {
+    args.push('--proxy', proxyUrl);
+  }
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (v !== undefined && v !== null) args.push('-H', `${k}: ${v}`);
+  }
+  const bodyStr = body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
+  if (bodyStr !== null) {
+    args.push('--data-binary', '@-');
+  }
+  args.push(url);
+
+  const res = await runProcessWithStdin('/usr/bin/curl', args, bodyStr || '', timeoutMs + 2500);
+  if (!res.ok) {
+    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: res.error || 'curl error' };
+  }
+  const marker = '\n__ATM_HTTP:';
+  const idx = res.stdout.lastIndexOf(marker);
+  if (idx === -1) {
+    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: 'curl no status' };
+  }
+  const bodyOut = res.stdout.slice(0, idx);
+  const status = Number(res.stdout.slice(idx + marker.length).trim()) || null;
+  if (!status) {
+    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: 'curl status 0' };
+  }
+  if (status === 401 || status === 403) {
+    return { ok: false, status, data: null, errorKind: 'unauthorized', errorMessage: `HTTP ${status}` };
+  }
+  if (status < 200 || status >= 300) {
+    return { ok: false, status, data: null, errorKind: 'http', errorMessage: `HTTP ${status}` };
+  }
+  try {
+    return { ok: true, status, data: bodyOut ? JSON.parse(bodyOut) : null, errorKind: 'ok', errorMessage: null };
+  } catch {
+    return { ok: false, status, data: null, errorKind: 'parse', errorMessage: 'invalid json' };
+  }
+}
+
+export async function httpRequestJson(
+  url,
+  { method = 'GET', headers = {}, body = null, timeoutMs = 8000 } = {}
+) {
+  const helperBin = resolveAppHelperBin();
+  const proxyState = await getProxyState();
+  const bodyStr = body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined;
+
+  if (helperBin && proxyState.hasSystemProxy) {
+    return nativeUrlSessionFetchJson(helperBin, url, { method, headers, body: bodyStr ?? null, timeoutMs });
+  }
+
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: bodyStr,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, status: res.status, data: null, errorKind: 'unauthorized', errorMessage: `HTTP ${res.status}` };
+    }
+    if (!res.ok) {
+      return { ok: false, status: res.status, data: null, errorKind: 'http', errorMessage: `HTTP ${res.status}` };
+    }
+    try {
+      const data = await res.json();
+      return { ok: true, status: res.status, data, errorKind: 'ok', errorMessage: null };
+    } catch {
+      return { ok: false, status: res.status, data: null, errorKind: 'parse', errorMessage: 'invalid json' };
+    }
+  } catch (err) {
+    if (helperBin) {
+      return nativeUrlSessionFetchJson(helperBin, url, { method, headers, body: bodyStr ?? null, timeoutMs });
+    }
+    if (proxyState.fallbackProxyUrl) {
+      return curlFetchJson(url, { method, headers, body: bodyStr ?? null, timeoutMs, proxyUrl: proxyState.fallbackProxyUrl });
+    }
+    return {
+      ok: false,
+      status: null,
+      data: null,
+      errorKind: 'network',
+      errorMessage: err?.cause?.code || err?.message || 'fetch failed',
+    };
+  }
+}
 
 function clampPct(v) {
   if (typeof v !== 'number' || !Number.isFinite(v)) return null;
@@ -146,29 +411,84 @@ function formatCodexPlan(planType) {
   return map[key] || String(planType);
 }
 
-function findNewestCodexRateLimits(codexHome) {
+function resolveCodexAuthCandidatePaths(codexHome, homeDir = homedir()) {
+  const paths = [join(codexHome, 'auth.json')];
+  if (!process.env.CODEX_HOME?.trim()) {
+    paths.push(join(homeDir, '.config', 'codex', 'auth.json'));
+  }
+  return paths;
+}
+
+export function resolveCodexUsageUrl(codexHome, configContents = null) {
+  const defaultBase = 'https://chatgpt.com/backend-api';
+  let content = configContents;
+  if (content === null && codexHome) {
+    const cfgPath = join(codexHome, 'config.toml');
+    if (existsSync(cfgPath)) {
+      try {
+        content = readFileSync(cfgPath, 'utf8');
+      } catch {}
+    }
+  }
+  let baseUrl = defaultBase;
+  if (typeof content === 'string') {
+    for (const rawLine of content.split(/\r?\n/)) {
+      const noComment = rawLine.split('#')[0].trim();
+      if (!noComment) continue;
+      const eqIdx = noComment.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = noComment.slice(0, eqIdx).trim();
+      if (key !== 'chatgpt_base_url') continue;
+      let val = noComment.slice(eqIdx + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1).trim();
+      }
+      if (val) baseUrl = val;
+      break;
+    }
+  }
+  let normalized = baseUrl.replace(/\/+$/, '') || defaultBase;
+  if (
+    (normalized.startsWith('https://chatgpt.com') || normalized.startsWith('https://chat.openai.com')) &&
+    !normalized.includes('/backend-api')
+  ) {
+    normalized += '/backend-api';
+  }
+  const usagePath = normalized.includes('/backend-api') ? '/wham/usage' : '/api/codex/usage';
+  return {
+    baseUrl: normalized,
+    usageUrl: `${normalized}${usagePath}`,
+    resetCreditsUrl: `${normalized}/wham/rate-limit-reset-credits`,
+  };
+}
+
+function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
   try {
-    const sessionsRoot = join(codexHome, 'sessions');
-    if (!existsSync(sessionsRoot)) return null;
+    const maxAgeMs = 30 * 86400 * 1000;
     const candidates = [];
 
     function walk(dir, depth) {
-      if (depth > 4) return;
+      if (depth > 4 || !existsSync(dir)) return;
       for (const ent of readdirSync(dir, { withFileTypes: true })) {
         const p = join(dir, ent.name);
         if (ent.isDirectory()) walk(p, depth + 1);
         else if (ent.name.endsWith('.jsonl') || ent.name.endsWith('.jsonl.zst')) {
           try {
             const st = statSync(p);
-            candidates.push({ p, mtimeMs: st.mtimeMs });
+            if (nowMs - st.mtimeMs <= maxAgeMs) {
+              candidates.push({ p, mtimeMs: st.mtimeMs });
+            }
           } catch {}
         }
       }
     }
 
-    walk(sessionsRoot, 0);
+    walk(join(codexHome, 'sessions'), 0);
+    if (candidates.length === 0) {
+      walk(join(codexHome, 'archived_sessions'), 0);
+    }
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    for (const { p } of candidates.slice(0, 10)) {
+    for (const { p } of candidates.slice(0, 40)) {
       let raw;
       try {
         raw = p.endsWith('.jsonl.zst')
@@ -178,7 +498,9 @@ function findNewestCodexRateLimits(codexHome) {
         continue;
       }
       const lines = raw.trim().split('\n');
-      for (let i = lines.length - 1; i >= Math.max(0, lines.length - 400); i -= 1) {
+      const minIdx = Math.max(0, lines.length - 4000);
+      let fallbackRl = null;
+      for (let i = lines.length - 1; i >= minIdx; i -= 1) {
         try {
           const obj = JSON.parse(lines[i]);
           const rl = obj?.payload?.rate_limits;
@@ -186,26 +508,40 @@ function findNewestCodexRateLimits(codexHome) {
             rl &&
             (typeof rl.primary?.used_percent === 'number' || typeof rl.secondary?.used_percent === 'number')
           ) {
-            return rl;
+            if (!rl.limit_id || rl.limit_id === 'codex') {
+              return rl;
+            }
+            if (!fallbackRl) fallbackRl = rl;
           }
         } catch {}
       }
+      if (fallbackRl) return fallbackRl;
     }
   } catch {}
   return null;
 }
 
 export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true } = {}) {
-  const empty = { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null };
+  const empty = {
+    accountEmail: null,
+    planTitle: null,
+    quotaWindows: [],
+    resetCreditsText: null,
+    quotaHint: null,
+    _ok: false,
+    _errorKind: null,
+  };
   try {
     const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
-    const authPath = join(codexHome, 'auth.json');
+    const authPaths = resolveCodexAuthCandidatePaths(codexHome);
     let accessToken = null;
     let accountId = null;
     let accountEmail = null;
     let planTitle = null;
+    let isApiKeyOnly = false;
 
-    if (existsSync(authPath)) {
+    for (const authPath of authPaths) {
+      if (!existsSync(authPath)) continue;
       try {
         const auth = JSON.parse(readFileSync(authPath, 'utf8'));
         accessToken = auth?.tokens?.access_token || null;
@@ -213,45 +549,78 @@ export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true 
         const idClaims = decodeJwtPayload(auth?.tokens?.id_token);
         accountEmail = idClaims?.email || null;
         planTitle = formatCodexPlan(idClaims?.['https://api.openai.com/auth']?.chatgpt_plan_type);
+        if (!accessToken && typeof auth?.OPENAI_API_KEY === 'string' && auth.OPENAI_API_KEY.trim()) {
+          isApiKeyOnly = true;
+        }
+        if (accessToken || accountEmail || isApiKeyOnly) break;
       } catch {}
     }
 
     let rateLimit = null;
     let resetCreditsText = null;
+    let networkErrorKind = null;
 
     if (allowNetwork && accessToken) {
-      try {
-        const res = await fetch('https://chatgpt.com/backend-api/wham/usage', {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}),
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(4000),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (data?.email) accountEmail = data.email;
-          if (data?.plan_type) planTitle = formatCodexPlan(data.plan_type);
-          if (data?.rate_limit) rateLimit = data.rate_limit;
-          const avail = data?.rate_limit_reset_credits?.available_count;
-          if (typeof avail === 'number' && avail > 0) {
-            resetCreditsText = `${avail} 次可用`;
+      const { usageUrl, resetCreditsUrl } = resolveCodexUsageUrl(codexHome);
+      const headers = {
+        Authorization: `Bearer ${accessToken}`,
+        ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}),
+        'User-Agent': 'codex-cli',
+        Accept: 'application/json',
+      };
+      const res = await httpRequestJson(usageUrl, { headers, timeoutMs: 8000 });
+      if (res.ok && res.data) {
+        const data = res.data;
+        if (data?.email) accountEmail = data.email;
+        if (data?.plan_type) planTitle = formatCodexPlan(data.plan_type);
+        if (data?.rate_limit && (data.rate_limit.primary_window || data.rate_limit.secondary_window)) {
+          rateLimit = data.rate_limit;
+        } else if (Array.isArray(data?.additional_rate_limits)) {
+          const extra = data.additional_rate_limits.find(
+            (e) => e?.rate_limit?.primary_window || e?.rate_limit?.secondary_window
+          );
+          if (extra?.rate_limit) rateLimit = extra.rate_limit;
+        }
+        const avail = data?.rate_limit_reset_credits?.available_count;
+        if (typeof avail === 'number' && avail > 0) {
+          resetCreditsText = `${avail} 次可用`;
+        } else if (data?.credits?.unlimited) {
+          resetCreditsText = '无限额度';
+        } else if (data?.credits?.has_credits && data?.credits?.balance !== undefined && data?.credits?.balance !== null) {
+          const bal = Number(data.credits.balance);
+          if (Number.isFinite(bal) && bal > 0) resetCreditsText = `余额 $${bal.toFixed(2)}`;
+        }
+        if (!resetCreditsText && rateLimit && !data?.rate_limit_reset_credits) {
+          const rcRes = await httpRequestJson(resetCreditsUrl, {
+            headers: {
+              ...headers,
+              'OpenAI-Beta': 'codex-1',
+              originator: 'Codex Desktop',
+            },
+            timeoutMs: 3000,
+          });
+          const rcAvail = rcRes?.data?.available_count;
+          if (typeof rcAvail === 'number' && rcAvail > 0) {
+            resetCreditsText = `${rcAvail} 次可用`;
           }
         }
-      } catch {}
+      } else {
+        networkErrorKind = res.errorKind;
+      }
     }
 
     if (!rateLimit) {
-      const localRl = findNewestCodexRateLimits(codexHome);
+      const localRl = findNewestCodexRateLimits(codexHome, nowMs);
       if (localRl) {
         if (localRl.plan_type) planTitle = formatCodexPlan(localRl.plan_type);
         const normalizeLocalWin = (w, defaultSecs) => {
           if (!w || typeof w.used_percent !== 'number') return null;
+          const resetSec = typeof w.resets_at === 'number' && w.resets_at > 0 ? w.resets_at : null;
+          const elapsedReset = resetSec !== null && resetSec * 1000 <= nowMs;
           return {
-            used_percent: w.used_percent,
+            used_percent: elapsedReset ? 0 : w.used_percent,
             limit_window_seconds: w.window_minutes ? w.window_minutes * 60 : defaultSecs,
-            reset_at: w.resets_at || null,
+            reset_at: elapsedReset ? null : resetSec,
           };
         };
         rateLimit = {
@@ -285,7 +654,28 @@ export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true 
     const sWin = buildCodexWin(rateLimit?.secondary_window, 'codex-weekly', '每周', 604800);
     if (sWin) quotaWindows.push(sWin);
 
-    return { accountEmail, planTitle, quotaWindows, resetCreditsText };
+    let quotaHint = null;
+    if (quotaWindows.length === 0) {
+      if (isApiKeyOnly) {
+        quotaHint = '当前使用 API Key 按量模式 · 无固定个人会话限额';
+      } else if (networkErrorKind === 'unauthorized') {
+        quotaHint = 'Codex 登录凭证已过期，请在 Codex 重新登录';
+      } else if (networkErrorKind === 'network' || networkErrorKind === 'http') {
+        quotaHint = '无法连接 ChatGPT 配额接口，请检查网络或系统代理';
+      } else if (accessToken || accountEmail) {
+        quotaHint = '暂无可用配额窗口 · 点击刷新或运行一轮 Codex 后同步';
+      }
+    }
+
+    return {
+      accountEmail,
+      planTitle,
+      quotaWindows,
+      resetCreditsText,
+      quotaHint,
+      _ok: quotaWindows.length > 0 || networkErrorKind === null,
+      _errorKind: quotaWindows.length > 0 ? null : networkErrorKind,
+    };
   } catch {
     return empty;
   }
@@ -530,10 +920,89 @@ function readCodexBarCursorSessionCookie() {
   return null;
 }
 
-function resolveCursorJwtCookie(rawToken) {
+export function decryptCursorSafeStorageToken(encryptedValue, passwords = []) {
+  if (typeof encryptedValue !== 'string') return null;
+  const prefix = 'cursor-safe-storage:v1:';
+  if (!encryptedValue.startsWith(prefix)) return null;
+  const b64 = encryptedValue.slice(prefix.length).trim();
+  if (!b64) return null;
+  const encrypted = Buffer.from(b64, 'base64');
+  if (encrypted.length <= 3 || encrypted.subarray(0, 3).toString('utf8') !== 'v10') return null;
+  const payload = encrypted.subarray(3);
+  if (payload.length === 0 || payload.length % 16 !== 0) return null;
+  const iv = Buffer.alloc(16, 0x20);
+
+  for (const password of passwords) {
+    if (typeof password !== 'string' || !password) continue;
+    try {
+      const key = pbkdf2Sync(Buffer.from(password, 'utf8'), Buffer.from('saltysalt', 'utf8'), 1003, 16, 'sha1');
+      const decipher = createDecipheriv('aes-128-cbc', key, iv);
+      const dec = Buffer.concat([decipher.update(payload), decipher.final()]).toString('utf8').trim();
+      if (dec && dec.split('.').length >= 3) {
+        return dec;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function decodeSqliteItemValue(val) {
+  if (typeof val === 'string') return val;
+  if (val instanceof Uint8Array || Buffer.isBuffer(val)) {
+    const buf = Buffer.from(val);
+    if (buf.length >= 2 && buf.length % 2 === 0) {
+      let looksUtf16Le = true;
+      for (let i = 0; i < buf.length; i += 2) {
+        if (buf[i] < 1 || buf[i] >= 128 || buf[i + 1] !== 0) {
+          looksUtf16Le = false;
+          break;
+        }
+      }
+      if (looksUtf16Le) return buf.toString('utf16le');
+    }
+    return buf.toString('utf8');
+  }
+  return null;
+}
+
+function readCursorStateDb(dbPath) {
+  if (!existsSync(dbPath)) return null;
+  const openRead = (target) => {
+    const db = new DatabaseSync(target, { readOnly: true });
+    try {
+      const getVal = (key) => decodeSqliteItemValue(db.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get(key)?.value);
+      return {
+        email: getVal('cursorAuth/cachedEmail') || null,
+        membership: getVal('cursorAuth/stripeMembershipType') || null,
+        cachedTeam: getVal('cursorAuth/cachedTeam') || null,
+        accessToken: getVal('cursorAuth/accessToken') || null,
+        authId: getVal('cursorAuth/stripeMembershipAuthId') || null,
+      };
+    } finally {
+      db.close();
+    }
+  };
+  try {
+    return openRead(dbPath);
+  } catch {
+    if (!existsSync(`${dbPath}-wal`) && !existsSync(`${dbPath}-shm`)) {
+      try {
+        return openRead(`file://${encodeURI(dbPath)}?immutable=1`);
+      } catch {}
+    }
+    return null;
+  }
+}
+
+function resolveCursorJwtCookie(rawToken, { safeStoragePasswords = [] } = {}) {
   if (typeof rawToken !== 'string') return null;
-  const trimmed = rawToken.trim();
-  if (!trimmed || trimmed.startsWith('cursor-safe-storage:')) return null;
+  let trimmed = rawToken.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('cursor-safe-storage:')) {
+    const decrypted = decryptCursorSafeStorageToken(trimmed, safeStoragePasswords);
+    if (!decrypted) return { encryptedNeedsKeychain: true };
+    trimmed = decrypted;
+  }
   const payload = decodeJwtPayload(trimmed);
   if (!payload || typeof payload.sub !== 'string') return null;
   if (typeof payload.exp === 'number' && payload.exp * 1000 <= Date.now() + 60_000) {
@@ -543,8 +1012,42 @@ function resolveCursorJwtCookie(rawToken) {
   if (!userId) return null;
   return {
     userId,
+    email: typeof payload.email === 'string' ? payload.email : null,
     cookieHeader: `WorkosCursorSessionToken=${userId}%3A%3A${trimmed}`,
   };
+}
+
+function readCursorAgentCookie(homeDir = homedir()) {
+  const cfgHome =
+    process.env.XDG_CONFIG_HOME?.startsWith('/') ? process.env.XDG_CONFIG_HOME : join(homeDir, '.config');
+  for (const p of [join(cfgHome, 'cursor', 'auth.json'), join(homeDir, '.cursor', 'auth.json')]) {
+    try {
+      if (!existsSync(p)) continue;
+      const obj = JSON.parse(readFileSync(p, 'utf8'));
+      const res = resolveCursorJwtCookie(obj?.accessToken || obj?.token);
+      if (res?.cookieHeader) return res.cookieHeader;
+    } catch {}
+  }
+  return null;
+}
+
+async function cursorApiFetch(
+  url,
+  cookieHeader,
+  { method = 'GET', body = null, timeoutMs = 8000 } = {}
+) {
+  const headers = {
+    Cookie: cookieHeader,
+    Accept: 'application/json',
+    Origin: 'https://cursor.com',
+    Referer: 'https://cursor.com/dashboard?tab=usage',
+    'User-Agent':
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+  };
+  if (body !== null) {
+    headers['Content-Type'] = 'application/json';
+  }
+  return httpRequestJson(url, { method, headers, body, timeoutMs });
 }
 
 export async function cursorApiJson(
@@ -552,48 +1055,74 @@ export async function cursorApiJson(
   cookieHeader,
   { method = 'GET', body = null, timeoutMs = 8000 } = {}
 ) {
-  try {
-    const headers = {
-      Cookie: cookieHeader,
-      Accept: 'application/json',
-      Origin: 'https://cursor.com',
-      Referer: 'https://cursor.com/dashboard?tab=usage',
-      'User-Agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
-    };
-    if (body !== null) {
-      headers['Content-Type'] = 'application/json';
+  const res = await cursorApiFetch(url, cookieHeader, { method, body, timeoutMs });
+  return res.ok ? res.data : null;
+}
+
+export async function resolveCursorCookieCandidates({
+  cursorCookie = null,
+  safeStoragePasswords = [],
+  allowSilentKeychain = false,
+  homeDir = homedir(),
+} = {}) {
+  const seen = new Set();
+  const candidates = [];
+  let hasEncryptedTokenWithoutKey = false;
+  let dbMeta = null;
+
+  const pushCandidate = (hdr, source) => {
+    const normalized = normalizeCursorCookieInput(hdr);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    candidates.push({ cookieHeader: normalized, source });
+  };
+
+  pushCandidate(cursorCookie, 'config');
+
+  const dbPath = join(homeDir, 'Library/Application Support/Cursor/User/globalStorage/state.vscdb');
+  dbMeta = readCursorStateDb(dbPath);
+  if (dbMeta?.accessToken) {
+    let passwords = [...safeStoragePasswords];
+    if (
+      dbMeta.accessToken.startsWith('cursor-safe-storage:') &&
+      passwords.length === 0 &&
+      allowSilentKeychain
+    ) {
+      const helperBin = resolveAppHelperBin();
+      if (helperBin) {
+        const res = await runProcessWithStdin(helperBin, ['--read-cursor-safe-storage'], '', 2000);
+        if (res.ok && res.stdout.trim()) {
+          try {
+            const parsed = JSON.parse(res.stdout);
+            if (Array.isArray(parsed?.passwords)) {
+              passwords = parsed.passwords.filter((p) => typeof p === 'string' && p.length > 0);
+            }
+          } catch {}
+        }
+      }
     }
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body !== null ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
+    const jwtRes = resolveCursorJwtCookie(dbMeta.accessToken, { safeStoragePasswords: passwords });
+    if (jwtRes?.cookieHeader) {
+      pushCandidate(jwtRes.cookieHeader, 'cursor-app-db');
+    } else if (jwtRes?.encryptedNeedsKeychain) {
+      hasEncryptedTokenWithoutKey = true;
+    }
   }
+
+  pushCandidate(readCodexBarCursorSessionCookie(), 'codexbar-cache');
+  pushCandidate(readCursorAgentCookie(homeDir), 'cursor-agent');
+
+  return { candidates, dbMeta, hasEncryptedTokenWithoutKey };
 }
 
 export function resolveCursorCookieHeader(cursorCookie = null) {
-  let cookieHeader = normalizeCursorCookieInput(cursorCookie);
-  if (cookieHeader) return cookieHeader;
-  try {
-    const dbPath = join(homedir(), 'Library/Application Support/Cursor/User/globalStorage/state.vscdb');
-    if (existsSync(dbPath)) {
-      const db = new DatabaseSync(dbPath, { readOnly: true });
-      try {
-        const token = db.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get('cursorAuth/accessToken')?.value;
-        const jwtRes = resolveCursorJwtCookie(token);
-        if (jwtRes) return jwtRes.cookieHeader;
-      } finally {
-        db.close();
-      }
-    }
-  } catch {}
-  return readCodexBarCursorSessionCookie();
+  const direct = normalizeCursorCookieInput(cursorCookie);
+  if (direct) return direct;
+  const dbPath = join(homedir(), 'Library/Application Support/Cursor/User/globalStorage/state.vscdb');
+  const dbMeta = readCursorStateDb(dbPath);
+  const jwtRes = resolveCursorJwtCookie(dbMeta?.accessToken);
+  if (jwtRes?.cookieHeader) return jwtRes.cookieHeader;
+  return readCodexBarCursorSessionCookie() || readCursorAgentCookie();
 }
 
 export function parseCursorQuotaSummary(
@@ -604,6 +1133,8 @@ export function parseCursorQuotaSummary(
     planTitle = null,
     teamBudget = null,
     reqUsage = null,
+    sandUsage = null,
+    unifiedUsage = null,
   } = {}
 ) {
   if (!summary || typeof summary !== 'object') {
@@ -628,9 +1159,32 @@ export function parseCursorQuotaSummary(
   const hasTotalPct = typeof plan?.totalPercentUsed === 'number' && Number.isFinite(plan.totalPercentUsed);
   const hasPlanCents = typeof plan?.limit === 'number' && plan.limit > 0 && typeof plan?.used === 'number';
 
+  const sandResetMs = sandUsage?.nextResetTimestampUtc ? Date.parse(sandUsage.nextResetTimestampUtc) : NaN;
+  const sandHasLimit =
+    typeof sandUsage?.includedLimitZero === 'boolean'
+      ? !sandUsage.includedLimitZero
+      : Boolean(sandUsage?.hasNonZeroIncludedLimit);
+  const hasUnifiedWeekly = Boolean(
+    sandUsage?.isUnified &&
+      sandHasLimit &&
+      typeof sandUsage?.usagePercent === 'number' &&
+      Number.isFinite(sandResetMs) &&
+      sandResetMs > nowMs
+  );
+
   const quotaWindows = [];
 
-  if (hasAutoPct || hasApiPct) {
+  if (hasUnifiedWeekly && !hasAutoPct && !hasApiPct) {
+    const win = computeQuotaWindow({
+      id: 'cursor-weekly',
+      title: '每周共享池',
+      usedPct: sandUsage.usagePercent,
+      windowSeconds: 7 * 86400,
+      resetAtMs: sandResetMs,
+      nowMs,
+    });
+    if (win) quotaWindows.push(win);
+  } else if (hasAutoPct || hasApiPct) {
     // Cursor's dual-pool plans track Auto/Composer ("Cursor Models") and third-party API ("Other Models")
     // separately; surfacing both pools matches Cursor's dashboard and avoids mixing the $20 API pool cap into total%.
     if (hasAutoPct) {
@@ -661,7 +1215,18 @@ export function parseCursorQuotaSummary(
     let usedPct = null;
     let includeBudgetNote = false;
 
-    if (hasTotalPct || hasPlanCents) {
+    if (
+      teamBudget &&
+      Number.isFinite(teamBudget.limitUSD) &&
+      teamBudget.limitUSD > 0 &&
+      Number.isFinite(teamBudget.usedUSD) &&
+      teamBudget.usedUSD >= 0
+    ) {
+      usedUSD = teamBudget.usedUSD;
+      limitUSD = teamBudget.limitUSD;
+      usedPct = (usedUSD / limitUSD) * 100;
+      includeBudgetNote = true;
+    } else if (hasTotalPct || hasPlanCents) {
       if (hasTotalPct) {
         usedPct = plan.totalPercentUsed;
       } else {
@@ -674,17 +1239,6 @@ export function parseCursorQuotaSummary(
         // Only attach "$used / $limit" when consistent with usedPct so API caps never contradict percentage bars.
         includeBudgetNote = !hasTotalPct || Math.abs(pctFromCents - usedPct) < 5;
       }
-    } else if (
-      teamBudget &&
-      Number.isFinite(teamBudget.limitUSD) &&
-      teamBudget.limitUSD > 0 &&
-      Number.isFinite(teamBudget.usedUSD) &&
-      teamBudget.usedUSD >= 0
-    ) {
-      usedUSD = teamBudget.usedUSD;
-      limitUSD = teamBudget.limitUSD;
-      usedPct = (usedUSD / limitUSD) * 100;
-      includeBudgetNote = true;
     } else if (overall && typeof overall.limit === 'number' && overall.limit > 0 && typeof overall.used === 'number') {
       usedUSD = overall.used / 100;
       limitUSD = overall.limit / 100;
@@ -730,26 +1284,36 @@ export function parseCursorQuotaSummary(
     }
   }
 
-  const indOnDemand = summary.individualUsage?.onDemand;
-  const teamOnDemand = summary.teamUsage?.onDemand;
-  const onDemand =
-    indOnDemand && (typeof indOnDemand.used === 'number' || typeof indOnDemand.limit === 'number')
-      ? indOnDemand
-      : teamOnDemand;
-  const onDemandUsed = onDemand?.used;
-  const onDemandLimit = onDemand?.limit;
   let resetCreditsText = null;
   if (
-    typeof onDemandUsed === 'number' &&
-    onDemandUsed >= 0 &&
-    onDemand?.enabled !== false &&
-    (onDemandUsed > 0 || (typeof onDemandLimit === 'number' && onDemandLimit > 0))
+    unifiedUsage &&
+    typeof unifiedUsage.usedCents === 'number' &&
+    unifiedUsage.usedCents >= 0 &&
+    typeof unifiedUsage.limitCents === 'number' &&
+    unifiedUsage.limitCents > 0
   ) {
-    const usdStr = `$${(onDemandUsed / 100).toFixed(2)}`;
-    resetCreditsText =
-      typeof onDemandLimit === 'number' && onDemandLimit > 0
-        ? `${usdStr} / $${(onDemandLimit / 100).toFixed(2)}`
-        : `${usdStr} / 无上限`;
+    resetCreditsText = `$${(unifiedUsage.usedCents / 100).toFixed(2)} / $${(unifiedUsage.limitCents / 100).toFixed(2)}`;
+  } else {
+    const indOnDemand = summary.individualUsage?.onDemand;
+    const teamOnDemand = summary.teamUsage?.onDemand;
+    const onDemand =
+      indOnDemand && (typeof indOnDemand.used === 'number' || typeof indOnDemand.limit === 'number')
+        ? indOnDemand
+        : teamOnDemand;
+    const onDemandUsed = onDemand?.used;
+    const onDemandLimit = onDemand?.limit;
+    if (
+      typeof onDemandUsed === 'number' &&
+      onDemandUsed >= 0 &&
+      onDemand?.enabled !== false &&
+      (onDemandUsed > 0 || (typeof onDemandLimit === 'number' && onDemandLimit > 0))
+    ) {
+      const usdStr = `$${(onDemandUsed / 100).toFixed(2)}`;
+      resetCreditsText =
+        typeof onDemandLimit === 'number' && onDemandLimit > 0
+          ? `${usdStr} / $${(onDemandLimit / 100).toFixed(2)}`
+          : `${usdStr} / 无上限`;
+    }
   }
 
   return {
@@ -760,80 +1324,132 @@ export function parseCursorQuotaSummary(
   };
 }
 
-export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true, cursorCookie = null } = {}) {
-  const empty = { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null };
+export async function fetchCursorQuota(
+  nowMs = Date.now(),
+  { allowNetwork = true, cursorCookie = null, safeStoragePasswords = [] } = {}
+) {
   let accountEmail = null;
   let planTitle = null;
   let teamId = null;
-  let cookieHeader = normalizeCursorCookieInput(cursorCookie);
   let userId = null;
 
-  try {
-    const dbPath = join(homedir(), 'Library/Application Support/Cursor/User/globalStorage/state.vscdb');
-    if (existsSync(dbPath)) {
-      const db = new DatabaseSync(dbPath, { readOnly: true });
-      try {
-        const getVal = (key) => db.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get(key)?.value;
-        accountEmail = getVal('cursorAuth/cachedEmail') || null;
-        const membership = getVal('cursorAuth/stripeMembershipType');
-        let teamName = null;
-        try {
-          const teamObj = JSON.parse(getVal('cursorAuth/cachedTeam') || 'null');
-          teamName = teamObj?.name || null;
-          if (typeof teamObj?.teamId === 'number') teamId = teamObj.teamId;
-        } catch {}
+  const { candidates, dbMeta, hasEncryptedTokenWithoutKey } = await resolveCursorCookieCandidates({
+    cursorCookie,
+    safeStoragePasswords,
+    allowSilentKeychain: allowNetwork,
+  });
 
-        if (!cookieHeader) {
-          const jwtRes = resolveCursorJwtCookie(getVal('cursorAuth/accessToken'));
-          if (jwtRes) {
-            cookieHeader = jwtRes.cookieHeader;
-            userId = jwtRes.userId;
-          }
-        }
-        if (!userId) {
-          const authId = getVal('cursorAuth/stripeMembershipAuthId');
-          if (typeof authId === 'string' && authId.includes('|')) {
-            userId = authId.split('|').filter(Boolean).pop() || null;
-          }
-        }
-
-        const planNames = {
-          enterprise: 'Enterprise',
-          pro: 'Pro',
-          pro_plus: 'Pro+',
-          ultra: 'Ultra',
-          team: 'Team',
-          free: 'Free',
-          free_trial: 'Pro Trial',
-          hobby: 'Hobby',
-        };
-        const basePlan = membership ? planNames[String(membership).toLowerCase()] || String(membership) : null;
-        planTitle = basePlan && teamName ? `${basePlan} · ${teamName}` : basePlan || teamName;
-      } finally {
-        db.close();
-      }
-    }
-  } catch {}
-
-  if (!cookieHeader) {
-    cookieHeader = readCodexBarCursorSessionCookie();
-  }
-  if (!userId && cookieHeader) {
+  if (dbMeta) {
+    accountEmail = dbMeta.email || null;
+    const membership = dbMeta.membership;
+    let teamName = null;
     try {
-      const m = decodeURIComponent(cookieHeader).match(/WorkosCursorSessionToken=([^;\s]+?)::/);
-      if (m?.[1]) userId = m[1];
+      const teamObj = JSON.parse(dbMeta.cachedTeam || 'null');
+      teamName = teamObj?.name || null;
+      if (typeof teamObj?.teamId === 'number') teamId = teamObj.teamId;
     } catch {}
-  }
-  if (!cookieHeader || !allowNetwork) {
-    return { accountEmail, planTitle, quotaWindows: [], resetCreditsText: null };
+    if (typeof dbMeta.authId === 'string' && dbMeta.authId.includes('|')) {
+      userId = dbMeta.authId.split('|').filter(Boolean).pop() || null;
+    }
+    const planNames = {
+      enterprise: 'Enterprise',
+      pro: 'Pro',
+      pro_plus: 'Pro+',
+      ultra: 'Ultra',
+      team: 'Team',
+      free: 'Free',
+      free_trial: 'Pro Trial',
+      hobby: 'Hobby',
+    };
+    const basePlan = membership ? planNames[String(membership).toLowerCase()] || String(membership) : null;
+    planTitle = basePlan && teamName ? `${basePlan} · ${teamName}` : basePlan || teamName;
   }
 
-  const summary = await cursorApiJson('https://cursor.com/api/usage-summary', cookieHeader);
-  if (!summary) {
-    return { accountEmail, planTitle, quotaWindows: [], resetCreditsText: null };
+  if (candidates.length === 0 || !allowNetwork) {
+    let quotaHint = null;
+    if (allowNetwork) {
+      quotaHint = hasEncryptedTokenWithoutKey
+        ? '检测到本机 Cursor 已登录，请点下方「读取本机登录」或「网页登录」授权同步'
+        : '需连接 Cursor 会话，才可同步套餐剩余百分比与重置时间';
+    }
+    return {
+      accountEmail,
+      planTitle,
+      quotaWindows: [],
+      resetCreditsText: null,
+      quotaHint,
+      hasEncryptedTokenWithoutKey,
+      _ok: false,
+      _errorKind: candidates.length === 0 ? 'no_credentials' : null,
+    };
   }
 
-  if (!accountEmail && summary.email) accountEmail = summary.email;
+  let activeCookie = null;
+  let summary = null;
+  let authMe = null;
+  let sandUsage = null;
+  let lastErrorKind = null;
+
+  for (const cand of candidates) {
+    const hdr = cand.cookieHeader;
+    if (!userId) {
+      try {
+        const m = decodeURIComponent(hdr).match(/WorkosCursorSessionToken=([^;\s]+?)::/);
+        if (m?.[1]) userId = m[1];
+      } catch {}
+    }
+
+    const [sumRes, meRes, sandRes] = await Promise.all([
+      cursorApiFetch('https://cursor.com/api/usage-summary', hdr, { timeoutMs: 8000 }),
+      cursorApiFetch('https://cursor.com/api/auth/me', hdr, { timeoutMs: 6000 }),
+      cursorApiFetch('https://cursor.com/api/dashboard/get-sand-usage-status', hdr, {
+        method: 'POST',
+        body: {},
+        timeoutMs: 5000,
+      }),
+    ]);
+
+    if (sumRes.ok && sumRes.data) {
+      activeCookie = hdr;
+      summary = sumRes.data;
+      authMe = meRes.ok ? meRes.data : null;
+      sandUsage = sandRes.ok ? sandRes.data : null;
+      break;
+    }
+
+    lastErrorKind = sumRes.errorKind;
+    if (sumRes.errorKind === 'network') {
+      break;
+    }
+  }
+
+  if (!summary || !activeCookie) {
+    let quotaHint = null;
+    if (lastErrorKind === 'unauthorized') {
+      quotaHint = hasEncryptedTokenWithoutKey
+        ? '当前 Cookie 已过期，请点下方「读取本机登录」或「重新登录」'
+        : 'Cursor 会话已过期，请点击下方重新登录同步额度';
+    } else if (lastErrorKind === 'network' || lastErrorKind === 'http') {
+      quotaHint = '无法连接 cursor.com 配额接口，请检查网络或系统代理';
+    }
+    return {
+      accountEmail,
+      planTitle,
+      quotaWindows: [],
+      resetCreditsText: null,
+      quotaHint,
+      hasEncryptedTokenWithoutKey,
+      _ok: false,
+      _errorKind: lastErrorKind,
+    };
+  }
+
+  if (authMe?.email) accountEmail = authMe.email;
+  else if (!accountEmail && summary.email) accountEmail = summary.email;
+  if (!userId && typeof authMe?.sub === 'string' && authMe.sub) {
+    userId = authMe.sub.split('|').filter(Boolean).pop() || null;
+  }
+
   const plan = summary.individualUsage?.plan;
   const hasPlanData = Boolean(
     plan &&
@@ -843,6 +1459,18 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
         (typeof plan.limit === 'number' && plan.limit > 0))
   );
 
+  let unifiedUsage = null;
+  if (summary.limitType === 'user' && summary.isUnlimited === false) {
+    const v2Res = await cursorApiFetch(
+      'https://cursor.com/api/dashboard/v2/usage-status?scope=user',
+      activeCookie,
+      { timeoutMs: 5000 }
+    );
+    if (v2Res.ok && v2Res.data && typeof v2Res.data.usedCents === 'number') {
+      unifiedUsage = v2Res.data;
+    }
+  }
+
   let teamBudget = null;
   if (
     !hasPlanData &&
@@ -850,9 +1478,9 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
       summary.membershipType === 'team' ||
       summary.isTeam ||
       summary.limitType === 'team') &&
-    accountEmail
+    (accountEmail || userId)
   ) {
-    const teamsRes = await cursorApiJson('https://cursor.com/api/dashboard/teams', cookieHeader, {
+    const teamsRes = await cursorApiJson('https://cursor.com/api/dashboard/teams', activeCookie, {
       method: 'POST',
       body: {},
     });
@@ -861,7 +1489,7 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
       teams.find((t) => t.id === teamId)?.id ??
       (teams.length === 1 ? teams[0]?.id : teamId);
     if (typeof targetTeamId === 'number') {
-      const spendRes = await cursorApiJson('https://cursor.com/api/dashboard/get-team-spend', cookieHeader, {
+      const spendRes = await cursorApiJson('https://cursor.com/api/dashboard/get-team-spend', activeCookie, {
         method: 'POST',
         body: {
           teamId: targetTeamId,
@@ -896,17 +1524,28 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
   if (!hasAnyFallback && userId) {
     reqUsage = await cursorApiJson(
       `https://cursor.com/api/usage?user=${encodeURIComponent(userId)}`,
-      cookieHeader
+      activeCookie
     );
   }
 
-  return parseCursorQuotaSummary(summary, {
+  const parsed = parseCursorQuotaSummary(summary, {
     nowMs,
     accountEmail,
     planTitle,
     teamBudget,
     reqUsage,
+    sandUsage,
+    unifiedUsage,
   });
+
+  return {
+    ...parsed,
+    resolvedCookieHeader: activeCookie,
+    hasEncryptedTokenWithoutKey,
+    quotaHint: parsed.quotaWindows.length === 0 ? '未读取到套餐限额，可刷新或重新登录确认套餐状态' : null,
+    _ok: true,
+    _errorKind: null,
+  };
 }
 
 export function fetchCodeBuddyQuota() {
@@ -1011,12 +1650,31 @@ function assembleAllQuotas(raw, enabledTools = null) {
   return { all, codex, antigravity, cursor, codebuddy };
 }
 
+function reconcileWithStaleGrace(toolKey, fresh, nowMs) {
+  if (fresh?.quotaWindows?.length > 0) {
+    lastGoodByTool[toolKey] = { snapshot: fresh, atMs: nowMs };
+    return fresh;
+  }
+  const prev = lastGoodByTool[toolKey];
+  if (
+    prev &&
+    nowMs - prev.atMs <= STALE_GRACE_MS &&
+    fresh?._errorKind === 'network' &&
+    (!fresh.accountEmail ||
+      !prev.snapshot.accountEmail ||
+      fresh.accountEmail.toLowerCase() === prev.snapshot.accountEmail.toLowerCase())
+  ) {
+    return prev.snapshot;
+  }
+  return fresh;
+}
+
 export async function getAllQuotas(
   nowMs = Date.now(),
   { forceRefresh = false, allowNetwork = true, cursorCookie = null, enabledTools = null } = {}
 ) {
   const cookieKey = cursorCookie ? String(cursorCookie).trim() : '';
-  if (!forceRefresh && cachedResult && cachedCookieKey === cookieKey && nowMs - cachedAtMs < CACHE_TTL_MS) {
+  if (!forceRefresh && cachedResult && cachedCookieKey === cookieKey && nowMs - cachedAtMs < cachedTtlMs) {
     return assembleAllQuotas(cachedResult, enabledTools);
   }
   if (!forceRefresh && inflightPromise && cachedCookieKey === cookieKey) {
@@ -1026,12 +1684,21 @@ export async function getAllQuotas(
   cachedCookieKey = cookieKey;
 
   inflightPromise = (async () => {
-    const [codex, antigravity, cursor] = await Promise.all([
+    const [codexRaw, antigravityRaw, cursorRaw] = await Promise.all([
       fetchCodexQuota(nowMs, { allowNetwork }),
       fetchAntigravityQuota(nowMs),
       fetchCursorQuota(nowMs, { allowNetwork, cursorCookie }),
     ]);
     const codebuddy = fetchCodeBuddyQuota();
+    const codex = reconcileWithStaleGrace('codex', codexRaw, nowMs);
+    const antigravity = reconcileWithStaleGrace('antigravity', antigravityRaw, nowMs);
+    const cursor = reconcileWithStaleGrace('cursor', cursorRaw, nowMs);
+
+    const anyTransientFailure = Boolean(
+      (codexRaw?._errorKind === 'network' && !codexRaw.quotaWindows?.length) ||
+        (cursorRaw?._errorKind === 'network' && !cursorRaw.quotaWindows?.length)
+    );
+    cachedTtlMs = anyTransientFailure ? ERROR_RETRY_TTL_MS : CACHE_TTL_MS;
 
     const raw = { codex, antigravity, cursor, codebuddy };
     cachedResult = raw;

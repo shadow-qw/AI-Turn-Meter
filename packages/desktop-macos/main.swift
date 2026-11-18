@@ -1,5 +1,8 @@
 import AppKit
+import Darwin
 import Foundation
+import LocalAuthentication
+import Security
 import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
@@ -160,6 +163,7 @@ struct CodexBarCardSnapshot: Decodable {
   let planTitle: String?
   let quotaWindows: [CardQuotaWindow]?
   let resetCreditsText: String?
+  let quotaHint: String?
   let latestTpsText: String?
   let latestCacheText: String?
   let latestTurnSubline: String?
@@ -532,7 +536,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.21"
+  @Published var version: String = "0.2.22"
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
@@ -987,7 +991,7 @@ final class MeterViewModel: ObservableObject {
       string: "http://127.0.0.1:\(daemonPort)/v1/usage?days=\(usageDays)\(toolQs)\(refreshQs)"
     ) else { return }
     if !silent { usageLoading = true }
-    var req = URLRequest(url: url, timeoutInterval: 6)
+    var req = URLRequest(url: url, timeoutInterval: 20)
     req.cachePolicy = .reloadIgnoringLocalCacheData
 
     URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
@@ -1193,6 +1197,57 @@ final class MeterViewModel: ObservableObject {
     )
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
       self?.fetchUsageSummary(silent: false, forceRefresh: true)
+    }
+  }
+
+  func syncCursorFromLocalApp() {
+    guard !busy, !runtime.runningFromDmg else { return }
+    busy = true
+    bannerIsError = false
+    statusBanner = "正在读取本机 Cursor 登录凭证…"
+    let port = daemonPort
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let passwords = HeadlessCliHelper.readCursorSafeStoragePasswords(allowPrompt: true)
+      var syncOk = false
+      var email: String? = nil
+      var errorMsg: String? = nil
+
+      if let url = URL(string: "http://127.0.0.1:\(port)/v1/cursor/sync-local"),
+         let jsonData = try? JSONSerialization.data(withJSONObject: ["passwords": passwords]) {
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = jsonData
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+          if let data = data,
+             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            syncOk = (obj["ok"] as? Bool) == true
+            email = obj["email"] as? String
+            errorMsg = obj["error"] as? String
+          }
+          sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 16)
+      } else {
+        errorMsg = "无法连接本地统计服务"
+      }
+
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.busy = false
+        if syncOk {
+          self.hasCursorCookie = true
+          self.bannerIsError = false
+          self.statusBanner = email != nil ? "已从本机 Cursor 同步账号（\(email!)）" : "已从本机 Cursor 同步套餐额度"
+          self.pollStatusOnly()
+          self.fetchUsageSummary(silent: false, forceRefresh: true)
+        } else {
+          self.bannerIsError = true
+          self.statusBanner = errorMsg ?? "未检测到本机 Cursor 登录态，请使用「登录同步…」"
+        }
+      }
     }
   }
 
@@ -2234,21 +2289,30 @@ private struct ProviderSettingsDetailView: View {
                     .font(.system(size: 12.5))
                     .foregroundColor(.primary)
                   Text(
-                    vm.hasCursorCookie
-                      ? "未读取到套餐限额，可重新登录或更新会话 Cookie"
-                      : "需连接 cursor.com 会话，才可同步套餐剩余百分比与重置时间"
+                    card?.quotaHint ?? (
+                      vm.hasCursorCookie
+                        ? "未读取到套餐限额，可读取本机凭证或重新登录"
+                        : "需连接 cursor.com 会话，才可同步套餐剩余百分比与重置时间"
+                    )
                   )
                   .font(.system(size: 11))
                   .foregroundColor(.secondary)
                   .lineLimit(2)
                 }
                 Spacer(minLength: 8)
-                Button(vm.hasCursorCookie ? "重新登录…" : "登录同步…") {
-                  vm.showCursorLoginSheet = true
+                Button("读取本机") {
+                  vm.syncCursorFromLocalApp()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.mini)
                 .tint(CodexBarPalette.accentBlue)
+                .disabled(vm.busy)
+
+                Button(vm.hasCursorCookie ? "重登…" : "网页登录…") {
+                  vm.showCursorLoginSheet = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
 
                 Button("Cookie…") {
                   vm.cursorCookieDraft = ""
@@ -3416,8 +3480,20 @@ struct CursorAuthWebView: NSViewRepresentable {
 
       store.getAllCookies { [weak self] cookies in
         guard let self = self, !self.didCapture else { return }
-        let cursorCookies = cookies.filter { $0.domain.lowercased().contains("cursor.com") && !$0.value.isEmpty }
-        let hasSession = cursorCookies.contains { $0.name == "WorkosCursorSessionToken" }
+        let sessionNames: Set<String> = [
+          "WorkosCursorSessionToken",
+          "__Secure-next-auth.session-token",
+          "next-auth.session-token",
+          "wos-session",
+          "__Secure-wos-session",
+          "authjs.session-token",
+          "__Secure-authjs.session-token",
+        ]
+        let cursorCookies = cookies.filter {
+          let dom = $0.domain.lowercased()
+          return (dom.contains("cursor.com") || dom.contains("cursor.sh")) && !$0.value.isEmpty
+        }
+        let hasSession = cursorCookies.contains { sessionNames.contains($0.name) }
         guard hasSession else {
           if force {
             DispatchQueue.main.async {
@@ -4304,15 +4380,16 @@ private struct CodexBarStyleCardView: View {
             isAll
               ? "正在同步客户端登录与额度信息…"
               : ((vm.apps[selection]?.installed ?? false)
-                  ? (selection == "cursor"
-                      ? (vm.hasCursorCookie
-                          ? "未读取到套餐限额 · 请重新登录"
-                          : "需在「设置 → Cursor」登录同步额度")
-                      : (selection == "codex"
-                          ? (card.accountEmail != nil
-                              ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
-                              : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
-                          : "企业/团队按量模式 · 无固定个人会话限额"))
+                  ? (card.quotaHint ?? (
+                      selection == "cursor"
+                        ? (vm.hasCursorCookie
+                            ? "未读取到套餐限额 · 请重新登录"
+                            : "需在「设置 → Cursor」授权读取或网页登录")
+                        : (selection == "codex"
+                            ? (card.accountEmail != nil
+                                ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
+                                : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
+                            : "企业/团队按量模式 · 无固定个人会话限额")))
                   : "未检测到该客户端安装")
           )
           .font(.system(size: 10.5))
@@ -4656,6 +4733,7 @@ struct MenuBarPopoverView: View {
       planTitle: nil,
       quotaWindows: nil,
       resetCreditsText: nil,
+      quotaHint: nil,
       latestTpsText: nil,
       latestCacheText: nil,
       latestTurnSubline: nil,
@@ -4721,7 +4799,7 @@ struct MenuBarPopoverView: View {
       VStack(spacing: 1) {
         PopoverActionRow(title: "刷新", shortcut: "⌘ R") {
           vm.refreshDoctorAndBootstrap()
-          vm.fetchUsageSummary(silent: true)
+          vm.fetchUsageSummary(silent: true, forceRefresh: true)
         }
         .keyboardShortcut("r", modifiers: .command)
 
@@ -5265,6 +5343,202 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     return false
   }
+}
+
+private enum HeadlessCliHelper {
+  static func readCursorSafeStoragePasswords(allowPrompt: Bool) -> [String] {
+    var results: [String] = []
+    let accounts = ["Cursor Key", "Cursor"]
+    for acct in accounts {
+      if let pw = readKeychainPassword(service: "Cursor Safe Storage", account: acct, allowPrompt: allowPrompt),
+         !results.contains(pw) {
+        results.append(pw)
+      }
+    }
+    if results.isEmpty,
+       let pw = readKeychainPassword(service: "Cursor Safe Storage", account: nil, allowPrompt: allowPrompt),
+       !results.contains(pw) {
+      results.append(pw)
+    }
+    return results
+  }
+
+  private typealias FnCopyAccess = @convention(c) (SecKeychainItem, UnsafeMutablePointer<SecAccess?>) -> OSStatus
+  private typealias FnCopyMatchingACLs = @convention(c) (SecAccess, CFTypeRef) -> Unmanaged<CFArray>?
+  private typealias FnCopyACLContents = @convention(c) (
+    SecACL,
+    UnsafeMutablePointer<CFArray?>,
+    UnsafeMutablePointer<CFString?>,
+    UnsafeMutablePointer<SecKeychainPromptSelector>
+  ) -> OSStatus
+  private typealias FnValidateTrustedApp = @convention(c) (SecTrustedApplication, UnsafePointer<CChar>) -> OSStatus
+
+  private nonisolated(unsafe) static let securityHandle = dlopen(
+    "/System/Library/Frameworks/Security.framework/Security",
+    RTLD_NOW
+  )
+
+  private static func securityFn<T>(_ name: String, as _: T.Type) -> T? {
+    guard let handle = securityHandle, let sym = dlsym(handle, name) else { return nil }
+    return unsafeBitCast(sym, to: T.self)
+  }
+
+  private static func isKeychainDecryptAllowedWithoutUI(service: String, account: String?) -> Bool {
+    guard let copyAccess = securityFn("SecKeychainItemCopyAccess", as: FnCopyAccess.self),
+          let copyACLs = securityFn("SecAccessCopyMatchingACLList", as: FnCopyMatchingACLs.self),
+          let copyACLContents = securityFn("SecACLCopyContents", as: FnCopyACLContents.self),
+          let validateApp = securityFn("SecTrustedApplicationValidateWithPath", as: FnValidateTrustedApp.self),
+          let exePath = Bundle.main.executablePath else {
+      return false
+    }
+
+    let ctx = LAContext()
+    ctx.interactionNotAllowed = true
+    var refQuery: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+      kSecReturnRef as String: true,
+      kSecUseAuthenticationContext as String: ctx,
+    ]
+    if let account = account {
+      refQuery[kSecAttrAccount as String] = account
+    }
+    var refObj: CFTypeRef?
+    guard SecItemCopyMatching(refQuery as CFDictionary, &refObj) == errSecSuccess,
+          let rawRef = refObj else {
+      return false
+    }
+    let item = unsafeDowncast(rawRef as AnyObject, to: SecKeychainItem.self)
+    var access: SecAccess?
+    guard copyAccess(item, &access) == errSecSuccess,
+          let access = access,
+          let acls = copyACLs(access, kSecACLAuthorizationDecrypt)?.takeRetainedValue() as? [SecACL] else {
+      return false
+    }
+    for acl in acls {
+      var apps: CFArray?
+      var desc: CFString?
+      var selector = SecKeychainPromptSelector()
+      guard copyACLContents(acl, &apps, &desc, &selector) == errSecSuccess else { continue }
+      guard selector.rawValue == 0 else { continue }
+      guard let trustedApps = apps as? [SecTrustedApplication] else {
+        return true
+      }
+      if trustedApps.contains(where: { app in
+        exePath.withCString { validateApp(app, $0) == errSecSuccess }
+      }) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private static func readKeychainPassword(service: String, account: String?, allowPrompt: Bool) -> String? {
+    if !allowPrompt && !isKeychainDecryptAllowedWithoutUI(service: service, account: account) {
+      return nil
+    }
+    var query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+      kSecReturnData as String: true,
+    ]
+    if let account = account {
+      query[kSecAttrAccount as String] = account
+    }
+    if !allowPrompt {
+      let ctx = LAContext()
+      ctx.interactionNotAllowed = true
+      query[kSecUseAuthenticationContext as String] = ctx
+    }
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    guard status == errSecSuccess, let data = item as? Data else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
+
+  static func runIfRequested() -> Bool {
+    let args = CommandLine.arguments
+    if args.contains("--net-fetch-json") {
+      runNetFetchJson()
+      return true
+    }
+    if args.contains("--read-cursor-safe-storage") {
+      let allowPrompt = args.contains("--allow-prompt")
+      let passwords = readCursorSafeStoragePasswords(allowPrompt: allowPrompt)
+      if let out = try? JSONSerialization.data(withJSONObject: ["ok": !passwords.isEmpty, "passwords": passwords]),
+         let text = String(data: out, encoding: .utf8) {
+        print(text)
+      } else {
+        print("{\"ok\":false,\"passwords\":[]}")
+      }
+      return true
+    }
+    return false
+  }
+
+  private static func runNetFetchJson() {
+    let inputData = FileHandle.standardInput.readDataToEndOfFile()
+    guard let obj = try? JSONSerialization.jsonObject(with: inputData) as? [String: Any],
+          let urlStr = obj["url"] as? String,
+          let url = URL(string: urlStr) else {
+      print("{\"ok\":false,\"error\":\"invalid input\"}")
+      return
+    }
+    let method = (obj["method"] as? String)?.uppercased() ?? "GET"
+    let timeoutMs = (obj["timeoutMs"] as? Double) ?? 8000.0
+    let timeoutSec = max(1.0, timeoutMs / 1000.0)
+
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.httpShouldSetCookies = false
+    cfg.httpCookieAcceptPolicy = .never
+    cfg.urlCache = nil
+    cfg.timeoutIntervalForRequest = timeoutSec
+    cfg.timeoutIntervalForResource = timeoutSec + 2.0
+
+    var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeoutSec)
+    req.httpMethod = method
+    if let headers = obj["headers"] as? [String: String] {
+      for (k, v) in headers {
+        req.setValue(v, forHTTPHeaderField: k)
+      }
+    }
+    if let bodyStr = obj["body"] as? String {
+      req.httpBody = bodyStr.data(using: .utf8)
+    }
+
+    let sem = DispatchSemaphore(value: 0)
+    var outPayload: [String: Any] = ["ok": false]
+    let session = URLSession(configuration: cfg)
+    session.dataTask(with: req) { data, resp, err in
+      if let http = resp as? HTTPURLResponse {
+        outPayload["status"] = http.statusCode
+        outPayload["ok"] = (200...299).contains(http.statusCode)
+      }
+      if let data = data, let text = String(data: data, encoding: .utf8) {
+        outPayload["body"] = text
+      }
+      if let err = err {
+        outPayload["error"] = err.localizedDescription
+      }
+      sem.signal()
+    }.resume()
+    if sem.wait(timeout: .now() + timeoutSec + 2.0) == .timedOut {
+      outPayload["error"] = "timeout"
+    }
+    session.invalidateAndCancel()
+    if let json = try? JSONSerialization.data(withJSONObject: outPayload),
+       let text = String(data: json, encoding: .utf8) {
+      print(text)
+    } else {
+      print("{\"ok\":false,\"error\":\"encode error\"}")
+    }
+  }
+}
+
+if HeadlessCliHelper.runIfRequested() {
+  exit(0)
 }
 
 let app = NSApplication.shared

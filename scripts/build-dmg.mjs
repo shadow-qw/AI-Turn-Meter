@@ -215,6 +215,10 @@ execFileSync(
     'Foundation',
     '-framework',
     'WebKit',
+    '-framework',
+    'Security',
+    '-framework',
+    'LocalAuthentication',
   ],
   { stdio: 'inherit' }
 );

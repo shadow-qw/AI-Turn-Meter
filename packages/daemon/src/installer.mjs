@@ -298,6 +298,8 @@ export function buildLaunchAgentPlist({
   <dict>
     <key>PATH</key>
     <string>${xmlEscape(runtimePath)}</string>
+    <key>NODE_USE_SYSTEM_CA</key>
+    <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

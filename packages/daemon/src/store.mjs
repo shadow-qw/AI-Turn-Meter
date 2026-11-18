@@ -901,6 +901,7 @@ export class TurnStore {
       planTitle: quotaInfo?.planTitle ?? null,
       quotaWindows: Array.isArray(quotaInfo?.quotaWindows) ? quotaInfo.quotaWindows : [],
       resetCreditsText: quotaInfo?.resetCreditsText ?? null,
+      quotaHint: quotaInfo?.quotaHint ?? null,
       latestTpsText: latestMetrics.latestTpsText,
       latestCacheText: latestMetrics.latestCacheText,
       latestTurnSubline: latestMetrics.latestTurnSubline,

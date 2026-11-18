@@ -8,7 +8,7 @@ import { CodeBuddyAdapter } from './adapters/codebuddy.mjs';
 import { drainCursorSpool, processCursorHookPayload, syncCursorHistoryEvents } from './adapters/cursor.mjs';
 import { CdpInlineInjector } from './cdp-injector.mjs';
 import { getPackageMeta } from './installer.mjs';
-import { getAllQuotas } from './quota.mjs';
+import { fetchCursorQuota, getAllQuotas } from './quota.mjs';
 import { TurnStore } from './store.mjs';
 
 const TOOL_KEYS = ['antigravity', 'codex', 'cursor', 'codebuddy'];
@@ -282,7 +282,8 @@ export function createMeterServer({
       req.method === 'POST' &&
       (url.pathname === '/v1/ingest' ||
         url.pathname === '/v1/ingest/cursor-hook' ||
-        url.pathname === '/v1/config')
+        url.pathname === '/v1/config' ||
+        url.pathname === '/v1/cursor/sync-local')
     ) {
       let body = '';
       req.setEncoding('utf8');
@@ -296,7 +297,57 @@ export function createMeterServer({
       });
       req.on('end', () => {
         try {
-          const payload = JSON.parse(body);
+          const payload = body.trim() ? JSON.parse(body) : {};
+          if (url.pathname === '/v1/cursor/sync-local') {
+            const safeStoragePasswords = Array.isArray(payload?.passwords)
+              ? payload.passwords.filter((p) => typeof p === 'string' && p.length > 0)
+              : [];
+            fetchCursorQuota(Date.now(), {
+              allowNetwork: true,
+              cursorCookie: null,
+              safeStoragePasswords,
+            })
+              .then(async (q) => {
+                if (q?.resolvedCookieHeader) {
+                  config.cursorCookie = q.resolvedCookieHeader;
+                  persistConfig();
+                  const pubCfg = publicConfig(config);
+                  broadcast('state', { ...store.getState(20, config.tools), config: pubCfg });
+                  if (enableQuotaProbe) {
+                    await getAllQuotas(Date.now(), {
+                      forceRefresh: true,
+                      cursorCookie: config.cursorCookie,
+                      enabledTools: config.tools,
+                    }).catch(() => {});
+                  }
+                  triggerCursorHistorySync({ force: true });
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(
+                    JSON.stringify({
+                      ok: true,
+                      email: q.accountEmail || null,
+                      quotaWindows: q.quotaWindows || [],
+                    })
+                  );
+                  return;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    ok: false,
+                    hasEncryptedTokenWithoutKey: Boolean(q?.hasEncryptedTokenWithoutKey),
+                    error: q?.quotaHint || '未读取到有效的 Cursor 登录会话',
+                  })
+                );
+              })
+              .catch(() => {
+                if (!res.headersSent) {
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: false, error: '同步 Cursor 本地登录态失败' }));
+                }
+              });
+            return;
+          }
           if (url.pathname === '/v1/config') {
             const prevInline = Object.fromEntries(TOOL_KEYS.map((k) => [k, isInlineEnabled(k)]));
             let refreshQuota = false;
