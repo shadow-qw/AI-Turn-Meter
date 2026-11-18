@@ -108,12 +108,29 @@ struct CardWindowMetrics: Decodable {
   let turnCount: Int
 }
 
+struct CardDailyModelItem: Decodable, Identifiable {
+  var id: String { model }
+  let model: String
+  let costUsd: Double?
+  let totalTokens: Int
+}
+
 struct CardDailyPoint: Decodable, Identifiable {
   var id: String { date }
   let date: String
   let label: String
   let totalTokens: Int
   let costUsd: Double?
+  let turnCount: Int
+  let models: [CardDailyModelItem]?
+}
+
+struct CardProjectBreakdown: Decodable, Identifiable {
+  var id: String { "\(name)-\(path)" }
+  let name: String
+  let path: String
+  let costUsd: Double?
+  let totalTokens: Int
   let turnCount: Int
 }
 
@@ -148,6 +165,7 @@ struct CodexBarCardSnapshot: Decodable {
   let currentWindow: CardWindowMetrics
   let days30: CardWindowMetrics
   let daily30: [CardDailyPoint]
+  let projects: [CardProjectBreakdown]?
   let recentWindows: [CardRecentWindow]
   let topModel: String?
 }
@@ -192,6 +210,16 @@ struct StatusResponse: Decodable {
   let config: MeterConfigPayload?
   let apps: [String: StatusAppEntry]
   let state: DaemonStateResponse?
+}
+
+enum SettingsPane: Hashable {
+  case general
+  case usage
+  case menuBar
+  case turns
+  case remote
+  case about
+  case provider(String)
 }
 
 enum MainTab: String, CaseIterable {
@@ -426,9 +454,10 @@ final class MeterViewModel: ObservableObject {
     static let showMenuBarSummary = "aiTurnMeter.showMenuBarSummary"
     static let menuBarDisplayMode = "aiTurnMeter.menuBarDisplayMode"
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
+    static let showRecentWindowsInMenu = "aiTurnMeter.showRecentWindowsInMenu"
   }
 
-  @Published var version: String = "0.2.10"
+  @Published var version: String = "0.2.11"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -452,10 +481,12 @@ final class MeterViewModel: ObservableObject {
     return UserDefaults.standard.bool(forKey: PrefKey.showMenuBarSummary) ? .tps : .iconOnly
   }()
   @Published var hideDockIcon: Bool = UserDefaults.standard.bool(forKey: PrefKey.hideDockIcon)
+  @Published var showRecentWindowsInMenu: Bool = UserDefaults.standard.bool(forKey: PrefKey.showRecentWindowsInMenu)
   @Published var launchAtLogin: Bool = FileManager.default.fileExists(
     atPath: (NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents/com.local.ai-turn-meter.app.plist")
   )
 
+  @Published var settingsPane: SettingsPane = .provider("antigravity")
   @Published var activeTab: MainTab = .control
   @Published var popoverSelection: String = "all"
   @Published var lastSyncedAt: Date? = nil
@@ -573,6 +604,25 @@ final class MeterViewModel: ObservableObject {
       UserDefaults.standard.set(true, forKey: PrefKey.showMenuBarExtra)
     }
     onPreferencesChanged?()
+  }
+
+  func setShowRecentWindowsInMenu(_ value: Bool) {
+    showRecentWindowsInMenu = value
+    UserDefaults.standard.set(value, forKey: PrefKey.showRecentWindowsInMenu)
+  }
+
+  func openSettingsPane(_ pane: SettingsPane) {
+    settingsPane = pane
+    switch pane {
+    case .usage:
+      activeTab = .usage
+      fetchUsageSummary()
+    case .turns:
+      activeTab = .turns
+      fetchRecentTurns()
+    default:
+      activeTab = .control
+    }
   }
 
   func ensureStarted() {
@@ -1352,16 +1402,45 @@ private enum CodexBarPalette {
   static let paceGreen = Color(red: 0.20, green: 0.72, blue: 0.42)
 }
 
+private struct SettingsAppPaneItem: Identifiable {
+  let id: String
+  let pane: SettingsPane
+  let title: String
+  let icon: String
+  let color: Color
+}
+
 struct ContentView: View {
   @ObservedObject var vm: MeterViewModel
-  @State private var hoveredTab: MainTab? = nil
+  @State private var searchText: String = ""
+  @State private var hoveredPane: SettingsPane? = nil
 
-  private var installedCount: Int {
-    vm.orderedKeys.filter { vm.apps[$0]?.installed ?? false }.count
+  private let appPanes: [SettingsAppPaneItem] = [
+    SettingsAppPaneItem(id: "general", pane: .general, title: "通用", icon: "gearshape.fill", color: Color.gray),
+    SettingsAppPaneItem(id: "usage", pane: .usage, title: "用量与支出", icon: "chart.bar.fill", color: Color.green),
+    SettingsAppPaneItem(id: "menubar", pane: .menuBar, title: "菜单栏与菜单", icon: "menubar.rectangle", color: CodexBarPalette.accentBlue),
+    SettingsAppPaneItem(id: "turns", pane: .turns, title: "最近轮次", icon: "clock.arrow.circlepath", color: Color.indigo),
+    SettingsAppPaneItem(id: "remote", pane: .remote, title: "远程与钩子", icon: "bolt.horizontal.circle.fill", color: Color.orange),
+    SettingsAppPaneItem(id: "about", pane: .about, title: "关于", icon: "info.circle.fill", color: CodexBarPalette.tealBar),
+  ]
+
+  private var filteredAppPanes: [SettingsAppPaneItem] {
+    let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !q.isEmpty else { return appPanes }
+    return appPanes.filter { $0.title.lowercased().contains(q) }
   }
 
-  private var connectedCount: Int {
-    vm.orderedKeys.filter {
+  private var providerKeys: [String] {
+    let preferred = ["codex", "cursor", "antigravity", "codebuddy"]
+    let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !q.isEmpty else { return preferred }
+    return preferred.filter {
+      vm.toolShortTitle(for: $0).lowercased().contains(q) || vm.displayTitle(for: $0).lowercased().contains(q)
+    }
+  }
+
+  private var enabledProviderCount: Int {
+    ["codex", "cursor", "antigravity", "codebuddy"].filter {
       (vm.apps[$0]?.installed ?? false) && vm.isToolEnabled($0) && vm.isActiveOverall
     }.count
   }
@@ -1383,137 +1462,8 @@ struct ContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(Color.orange.opacity(0.12))
+        Divider()
       }
-
-      // Top Header + Capsule Tab Bar
-      HStack(spacing: 12) {
-        HStack(spacing: 9) {
-          ZStack {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-              .fill(LinearGradient(
-                colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-              ))
-              .frame(width: 28, height: 28)
-            Image(systemName: "gauge.with.dots.needle.67percent")
-              .font(.system(size: 13.5, weight: .semibold))
-              .foregroundColor(.white)
-          }
-
-          VStack(alignment: .leading, spacing: 1) {
-            Text("AI Turn Meter")
-              .font(.system(size: 13, weight: .semibold))
-            HStack(spacing: 5) {
-              Circle()
-                .fill(vm.isActiveOverall ? Color.green : (vm.daemonOnline ? Color.orange : Color.gray.opacity(0.5)))
-                .frame(width: 6.5, height: 6.5)
-              Text(vm.isActiveOverall ? "运行中" : (vm.daemonOnline ? "已暂停" : "未启动"))
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundColor(.secondary)
-              Text("v\(vm.version)")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary.opacity(0.8))
-            }
-          }
-        }
-
-        Spacer(minLength: 8)
-
-        HStack(spacing: 3) {
-          ForEach(MainTab.allCases, id: \.self) { tab in
-            let selected = vm.activeTab == tab
-            let hovered = hoveredTab == tab
-            Button {
-              vm.activeTab = tab
-            } label: {
-              HStack(spacing: 5) {
-                Image(systemName: tab.icon)
-                  .font(.system(size: 11, weight: .semibold))
-                Text(tab.rawValue)
-                  .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
-              }
-              .padding(.horizontal, 10)
-              .padding(.vertical, 5.5)
-              .foregroundColor(hovered ? .white : (selected ? .primary : .primary.opacity(0.75)))
-              .background(
-                Capsule()
-                  .fill(hovered ? CodexBarPalette.accentBlue : (selected ? Color(nsColor: .controlBackgroundColor) : Color.clear))
-              )
-              .overlay(
-                Capsule()
-                  .stroke(selected && !hovered ? Color.primary.opacity(0.10) : Color.clear, lineWidth: 1)
-              )
-            }
-            .buttonStyle(.plain)
-            .onHover { inside in
-              if inside { hoveredTab = tab }
-              else if hoveredTab == tab { hoveredTab = nil }
-            }
-          }
-        }
-        .padding(3)
-        .background(Color.primary.opacity(0.06))
-        .clipShape(Capsule())
-
-        Spacer(minLength: 8)
-
-        HStack(spacing: 7) {
-          if vm.busy {
-            ProgressView().controlSize(.small)
-          } else if !vm.daemonOnline && !vm.runtime.runningFromDmg {
-            Button("开启后台") { vm.setMasterEnabled(true) }
-              .buttonStyle(.borderedProminent)
-              .tint(CodexBarPalette.accentBlue)
-              .controlSize(.small)
-          } else if !vm.masterEnabled && !vm.runtime.runningFromDmg {
-            Button("恢复显示") { vm.setMasterEnabled(true) }
-              .buttonStyle(.borderedProminent)
-              .tint(.orange)
-              .controlSize(.small)
-          } else if let today = vm.todaySummary {
-            Button {
-              vm.activeTab = .usage
-              vm.fetchUsageSummary()
-            } label: {
-              HStack(spacing: 5) {
-                Text("今日")
-                  .font(.system(size: 10.5))
-                  .foregroundColor(.secondary)
-                Text(MeterFormat.usd(today.estimatedCostUsd))
-                  .font(.system(size: 11.5, weight: .semibold))
-                  .monospacedDigit()
-                  .foregroundColor(.primary)
-              }
-              .padding(.horizontal, 9)
-              .padding(.vertical, 4.5)
-              .background(Color.primary.opacity(0.06))
-              .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .help("查看今日用量与费用详情")
-          }
-
-          Button {
-            vm.refreshDoctorAndBootstrap()
-            vm.fetchUsageSummary(silent: true)
-            if vm.activeTab == .turns { vm.fetchRecentTurns() }
-          } label: {
-            Image(systemName: "arrow.clockwise")
-              .font(.system(size: 11.5, weight: .medium))
-              .frame(width: 24, height: 24)
-              .background(Color.primary.opacity(0.06))
-              .clipShape(Circle())
-          }
-          .buttonStyle(.plain)
-          .help("刷新状态与统计")
-        }
-      }
-      .padding(.horizontal, 16)
-      .padding(.vertical, 11)
-      .background(Color(nsColor: .windowBackgroundColor))
-
-      Divider()
 
       if let msg = vm.statusBanner {
         HStack(spacing: 8) {
@@ -1521,7 +1471,7 @@ struct ContentView: View {
             .foregroundColor(vm.bannerIsError ? .red : .green)
           Text(msg)
             .font(.system(size: 12))
-            .lineLimit(3)
+            .lineLimit(2)
           Spacer()
           Button("关闭") { vm.statusBanner = nil }
             .buttonStyle(.plain)
@@ -1534,101 +1484,150 @@ struct ContentView: View {
         Divider()
       }
 
-      Group {
-        switch vm.activeTab {
-        case .control:
-          ControlPanelTabView(vm: vm)
-        case .usage:
-          UsageSummaryTabView(vm: vm)
-        case .turns:
-          RecentTurnsTabView(vm: vm)
-        }
-      }
-      .padding(16)
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background(Color(nsColor: .underPageBackgroundColor).opacity(0.45))
-
-      Divider()
-
-      // Footer Status + Maintenance Bar
-      HStack(spacing: 10) {
-        HStack(spacing: 6) {
-          Text(vm.relativeUpdateLabel())
-            .font(.system(size: 11))
-            .foregroundColor(.secondary)
-          Text("·")
-            .foregroundColor(.secondary.opacity(0.6))
-          Text("\(connectedCount)/\(installedCount) 个客户端监控中")
-            .font(.system(size: 11))
-            .foregroundColor(.secondary)
-        }
-
-        Spacer()
-
-        Button {
-          vm.knownSshHosts = MeterRuntime.readSshConfigHosts()
-          if vm.sshHost.isEmpty, let first = vm.knownSshHosts.first {
-            vm.sshHost = first
-          }
-          vm.sshApplyStatus = nil
-          vm.generateSshSnippet()
-          vm.showSshSheet = true
-        } label: {
-          Label("Remote-SSH", systemImage: "network")
-            .font(.system(size: 11.5))
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-
-        Button {
-          vm.checkForUpdates()
-        } label: {
-          Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
-            .font(.system(size: 11.5))
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-
-        Menu {
-          Button("修复或重新同步扩展配置") {
-            vm.runAction(args: ["install"], successText: "已重新同步全部配置与扩展")
-          }
-          Button("刷新全部数据") {
-            vm.refreshDoctorAndBootstrap()
-            vm.fetchUsageSummary()
-            if vm.activeTab == .turns { vm.fetchRecentTurns() }
-          }
-          if vm.daemonOnline {
-            Button(vm.masterEnabled ? "暂停全部显示" : "恢复全部显示") {
-              vm.setMasterEnabled(!vm.masterEnabled)
+      HStack(spacing: 0) {
+        // Left System-Settings-style Sidebar (CodexBar style)
+        VStack(alignment: .leading, spacing: 0) {
+          HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+              .font(.system(size: 11.5))
+              .foregroundColor(.secondary)
+            TextField("搜索设置", text: $searchText)
+              .textFieldStyle(.plain)
+              .font(.system(size: 12))
+            if !searchText.isEmpty {
+              Button {
+                searchText = ""
+              } label: {
+                Image(systemName: "xmark.circle.fill")
+                  .font(.system(size: 11))
+                  .foregroundColor(.secondary)
+              }
+              .buttonStyle(.plain)
             }
           }
-          Divider()
-          if vm.daemonOnline {
-            Button("彻底退出后台进程") {
-              vm.runAction(args: ["stop-daemon"], successText: "后台进程已退出")
+          .padding(.horizontal, 9)
+          .padding(.vertical, 6)
+          .background(Color(nsColor: .controlBackgroundColor))
+          .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+          .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+              .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+          )
+          .padding(.horizontal, 12)
+          .padding(.top, 12)
+          .padding(.bottom, 10)
+
+          ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+              ForEach(filteredAppPanes) { item in
+                sidebarRow(
+                  pane: item.pane,
+                  isSelected: vm.settingsPane == item.pane
+                ) {
+                  ZStack {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                      .fill(item.color)
+                      .frame(width: 20, height: 20)
+                    Image(systemName: item.icon)
+                      .font(.system(size: 10.5, weight: .semibold))
+                      .foregroundColor(.white)
+                  }
+                  Text(item.title)
+                    .font(.system(size: 12.5, weight: vm.settingsPane == item.pane ? .semibold : .regular))
+                    .foregroundColor(.primary)
+                  Spacer()
+                }
+              }
+
+              if !providerKeys.isEmpty {
+                HStack {
+                  Text("提供商")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                  Spacer()
+                  Text("\(enabledProviderCount) 个已开启")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 14)
+                .padding(.bottom, 4)
+
+                ForEach(providerKeys, id: \.self) { key in
+                  let entry = vm.apps[key]
+                  let installed = entry?.installed ?? false
+                  let enabled = vm.isToolEnabled(key)
+                  let dotColor: Color = {
+                    if !installed || !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.45) }
+                    if key != "antigravity" && entry?.cdpPort == nil { return .orange }
+                    return Color(red: 0.20, green: 0.72, blue: 0.42)
+                  }()
+
+                  sidebarRow(
+                    pane: .provider(key),
+                    isSelected: vm.settingsPane == .provider(key)
+                  ) {
+                    ToolGlyph.iconView(for: key, size: 15)
+                      .foregroundColor(installed ? .primary : .secondary.opacity(0.6))
+                      .frame(width: 20)
+                    Text(vm.toolShortTitle(for: key))
+                      .font(.system(size: 12.5, weight: vm.settingsPane == .provider(key) ? .semibold : .regular))
+                      .foregroundColor(installed ? .primary : .secondary)
+                    Spacer()
+                    Circle()
+                      .fill(dotColor)
+                      .frame(width: 6.5, height: 6.5)
+                  }
+                }
+              }
             }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 12)
           }
-          Button("完全卸载本地配置…", role: .destructive) {
-            vm.showUninstallAlert = true
-          }
-        } label: {
-          Label("更多", systemImage: "ellipsis.circle")
-            .font(.system(size: 11.5))
         }
-        .menuStyle(.borderedButton)
-        .controlSize(.small)
-        .fixedSize()
+        .frame(width: 215)
+        .background(Color(nsColor: .windowBackgroundColor))
+
+        Divider()
+
+        // Right Detail Area
+        Group {
+          switch vm.settingsPane {
+          case .provider(let key):
+            ProviderSettingsDetailView(vm: vm, key: key)
+          case .general:
+            GeneralSettingsPaneView(vm: vm)
+          case .menuBar:
+            MenuBarSettingsPaneView(vm: vm)
+          case .remote:
+            RemoteHooksSettingsPaneView(vm: vm)
+          case .about:
+            AboutSettingsPaneView(vm: vm)
+          case .usage:
+            UsageSummaryTabView(vm: vm)
+              .padding(16)
+          case .turns:
+            RecentTurnsTabView(vm: vm)
+              .padding(16)
+          }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .underPageBackgroundColor).opacity(0.45))
       }
-      .padding(.horizontal, 16)
-      .padding(.vertical, 9)
-      .background(Color(nsColor: .windowBackgroundColor))
     }
-    .frame(minWidth: 640, minHeight: 520)
+    .frame(minWidth: 740, minHeight: 540)
     .onAppear { vm.ensureStarted() }
-    .onChange(of: vm.activeTab) { newTab in
-      if newTab == .usage { vm.fetchUsageSummary() }
-      else if newTab == .turns { vm.fetchRecentTurns() }
+    .onChange(of: vm.settingsPane) { newPane in
+      switch newPane {
+      case .usage:
+        vm.activeTab = .usage
+        vm.fetchUsageSummary()
+      case .turns:
+        vm.activeTab = .turns
+        vm.fetchRecentTurns()
+      default:
+        vm.activeTab = .control
+      }
     }
     .alert("确认彻底卸载？", isPresented: $vm.showUninstallAlert) {
       Button("取消", role: .cancel) {}
@@ -1666,76 +1665,441 @@ struct ContentView: View {
       .frame(width: 440)
     }
   }
+
+  private func sidebarRow<RowContent: View>(
+    pane: SettingsPane,
+    isSelected: Bool,
+    @ViewBuilder content: () -> RowContent
+  ) -> some View {
+    let isHovered = hoveredPane == pane
+    return Button {
+      vm.openSettingsPane(pane)
+    } label: {
+      HStack(spacing: 8) {
+        content()
+      }
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(
+        RoundedRectangle(cornerRadius: 7, style: .continuous)
+          .fill(isSelected ? Color.primary.opacity(0.11) : (isHovered ? Color.primary.opacity(0.05) : Color.clear))
+      )
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .onHover { inside in
+      if inside { hoveredPane = pane }
+      else if hoveredPane == pane { hoveredPane = nil }
+    }
+  }
 }
 
-struct ControlPanelTabView: View {
-  @ObservedObject var vm: MeterViewModel
-
-  private let gridCols = [
-    GridItem(.flexible(), spacing: 10),
-    GridItem(.flexible(), spacing: 10),
-  ]
+private struct SettingsGroupCard<Content: View>: View {
+  let content: Content
+  init(@ViewBuilder content: () -> Content) {
+    self.content = content()
+  }
 
   var body: some View {
+    VStack(spacing: 0) {
+      content
+    }
+    .background(Color(nsColor: .controlBackgroundColor))
+    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 11, style: .continuous)
+        .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+    )
+  }
+}
+
+private func settingsKVRow(title: String, value: String, valueColor: Color = .secondary) -> some View {
+  HStack {
+    Text(title)
+      .font(.system(size: 12.5))
+      .foregroundColor(.primary)
+    Spacer(minLength: 12)
+    Text(value)
+      .font(.system(size: 12.5))
+      .monospacedDigit()
+      .foregroundColor(valueColor)
+      .lineLimit(1)
+      .truncationMode(.middle)
+  }
+  .padding(.horizontal, 14)
+  .padding(.vertical, 10)
+}
+
+private func settingsControlRow<Accessory: View>(
+  title: String,
+  subtitle: String? = nil,
+  @ViewBuilder accessory: () -> Accessory
+) -> some View {
+  HStack(spacing: 12) {
+    VStack(alignment: .leading, spacing: 2) {
+      Text(title)
+        .font(.system(size: 12.5))
+      if let subtitle = subtitle, !subtitle.isEmpty {
+        Text(subtitle)
+          .font(.system(size: 10.5))
+          .foregroundColor(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    Spacer(minLength: 12)
+    accessory()
+  }
+  .padding(.horizontal, 14)
+  .padding(.vertical, 10)
+}
+
+private struct ProviderSettingsDetailView: View {
+  @ObservedObject var vm: MeterViewModel
+  let key: String
+
+  var body: some View {
+    let entry = vm.apps[key]
+    let installed = entry?.installed ?? false
+    let enabled = vm.isToolEnabled(key)
+    let active = installed && vm.isActiveOverall && enabled
+    let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
+    let card = vm.usageData?.cards?[key]
+    let windows = card?.quotaWindows ?? []
+
+    let statusText: String = {
+      if !installed { return "未安装" }
+      if !vm.daemonOnline { return "后台服务未启动" }
+      if !vm.masterEnabled { return "全局已暂停" }
+      if !enabled { return "已关闭" }
+      if let port = entry?.cdpPort { return "正常运行 (CDP:\(port))" }
+      return "正常运行"
+    }()
+
     ScrollView {
-      VStack(alignment: .leading, spacing: 14) {
-        if vm.isActiveOverall && !vm.appsNeedingInlineCdp.isEmpty {
-          HStack(spacing: 10) {
-            Image(systemName: "sparkles")
-              .font(.system(size: 14, weight: .semibold))
-              .foregroundColor(CodexBarPalette.accentBlue)
+      VStack(alignment: .leading, spacing: 18) {
+        // Provider Summary Card matching 图5
+        SettingsGroupCard {
+          HStack(spacing: 12) {
+            ToolGlyph.iconView(for: key, size: 26)
+              .foregroundColor(installed ? .primary : .secondary)
+              .frame(width: 30, height: 30)
+
             VStack(alignment: .leading, spacing: 2) {
-              Text("有客户端尚未开启消息旁胶囊")
-                .font(.system(size: 12, weight: .semibold))
-              Text("Codex / Cursor / CodeBuddy 支持重启接入，直接在每条消息旁展示用量与速率。")
+              Text(vm.displayTitle(for: key))
+                .font(.system(size: 15, weight: .semibold))
+              Text("app · \(vm.relativeUpdateLabel())")
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
             }
+
             Spacer()
-            Button("一键全部接入") {
-              vm.runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
+
+            Button {
+              vm.refreshDoctorAndBootstrap()
+              vm.fetchUsageSummary()
+            } label: {
+              Image(systemName: "arrow.clockwise")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.secondary)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(CodexBarPalette.accentBlue)
-            .controlSize(.small)
-            .disabled(vm.busy || vm.runtime.runningFromDmg)
+            .buttonStyle(.borderless)
+            .help("刷新此提供商状态与额度")
+
+            Toggle("", isOn: Binding(
+              get: { installed && enabled && vm.isActiveOverall },
+              set: { vm.setToolEnabled(key, enabled: $0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .controlSize(.regular)
+            .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
           }
-          .padding(12)
-          .background(CodexBarPalette.accentBlue.opacity(0.09))
-          .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-          .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-              .stroke(CodexBarPalette.accentBlue.opacity(0.22), lineWidth: 1)
-          )
+          .padding(.horizontal, 14)
+          .padding(.vertical, 12)
+
+          Divider().padding(.leading, 14)
+          settingsKVRow(title: "来源", value: entry?.cdpPort != nil ? "app · CDP 实时探针" : "app")
+          Divider().padding(.leading, 14)
+          settingsKVRow(title: "已更新", value: vm.relativeUpdateLabel())
+          Divider().padding(.leading, 14)
+
+          HStack(spacing: 8) {
+            Text("状态")
+              .font(.system(size: 12.5))
+            Spacer()
+            if needsInline && !vm.runtime.runningFromDmg {
+              Button(vm.inlineBtnLabel(for: key)) {
+                vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
+              }
+              .buttonStyle(.borderedProminent)
+              .tint(CodexBarPalette.accentBlue)
+              .controlSize(.small)
+              .disabled(vm.busy)
+            }
+            Text(statusText)
+              .font(.system(size: 12.5))
+              .foregroundColor(active ? .secondary : .orange)
+          }
+          .padding(.horizontal, 14)
+          .padding(.vertical, 10)
+
+          Divider().padding(.leading, 14)
+          settingsKVRow(title: "账户", value: card?.accountEmail ?? "本地工作区会话")
+          Divider().padding(.leading, 14)
+          settingsKVRow(title: "套餐", value: card?.planTitle ?? "按量 / 本地监控")
+
+          if installed {
+            Divider().padding(.leading, 14)
+            HStack(spacing: 10) {
+              Text("快捷操作")
+                .font(.system(size: 12.5))
+              Spacer()
+              Button("历史轮次…") {
+                vm.recentTurnsFilterTool = key
+                vm.openSettingsPane(.turns)
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.small)
+
+              if let appPath = entry?.appPath {
+                Button("打开应用") {
+                  NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+              }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+          }
         }
 
-        // 2x2 Client Cards
+        // 用量 Section matching 图5
         VStack(alignment: .leading, spacing: 8) {
-          Text("受监控客户端")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundColor(.secondary)
+          Text("用量")
+            .font(.system(size: 13.5, weight: .semibold))
             .padding(.horizontal, 2)
 
-          LazyVGrid(columns: gridCols, spacing: 10) {
-            ForEach(vm.orderedKeys, id: \.self) { key in
-              clientCard(key: key)
+          SettingsGroupCard {
+            if !windows.isEmpty {
+              ForEach(Array(windows.enumerated()), id: \.element.id) { idx, win in
+                if idx > 0 {
+                  Divider().padding(.leading, 14)
+                }
+                providerQuotaRow(win: win)
+              }
+            } else {
+              settingsKVRow(
+                title: "今日估算用量",
+                value: "\(MeterFormat.usd(card?.today.costUsd)) · \(MeterFormat.tokens(card?.today.totalTokens ?? 0))"
+              )
+              Divider().padding(.leading, 14)
+              settingsKVRow(
+                title: "近 30 天估算用量",
+                value: "\(MeterFormat.usd(card?.days30.costUsd)) · \(MeterFormat.tokens(card?.days30.totalTokens ?? 0))"
+              )
+              if let latestSub = card?.latestTurnSubline {
+                Divider().padding(.leading, 14)
+                settingsKVRow(title: "最近一轮", value: latestSub)
+              }
+            }
+          }
+        }
+      }
+      .padding(20)
+    }
+  }
+
+  private func providerQuotaRow(win: CardQuotaWindow) -> some View {
+    let clamped = min(1.0, max(0.0, win.remainingPct / 100.0))
+    let pctRounded = Int(win.remainingPct.rounded())
+
+    return VStack(alignment: .leading, spacing: 6) {
+      HStack {
+        Text("\(win.title) 剩余 \(pctRounded)%")
+          .font(.system(size: 12.5, weight: .semibold))
+          .monospacedDigit()
+        Spacer()
+        if let resetText = win.resetText, !resetText.isEmpty {
+          Text(resetText)
+            .font(.system(size: 11.5))
+            .monospacedDigit()
+            .foregroundColor(.secondary)
+        }
+      }
+
+      GeometryReader { geo in
+        ZStack(alignment: .leading) {
+          Capsule()
+            .fill(Color.primary.opacity(0.10))
+          if clamped > 0 {
+            Capsule()
+              .fill(Color(red: 0.24, green: 0.72, blue: 0.48))
+              .frame(width: max(5, geo.size.width * CGFloat(clamped)))
+          }
+          if let pacePct = win.pacePct {
+            let paceFrac = min(1.0, max(0.0, pacePct / 100.0))
+            let paceX = min(max(0, geo.size.width - 5.0), max(0, geo.size.width * CGFloat(paceFrac) - 2.5))
+            ZStack {
+              RoundedRectangle(cornerRadius: 1)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .frame(width: 5.0, height: 8)
+              RoundedRectangle(cornerRadius: 0.75)
+                .fill(Color(red: 0.14, green: 0.56, blue: 0.34))
+                .frame(width: 2.0, height: 8)
+            }
+            .offset(x: paceX)
+          }
+        }
+      }
+      .frame(height: 6)
+
+      if let sub = win.subtitle, !sub.isEmpty {
+        Text(sub)
+          .font(.system(size: 11))
+          .monospacedDigit()
+          .foregroundColor(.secondary)
+      }
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 11)
+  }
+}
+
+private struct GeneralSettingsPaneView: View {
+  @ObservedObject var vm: MeterViewModel
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("通用与驻留")
+            .font(.system(size: 13.5, weight: .semibold))
+            .padding(.horizontal, 2)
+
+          SettingsGroupCard {
+            settingsControlRow(
+              title: "全局统计与消息旁显示",
+              subtitle: "控制后台采样与顶部状态栏及消息旁胶囊的总开关"
+            ) {
+              Toggle("", isOn: Binding(
+                get: { vm.masterEnabled },
+                set: { vm.setMasterEnabled($0) }
+              ))
+              .toggleStyle(.switch)
+              .labelsHidden()
+              .disabled(vm.busy || vm.runtime.runningFromDmg)
+            }
+
+            Divider().padding(.leading, 14)
+            settingsControlRow(
+              title: "开机自动启动",
+              subtitle: "登录 macOS 时静默后台启动并常驻顶部菜单栏"
+            ) {
+              Toggle("", isOn: Binding(
+                get: { vm.launchAtLogin },
+                set: { vm.setLaunchAtLogin($0) }
+              ))
+              .toggleStyle(.switch)
+              .labelsHidden()
+              .disabled(vm.busy || vm.runtime.runningFromDmg)
+            }
+
+            Divider().padding(.leading, 14)
+            settingsControlRow(
+              title: "隐藏程序坞 (Dock) 图标",
+              subtitle: "开启后仅驻留在系统顶部菜单栏"
+            ) {
+              Toggle("", isOn: Binding(
+                get: { vm.hideDockIcon },
+                set: { vm.setHideDockIcon($0) }
+              ))
+              .toggleStyle(.switch)
+              .labelsHidden()
             }
           }
         }
 
-        // Grouped System-Settings-Style Preferences
+        if vm.isActiveOverall && !vm.appsNeedingInlineCdp.isEmpty {
+          VStack(alignment: .leading, spacing: 8) {
+            Text("消息旁胶囊接入")
+              .font(.system(size: 13.5, weight: .semibold))
+              .padding(.horizontal, 2)
+
+            SettingsGroupCard {
+              settingsControlRow(
+                title: "一键接入支持客户端",
+                subtitle: "为 Codex / Cursor / CodeBuddy 开启消息旁 Token、速率与费用胶囊"
+              ) {
+                Button("全部开启") {
+                  vm.runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(CodexBarPalette.accentBlue)
+                .controlSize(.small)
+                .disabled(vm.busy || vm.runtime.runningFromDmg)
+              }
+            }
+          }
+        }
+
         VStack(alignment: .leading, spacing: 8) {
-          Text("菜单栏、驻留与远程")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundColor(.secondary)
+          Text("维护与更新")
+            .font(.system(size: 13.5, weight: .semibold))
             .padding(.horizontal, 2)
 
-          VStack(spacing: 0) {
-            preferenceRow(
-              icon: "menubar.rectangle",
-              iconColor: CodexBarPalette.accentBlue,
+          SettingsGroupCard {
+            settingsControlRow(title: "软件更新", subtitle: "当前版本 v\(vm.version)") {
+              Button("检查更新…") {
+                vm.checkForUpdates()
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.small)
+            }
+
+            Divider().padding(.leading, 14)
+            settingsControlRow(title: "修复扩展与后台服务", subtitle: "重新同步 VSIX 扩展、Cursor Hooks 与 LaunchAgent") {
+              Button("重新同步") {
+                vm.runAction(args: ["install"], successText: "已重新同步全部配置与扩展")
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.small)
+              .disabled(vm.busy || vm.runtime.runningFromDmg)
+            }
+
+            Divider().padding(.leading, 14)
+            settingsControlRow(title: "完全卸载本地配置", subtitle: "停止后台服务并移除 Hooks 与扩展（保留历史记录库）") {
+              Button("卸载…", role: .destructive) {
+                vm.showUninstallAlert = true
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.small)
+              .disabled(vm.busy)
+            }
+          }
+        }
+      }
+      .padding(20)
+    }
+  }
+}
+
+private struct MenuBarSettingsPaneView: View {
+  @ObservedObject var vm: MeterViewModel
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("顶部菜单栏")
+            .font(.system(size: 13.5, weight: .semibold))
+            .padding(.horizontal, 2)
+
+          SettingsGroupCard {
+            settingsControlRow(
               title: "显示顶部菜单栏状态图标",
-              subtitle: "在系统顶部菜单栏常驻展示概览卡片与实时数据"
+              subtitle: "在系统顶部菜单栏展示概览与实时用量卡片"
             ) {
               Toggle("", isOn: Binding(
                 get: { vm.showMenuBarExtra },
@@ -1743,16 +2107,13 @@ struct ControlPanelTabView: View {
               ))
               .toggleStyle(.switch)
               .labelsHidden()
-              .controlSize(.small)
             }
 
             if vm.showMenuBarExtra {
-              Divider().padding(.leading, 44)
-              preferenceRow(
-                icon: "textformat.123",
-                iconColor: Color.indigo,
+              Divider().padding(.leading, 14)
+              settingsControlRow(
                 title: "菜单栏标题内容",
-                subtitle: "决定顶部状态图标右侧附加的简短实时数值"
+                subtitle: "决定顶部图标右侧显示剩余额度、今日费用或实时速率"
               ) {
                 Picker("", selection: Binding(
                   get: { vm.menuBarDisplayMode },
@@ -1763,50 +2124,53 @@ struct ControlPanelTabView: View {
                   }
                 }
                 .labelsHidden()
-                .frame(width: 155)
+                .frame(width: 165)
                 .controlSize(.small)
               }
             }
+          }
+        }
 
-            Divider().padding(.leading, 44)
-            preferenceRow(
-              icon: "dock.rectangle",
-              iconColor: Color.purple,
-              title: "隐藏程序坞 (Dock) 图标",
-              subtitle: "开启后应用仅驻留在顶部菜单栏，不占用程序坞图标位置"
+        VStack(alignment: .leading, spacing: 8) {
+          Text("菜单卡片选项")
+            .font(.system(size: 13.5, weight: .semibold))
+            .padding(.horizontal, 2)
+
+          SettingsGroupCard {
+            settingsControlRow(
+              title: "在菜单卡片中显示「最近窗口」",
+              subtitle: "开启后在菜单卡片底部展开近 4 个 7 天滑动窗口明细（默认关闭，悬停卡片仍可查看详细图表与项目分解）"
             ) {
               Toggle("", isOn: Binding(
-                get: { vm.hideDockIcon },
-                set: { vm.setHideDockIcon($0) }
+                get: { vm.showRecentWindowsInMenu },
+                set: { vm.setShowRecentWindowsInMenu($0) }
               ))
               .toggleStyle(.switch)
               .labelsHidden()
-              .controlSize(.small)
             }
+          }
+        }
+      }
+      .padding(20)
+    }
+  }
+}
 
-            Divider().padding(.leading, 44)
-            preferenceRow(
-              icon: "power",
-              iconColor: Color.green,
-              title: "开机自动启动菜单栏",
-              subtitle: "登录 macOS 时静默后台启动并保持采集统计"
-            ) {
-              Toggle("", isOn: Binding(
-                get: { vm.launchAtLogin },
-                set: { vm.setLaunchAtLogin($0) }
-              ))
-              .toggleStyle(.switch)
-              .labelsHidden()
-              .controlSize(.small)
-              .disabled(vm.busy || vm.runtime.runningFromDmg)
-            }
+private struct RemoteHooksSettingsPaneView: View {
+  @ObservedObject var vm: MeterViewModel
 
-            Divider().padding(.leading, 44)
-            preferenceRow(
-              icon: "network",
-              iconColor: Color.orange,
-              title: "Cursor Remote-SSH 远程写入",
-              subtitle: "自动向 ~/.ssh/config 与远端主机注入端口转发与统计支持"
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Remote-SSH 远程配置")
+            .font(.system(size: 13.5, weight: .semibold))
+            .padding(.horizontal, 2)
+
+          SettingsGroupCard {
+            settingsControlRow(
+              title: "Cursor Remote-SSH 自动注入",
+              subtitle: "向 ~/.ssh/config 与远端主机一键写入端口转发，使远端 Cursor 对话同步到本地汇总"
             ) {
               Button("配置…") {
                 vm.knownSshHosts = MeterRuntime.readSshConfigHosts()
@@ -1821,168 +2185,77 @@ struct ControlPanelTabView: View {
               .controlSize(.small)
             }
           }
-          .background(Color(nsColor: .controlBackgroundColor))
-          .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-          .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-              .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-          )
-        }
-      }
-      .padding(.bottom, 4)
-    }
-  }
-
-  @ViewBuilder
-  private func clientCard(key: String) -> some View {
-    let entry = vm.apps[key]
-    let installed = entry?.installed ?? false
-    let enabled = vm.isToolEnabled(key)
-    let active = installed && vm.isActiveOverall && enabled
-    let accent = vm.toolAccentColor(for: key)
-    let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
-
-    VStack(alignment: .leading, spacing: 9) {
-      HStack(spacing: 9) {
-        ZStack {
-          RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(installed ? accent.opacity(0.14) : Color.primary.opacity(0.06))
-            .frame(width: 30, height: 30)
-          ToolGlyph.iconView(for: key, size: 15)
-            .foregroundColor(installed ? accent : .secondary)
         }
 
-        VStack(alignment: .leading, spacing: 2) {
-          Text(vm.displayTitle(for: key))
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundColor(installed ? .primary : .secondary)
-            .lineLimit(1)
+        VStack(alignment: .leading, spacing: 8) {
+          Text("本地服务与扩展状态")
+            .font(.system(size: 13.5, weight: .semibold))
+            .padding(.horizontal, 2)
 
-          HStack(spacing: 4) {
-            Circle()
-              .fill(active ? (entry?.cdpPort != nil ? Color.green : accent) : (installed ? Color.orange : Color.gray.opacity(0.45)))
-              .frame(width: 6, height: 6)
-            Text(
-              !installed
-                ? "未安装"
-                : (!vm.masterEnabled
-                    ? "全局暂停"
-                    : (!enabled
-                        ? "已关闭"
-                        : (entry?.cdpPort != nil ? "消息旁胶囊已连接" : "状态栏就绪")))
-            )
-            .font(.system(size: 10.5))
-            .foregroundColor(.secondary)
-            .lineLimit(1)
-          }
-        }
-
-        Spacer(minLength: 4)
-
-        Toggle("", isOn: Binding(
-          get: { installed && enabled && vm.isActiveOverall },
-          set: { vm.setToolEnabled(key, enabled: $0) }
-        ))
-        .toggleStyle(.switch)
-        .labelsHidden()
-        .controlSize(.small)
-        .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
-      }
-
-      Text(vm.appSubtitle(for: key))
-        .font(.system(size: 11))
-        .foregroundColor(.secondary)
-        .lineLimit(2)
-        .frame(maxWidth: .infinity, minHeight: 28, alignment: .topLeading)
-
-      HStack(spacing: 8) {
-        if needsInline {
-          Button(vm.inlineBtnLabel(for: key)) {
-            vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
-          }
-          .buttonStyle(.borderedProminent)
-          .tint(accent)
-          .controlSize(.mini)
-          .disabled(vm.busy)
-        } else if let port = entry?.cdpPort, active {
-          Text("CDP :\(port)")
-            .font(.system(size: 10, weight: .medium))
-            .monospacedDigit()
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(Color.primary.opacity(0.05))
-            .clipShape(Capsule())
-        } else if let ver = vm.vsixVersions[key], installed {
-          Text("扩展 v\(ver)")
-            .font(.system(size: 10))
-            .foregroundColor(.secondary)
-        }
-
-        Spacer()
-
-        if installed {
-          Button("历史") {
-            vm.recentTurnsFilterTool = key
-            vm.activeTab = .turns
-            vm.fetchRecentTurns()
-          }
-          .buttonStyle(.borderless)
-          .font(.system(size: 11, weight: .medium))
-          .foregroundColor(accent)
-
-          if let appPath = entry?.appPath {
-            Button("打开") {
-              NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
+          SettingsGroupCard {
+            settingsKVRow(title: "守护进程状态", value: vm.daemonOnline ? "运行中 (127.0.0.1:\(vm.daemonPort))" : "未运行")
+            Divider().padding(.leading, 14)
+            settingsKVRow(title: "LaunchAgent", value: vm.launchAgentLoaded ? "已加载" : (vm.launchAgentExists ? "已注册未加载" : "未注册"))
+            ForEach(["cursor", "codebuddy"], id: \.self) { key in
+              if let ver = vm.vsixVersions[key] {
+                Divider().padding(.leading, 14)
+                settingsKVRow(title: "\(vm.displayTitle(for: key)) 扩展", value: "v\(ver)")
+              }
             }
-            .buttonStyle(.borderless)
-            .font(.system(size: 11, weight: .medium))
-            .foregroundColor(.secondary)
           }
         }
       }
+      .padding(20)
     }
-    .padding(12)
-    .background(Color(nsColor: .controlBackgroundColor))
-    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    .overlay(
-      RoundedRectangle(cornerRadius: 12, style: .continuous)
-        .stroke(active ? accent.opacity(0.22) : Color.primary.opacity(0.07), lineWidth: 1)
-    )
-    .opacity(installed ? 1.0 : 0.6)
   }
+}
 
-  private func preferenceRow<Accessory: View>(
-    icon: String,
-    iconColor: Color,
-    title: String,
-    subtitle: String,
-    @ViewBuilder accessory: () -> Accessory
-  ) -> some View {
-    HStack(spacing: 12) {
+private struct AboutSettingsPaneView: View {
+  @ObservedObject var vm: MeterViewModel
+
+  var body: some View {
+    VStack(spacing: 14) {
+      Spacer()
       ZStack {
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-          .fill(iconColor.opacity(0.14))
-          .frame(width: 26, height: 26)
-        Image(systemName: icon)
-          .font(.system(size: 12, weight: .semibold))
-          .foregroundColor(iconColor)
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+          .fill(LinearGradient(
+            colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          ))
+          .frame(width: 56, height: 56)
+        Image(systemName: "gauge.with.dots.needle.67percent")
+          .font(.system(size: 26, weight: .semibold))
+          .foregroundColor(.white)
       }
+      Text("AI Turn Meter")
+        .font(.system(size: 17, weight: .bold))
+      Text("版本 v\(vm.version)")
+        .font(.system(size: 12))
+        .foregroundColor(.secondary)
+      Text("本地统一监控 Antigravity、Codex Desktop、Cursor 与 CodeBuddy CN 的轮次耗时、Token 缓存与套餐额度。")
+        .font(.system(size: 12))
+        .foregroundColor(.secondary)
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: 360)
 
-      VStack(alignment: .leading, spacing: 2) {
-        Text(title)
-          .font(.system(size: 12.5, weight: .medium))
-        Text(subtitle)
-          .font(.system(size: 10.5))
-          .foregroundColor(.secondary)
-          .lineLimit(1)
+      HStack(spacing: 10) {
+        Button("检查更新…") {
+          vm.checkForUpdates()
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(CodexBarPalette.accentBlue)
+        .controlSize(.small)
+
+        if let url = URL(string: "https://github.com/shadow-qw/AI-Turn-Meter") {
+          Link("GitHub 仓库", destination: url)
+            .font(.system(size: 12))
+        }
       }
-
-      Spacer(minLength: 10)
-      accessory()
+      Spacer()
     }
-    .padding(.horizontal, 12)
-    .padding(.vertical, 10)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .padding(20)
   }
 }
 
@@ -2795,90 +3068,6 @@ struct RemoteSshSheetView: View {
   }
 }
 
-private final class PopoverMenuActionBox: NSObject {
-  let block: () -> Void
-  init(_ block: @escaping () -> Void) {
-    self.block = block
-  }
-}
-
-@MainActor
-private final class DisplayPrefsMenuController: NSObject {
-  static let shared = DisplayPrefsMenuController()
-
-  private func makeItem(
-    title: String,
-    checked: Bool = false,
-    enabled: Bool = true,
-    action: (() -> Void)? = nil
-  ) -> NSMenuItem {
-    let item = NSMenuItem(
-      title: title,
-      action: action != nil ? #selector(handleItem(_:)) : nil,
-      keyEquivalent: ""
-    )
-    item.target = self
-    item.isEnabled = enabled
-    item.state = checked ? .on : .off
-    if let action = action {
-      item.representedObject = PopoverMenuActionBox(action)
-    }
-    return item
-  }
-
-  @objc private func handleItem(_ sender: NSMenuItem) {
-    if let box = sender.representedObject as? PopoverMenuActionBox {
-      box.block()
-    }
-  }
-
-  func present(vm: MeterViewModel) {
-    let menu = NSMenu()
-    menu.autoenablesItems = false
-
-    let modeItem = NSMenuItem(title: "菜单栏文本（\(vm.menuBarDisplayMode.title)）", action: nil, keyEquivalent: "")
-    let modeSub = NSMenu()
-    modeSub.autoenablesItems = false
-    for mode in MenuBarDisplayMode.allCases {
-      modeSub.addItem(makeItem(title: mode.title, checked: vm.menuBarDisplayMode == mode) {
-        vm.setMenuBarDisplayMode(mode)
-      })
-    }
-    modeItem.submenu = modeSub
-    menu.addItem(modeItem)
-
-    menu.addItem(NSMenuItem.separator())
-
-    menu.addItem(makeItem(title: "隐藏程序坞 (Dock) 图标", checked: vm.hideDockIcon) {
-      vm.setHideDockIcon(!vm.hideDockIcon)
-    })
-
-    if !vm.runtime.runningFromDmg {
-      menu.addItem(makeItem(
-        title: "开机自动启动菜单栏",
-        checked: vm.launchAtLogin,
-        enabled: !vm.busy
-      ) {
-        vm.setLaunchAtLogin(!vm.launchAtLogin)
-      })
-    }
-
-    if vm.daemonOnline && !vm.runtime.runningFromDmg {
-      menu.addItem(NSMenuItem.separator())
-      menu.addItem(makeItem(title: vm.masterEnabled ? "暂停全部监控显示" : "恢复全部监控显示") {
-        vm.setMasterEnabled(!vm.masterEnabled)
-      })
-    }
-
-    if let ev = NSApp.currentEvent, let view = ev.window?.contentView {
-      let pt = view.convert(ev.locationInWindow, from: nil)
-      menu.popUp(positioning: nil, at: NSPoint(x: pt.x + 6, y: pt.y), in: view)
-    } else {
-      menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
-    }
-  }
-}
-
 private struct ProviderSwitcherBar: View {
   @ObservedObject var vm: MeterViewModel
   @Binding var selection: String
@@ -3046,6 +3235,389 @@ private struct MiniUsageBarsView: View {
   }
 }
 
+@MainActor
+private final class CostHistoryFlyoutController: NSObject {
+  static let shared = CostHistoryFlyoutController()
+
+  weak var anchorPopover: NSPopover?
+  private weak var attachedParentWindow: NSWindow?
+  private var panel: NSPanel?
+  private var vfxView: NSVisualEffectView?
+  private var hostingView: NSHostingView<CostHistoryDetailFlyoutView>?
+  private var isCardHovered: Bool = false
+  private var isFlyoutHovered: Bool = false
+  private var hideWorkItem: DispatchWorkItem?
+  private var showWorkItem: DispatchWorkItem?
+
+  func setCardHovered(_ hovered: Bool, vm: MeterViewModel, card: CodexBarCardSnapshot, selection: String) {
+    isCardHovered = hovered
+    if hovered {
+      hideWorkItem?.cancel()
+      hideWorkItem = nil
+      showWorkItem?.cancel()
+      let item = DispatchWorkItem { [weak self] in
+        MainActor.assumeIsolated {
+          guard let self = self, self.isCardHovered else { return }
+          self.present(vm: vm, card: card, selection: selection)
+        }
+      }
+      showWorkItem = item
+      let delay: TimeInterval = (panel?.isVisible ?? false) ? 0.0 : 0.08
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    } else {
+      showWorkItem?.cancel()
+      showWorkItem = nil
+      scheduleHideIfNeeded()
+    }
+  }
+
+  func setFlyoutHovered(_ hovered: Bool) {
+    isFlyoutHovered = hovered
+    if hovered {
+      hideWorkItem?.cancel()
+      hideWorkItem = nil
+    } else {
+      scheduleHideIfNeeded()
+    }
+  }
+
+  private func scheduleHideIfNeeded() {
+    guard !isCardHovered && !isFlyoutHovered else { return }
+    hideWorkItem?.cancel()
+    let item = DispatchWorkItem { [weak self] in
+      MainActor.assumeIsolated {
+        guard let self = self, !self.isCardHovered && !self.isFlyoutHovered else { return }
+        self.hideImmediately()
+      }
+    }
+    hideWorkItem = item
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.16, execute: item)
+  }
+
+  func hideImmediately() {
+    showWorkItem?.cancel()
+    showWorkItem = nil
+    hideWorkItem?.cancel()
+    hideWorkItem = nil
+    isCardHovered = false
+    isFlyoutHovered = false
+    if let p = panel {
+      if let parent = attachedParentWindow {
+        parent.removeChildWindow(p)
+        attachedParentWindow = nil
+      }
+      p.orderOut(nil)
+    }
+  }
+
+  private func ensurePanel(rootView: CostHistoryDetailFlyoutView) -> NSPanel {
+    if let existing = panel, let hosting = hostingView {
+      hosting.rootView = rootView
+      return existing
+    }
+
+    let hosting = NSHostingView(rootView: rootView)
+    let vfx = NSVisualEffectView()
+    vfx.material = .popover
+    vfx.blendingMode = .behindWindow
+    vfx.state = .active
+    vfx.wantsLayer = true
+    vfx.layer?.cornerRadius = 12
+    vfx.layer?.masksToBounds = true
+    vfx.layer?.borderWidth = 0.5
+    vfx.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+    vfx.addSubview(hosting)
+    hosting.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      hosting.topAnchor.constraint(equalTo: vfx.topAnchor),
+      hosting.leadingAnchor.constraint(equalTo: vfx.leadingAnchor),
+      hosting.trailingAnchor.constraint(equalTo: vfx.trailingAnchor),
+      hosting.bottomAnchor.constraint(equalTo: vfx.bottomAnchor),
+    ])
+
+    let p = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 286, height: 340),
+      styleMask: [.borderless, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    p.isOpaque = false
+    p.backgroundColor = .clear
+    p.level = .popUpMenu
+    p.hasShadow = true
+    p.hidesOnDeactivate = true
+    p.collectionBehavior = [.transient, .ignoresCycle]
+    p.contentView = vfx
+
+    self.panel = p
+    self.vfxView = vfx
+    self.hostingView = hosting
+    return p
+  }
+
+  private func present(vm: MeterViewModel, card: CodexBarCardSnapshot, selection: String) {
+    guard let pop = anchorPopover, pop.isShown,
+          let popWindow = pop.contentViewController?.view.window else {
+      return
+    }
+    guard !card.daily30.isEmpty || !(card.projects ?? []).isEmpty else { return }
+
+    let view = CostHistoryDetailFlyoutView(
+      selection: selection,
+      card: card,
+      onHoverChanged: { [weak self] inside in
+        self?.setFlyoutHovered(inside)
+      }
+    )
+    let p = ensurePanel(rootView: view)
+    guard let hosting = hostingView else { return }
+    hosting.layoutSubtreeIfNeeded()
+    let fitSize = hosting.fittingSize
+    let panelWidth: CGFloat = 286
+    let panelHeight = min(max(fitSize.height, 200), 620)
+
+    let popFrame = popWindow.frame
+    let screenFrame = (popWindow.screen ?? NSScreen.main)?.visibleFrame
+      ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+
+    let x: CGFloat = (popFrame.minX - panelWidth - 8 >= screenFrame.minX)
+      ? (popFrame.minX - panelWidth - 8)
+      : min(screenFrame.maxX - panelWidth - 8, popFrame.maxX + 8)
+    let rawY = popFrame.maxY - panelHeight
+    let y = min(screenFrame.maxY - panelHeight - 6, max(screenFrame.minY + 8, rawY))
+
+    p.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
+    if let oldParent = attachedParentWindow, oldParent !== popWindow {
+      oldParent.removeChildWindow(p)
+      attachedParentWindow = nil
+    }
+    if attachedParentWindow == nil {
+      popWindow.addChildWindow(p, ordered: .above)
+      attachedParentWindow = popWindow
+    }
+    p.orderFront(nil)
+  }
+}
+
+private enum FlyoutChartMetric: Hashable {
+  case tokens
+  case cost
+}
+
+private struct CostHistoryDetailFlyoutView: View {
+  let selection: String
+  let card: CodexBarCardSnapshot
+  let onHoverChanged: (Bool) -> Void
+
+  @State private var metric: FlyoutChartMetric = .tokens
+  @State private var hoveredDate: String? = nil
+
+  private func pointValue(_ pt: CardDailyPoint) -> Double {
+    switch metric {
+    case .tokens: return Double(max(0, pt.totalTokens))
+    case .cost: return max(0, pt.costUsd ?? 0)
+    }
+  }
+
+  private func axisLabel(_ val: Double) -> String {
+    if val <= 0 { return "0" }
+    switch metric {
+    case .tokens:
+      return MeterFormat.tokens(Int(val.rounded()))
+    case .cost:
+      if val >= 10 { return "$\(Int(val.rounded()))" }
+      return MeterFormat.usd(val)
+    }
+  }
+
+  var body: some View {
+    let points = card.daily30
+    let maxVal = max(0.0, points.map(pointValue).max() ?? 0)
+    let scaleMax = max(0.000001, maxVal)
+    let peakDate = points.max(by: { pointValue($0) < pointValue($1) })?.date
+    let selectedPt: CardDailyPoint? = points.first(where: { $0.date == hoveredDate })
+      ?? points.last(where: { $0.totalTokens > 0 || ($0.costUsd ?? 0) > 0 })
+      ?? points.last
+    let projects = Array((card.projects ?? []).prefix(5))
+
+    VStack(alignment: .leading, spacing: 10) {
+      // 30-day vertical bar chart with Y-axis + yellow peak cap (图3)
+      if !points.isEmpty {
+        VStack(alignment: .leading, spacing: 4) {
+          HStack(alignment: .bottom, spacing: 6) {
+            VStack(alignment: .leading) {
+              Text(maxVal > 0 ? axisLabel(maxVal) : (metric == .tokens ? "0" : "$0"))
+              Spacer()
+              Text(maxVal > 0 ? axisLabel(maxVal / 2.0) : "")
+              Spacer()
+              Text("0")
+            }
+            .font(.system(size: 10))
+            .monospacedDigit()
+            .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+            .frame(width: 36, height: 102, alignment: .leading)
+
+            HStack(alignment: .bottom, spacing: 2.5) {
+              ForEach(points, id: \.id) { pt in
+                flyoutBar(
+                  pt: pt,
+                  scaleMax: scaleMax,
+                  maxVal: maxVal,
+                  peakDate: peakDate,
+                  selectedDate: selectedPt?.date
+                )
+              }
+            }
+          }
+
+          if let firstLabel = points.first?.label {
+            Text(firstLabel)
+              .font(.system(size: 10))
+              .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+              .padding(.leading, 42)
+          }
+        }
+
+        // token | 费用 segmented toggle
+        HStack {
+          Spacer()
+          Picker("", selection: $metric) {
+            Text("token").tag(FlyoutChartMetric.tokens)
+            Text("费用").tag(FlyoutChartMetric.cost)
+          }
+          .pickerStyle(.segmented)
+          .labelsHidden()
+          .controlSize(.small)
+          .frame(width: 112)
+        }
+      }
+
+      // Selected day detail + per-model breakdown
+      if let pt = selectedPt {
+        let dayModels: [CardDailyModelItem] = {
+          if let explicit = pt.models, !explicit.isEmpty { return Array(explicit.prefix(4)) }
+          if let top = card.topModel, pt.totalTokens > 0 {
+            return [CardDailyModelItem(model: top, costUsd: pt.costUsd, totalTokens: pt.totalTokens)]
+          }
+          return []
+        }()
+
+        VStack(alignment: .leading, spacing: 6) {
+          Text("\(pt.label): \(MeterFormat.usd(pt.costUsd)) · \(MeterFormat.tokens(pt.totalTokens)) tokens")
+            .font(.system(size: 11.5))
+            .monospacedDigit()
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+
+          ForEach(dayModels) { m in
+            HStack(alignment: .center, spacing: 8) {
+              Rectangle()
+                .fill(CodexBarPalette.tealBar)
+                .frame(width: 2, height: 26)
+              VStack(alignment: .leading, spacing: 1) {
+                Text(m.model)
+                  .font(.system(size: 11))
+                  .foregroundColor(.secondary)
+                  .lineLimit(1)
+                  .truncationMode(.middle)
+                Text("\(MeterFormat.usd(m.costUsd)) · \(MeterFormat.tokens(m.totalTokens))")
+                  .font(.system(size: 10.5))
+                  .monospacedDigit()
+                  .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+              }
+            }
+          }
+        }
+      }
+
+      // 30-day total estimate + disclaimer
+      VStack(alignment: .leading, spacing: 2) {
+        Text("估算总计 (近 30 天): \(MeterFormat.usd(card.days30.costUsd))")
+          .font(.system(size: 11.5))
+          .monospacedDigit()
+          .foregroundColor(.secondary)
+        Text("根据 Token 用量估算 · 不是订阅账单")
+          .font(.system(size: 10))
+          .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+      }
+
+      // Projects breakdown (项目)
+      if !projects.isEmpty {
+        VStack(alignment: .leading, spacing: 7) {
+          Text("项目")
+            .font(.system(size: 11.5))
+            .foregroundColor(.secondary)
+
+          ForEach(projects) { proj in
+            VStack(alignment: .leading, spacing: 1) {
+              HStack(spacing: 6) {
+                Text(proj.name)
+                  .font(.system(size: 11.5, weight: .medium))
+                  .foregroundColor(.secondary)
+                  .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("\(MeterFormat.usd(proj.costUsd)) · \(MeterFormat.tokens(proj.totalTokens)) token 用量")
+                  .font(.system(size: 11))
+                  .monospacedDigit()
+                  .foregroundColor(.secondary)
+                  .lineLimit(1)
+              }
+              Text(proj.path)
+                .font(.system(size: 10))
+                .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            }
+          }
+        }
+      }
+    }
+    .padding(16)
+    .frame(width: 286, alignment: .leading)
+    .contentShape(Rectangle())
+    .onHover { onHoverChanged($0) }
+  }
+
+  private func flyoutBar(
+    pt: CardDailyPoint,
+    scaleMax: Double,
+    maxVal: Double,
+    peakDate: String?,
+    selectedDate: String?
+  ) -> some View {
+    let val = pointValue(pt)
+    let ratio: CGFloat = val > 0 ? CGFloat(val / scaleMax) : 0
+    let isSelected = selectedDate == pt.date
+    let isPeak = maxVal > 0 && pt.date == peakDate
+
+    return ZStack(alignment: .bottom) {
+      if isSelected {
+        Rectangle()
+          .fill(Color.primary.opacity(0.08))
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
+      RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+        .fill(val > 0 ? CodexBarPalette.tealBar : Color.primary.opacity(0.12))
+        .frame(maxWidth: .infinity)
+        .frame(height: val > 0 ? max(5, ratio * 98) : 1.5)
+        .overlay(alignment: .top) {
+          if isPeak {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+              .fill(Color(nsColor: .systemYellow))
+              .frame(height: 4)
+          }
+        }
+    }
+    .frame(maxWidth: .infinity)
+    .frame(height: 102, alignment: .bottom)
+    .contentShape(Rectangle())
+    .onHover { inside in
+      if inside { hoveredDate = pt.date }
+      else if hoveredDate == pt.date { hoveredDate = nil }
+    }
+  }
+}
+
 private struct CodexBarStyleCardView: View {
   @ObservedObject var vm: MeterViewModel
   let selection: String
@@ -3107,7 +3679,8 @@ private struct CodexBarStyleCardView: View {
   }
 
   private var visibleWindows: [CardRecentWindow] {
-    card.recentWindows.filter { $0.index == 0 || $0.turnCount > 0 }
+    guard vm.showRecentWindowsInMenu else { return [] }
+    return card.recentWindows.filter { $0.index == 0 || $0.turnCount > 0 }
   }
 
   private var dividerLine: some View {
@@ -3285,7 +3858,10 @@ private struct CodexBarStyleCardView: View {
     )
     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     .contentShape(Rectangle())
-    .onHover { isCardHovered = $0 }
+    .onHover { inside in
+      isCardHovered = inside
+      CostHistoryFlyoutController.shared.setCardHovered(inside, vm: vm, card: card, selection: selection)
+    }
     .padding(.horizontal, 6)
   }
 
@@ -3439,7 +4015,7 @@ private struct PopoverActionRow: View {
 
 struct MenuBarPopoverView: View {
   @ObservedObject var vm: MeterViewModel
-  let onOpenMainTab: (MainTab) -> Void
+  let onOpenMainTab: (MainTab?) -> Void
   let onCheckUpdates: () -> Void
   let onClosePopover: () -> Void
 
@@ -3476,13 +4052,14 @@ struct MenuBarPopoverView: View {
       currentWindow: emptyWin,
       days30: emptyWin,
       daily30: [],
+      projects: nil,
       recentWindows: [],
       topModel: nil
     )
   }
 
   private var showsContextStrip: Bool {
-    (!vm.runtime.runningFromDmg && (!vm.daemonOnline || !vm.masterEnabled)) || vm.popoverSelection != "all"
+    !vm.runtime.runningFromDmg && (!vm.daemonOnline || !vm.masterEnabled)
   }
 
   var body: some View {
@@ -3494,9 +4071,20 @@ struct MenuBarPopoverView: View {
       CodexBarStyleCardView(vm: vm, selection: vm.popoverSelection, card: activeCard)
 
       if showsContextStrip {
-        quickContextSection
-          .padding(.horizontal, 12)
-          .padding(.vertical, 5)
+        HStack {
+          Text(vm.daemonOnline ? "全局监控已暂停" : "后台采集服务未运行")
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
+          Spacer()
+          Button(vm.daemonOnline ? "恢复显示" : "开启后台") {
+            vm.setMasterEnabled(true)
+          }
+          .buttonStyle(.borderedProminent)
+          .tint(CodexBarPalette.accentBlue)
+          .controlSize(.mini)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
       } else {
         Spacer().frame(height: 4)
       }
@@ -3504,34 +4092,20 @@ struct MenuBarPopoverView: View {
       Divider().padding(.horizontal, 10)
 
       VStack(spacing: 1) {
-        PopoverActionRow(
-          title: "显示样式与驻留",
-          trailingSymbol: "chevron.right",
-          badgeText: vm.menuBarDisplayMode.title
-        ) {
-          DisplayPrefsMenuController.shared.present(vm: vm)
-        }
-
-        PopoverActionRow(title: "用量仪表盘…") {
+        PopoverActionRow(title: "用量仪表盘") {
           onClosePopover()
           onOpenMainTab(.usage)
         }
 
-        PopoverActionRow(title: "最近轮次明细…") {
+        PopoverActionRow(title: "最近轮次") {
           onClosePopover()
           onOpenMainTab(.turns)
         }
-
-        PopoverActionRow(title: "控制面板与设置…", shortcut: "⌘ ,") {
-          onClosePopover()
-          onOpenMainTab(.control)
-        }
-        .keyboardShortcut(",", modifiers: .command)
       }
       .padding(.horizontal, 6)
       .padding(.vertical, 3)
 
-      Divider().padding(.horizontal, 8)
+      Divider().padding(.horizontal, 10)
 
       VStack(spacing: 1) {
         PopoverActionRow(title: "刷新", shortcut: "⌘ R") {
@@ -3540,12 +4114,17 @@ struct MenuBarPopoverView: View {
         }
         .keyboardShortcut("r", modifiers: .command)
 
-        PopoverActionRow(title: "检查更新…") {
+        PopoverActionRow(title: "设置...", shortcut: "⌘ ,") {
+          let targetPane: SettingsPane = vm.popoverSelection == "all"
+            ? .general
+            : .provider(vm.popoverSelection)
           onClosePopover()
-          onCheckUpdates()
+          vm.openSettingsPane(targetPane)
+          onOpenMainTab(nil)
         }
+        .keyboardShortcut(",", modifiers: .command)
 
-        PopoverActionRow(title: "退出控制面板", shortcut: "⌘ Q") {
+        PopoverActionRow(title: "退出", shortcut: "⌘ Q") {
           NSApp.terminate(nil)
         }
         .keyboardShortcut("q", modifiers: .command)
@@ -3555,68 +4134,6 @@ struct MenuBarPopoverView: View {
       .padding(.bottom, 6)
     }
     .frame(width: 310)
-  }
-
-  @ViewBuilder
-  private var quickContextSection: some View {
-    let key = vm.popoverSelection
-    if !vm.runtime.runningFromDmg && (!vm.daemonOnline || !vm.masterEnabled) {
-      HStack {
-        Text(vm.daemonOnline ? "全局监控已暂停" : "后台采集服务未运行")
-          .font(.system(size: 11))
-          .foregroundColor(.secondary)
-        Spacer()
-        Button(vm.daemonOnline ? "恢复显示" : "开启后台") {
-          vm.setMasterEnabled(true)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(CodexBarPalette.accentBlue)
-        .controlSize(.mini)
-      }
-      .padding(.horizontal, 2)
-    } else if key != "all" {
-      let entry = vm.apps[key]
-      let installed = entry?.installed ?? false
-      let enabled = vm.isToolEnabled(key)
-      let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
-      HStack(spacing: 8) {
-        if installed {
-          Toggle(isOn: Binding(
-            get: { enabled },
-            set: { vm.setToolEnabled(key, enabled: $0) }
-          )) {
-            Text("监控 \(vm.toolShortTitle(for: key))")
-              .font(.system(size: 11))
-          }
-          .toggleStyle(.switch)
-          .controlSize(.mini)
-          .disabled(vm.busy || vm.runtime.runningFromDmg)
-
-          Spacer()
-
-          if needsInline && !vm.runtime.runningFromDmg {
-            Button("接入消息旁") {
-              vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.mini)
-          } else if let appPath = entry?.appPath {
-            Button("打开应用") {
-              onClosePopover()
-              NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.mini)
-          }
-        } else {
-          Text("未检测到 \(vm.toolShortTitle(for: key)) 安装")
-            .font(.system(size: 11))
-            .foregroundColor(.secondary)
-          Spacer()
-        }
-      }
-      .padding(.horizontal, 2)
-    }
   }
 }
 
@@ -3646,8 +4163,13 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     ))
     hosting.sizingOptions = [.preferredContentSize]
     pop.contentViewController = hosting
+    CostHistoryFlyoutController.shared.anchorPopover = pop
     return pop
   }()
+
+  func popoverWillClose(_ notification: Notification) {
+    CostHistoryFlyoutController.shared.hideImmediately()
+  }
 
   init(
     vm: MeterViewModel,
@@ -3694,6 +4216,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
   }
 
   func closePopover() {
+    CostHistoryFlyoutController.shared.hideImmediately()
     if popover.isShown {
       popover.performClose(nil)
     }
@@ -3838,12 +4361,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
       let view = ContentView(vm: model)
       let win = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 680, height: 560),
+        contentRect: NSRect(x: 0, y: 0, width: 780, height: 580),
         styleMask: [.titled, .closable, .miniaturizable, .resizable],
         backing: .buffered,
         defer: false
       )
-      win.title = "AI Turn Meter"
+      win.title = "AI Turn Meter 设置"
       win.center()
       win.isReleasedWhenClosed = false
       win.contentView = NSHostingView(rootView: view)
@@ -3855,7 +4378,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           self?.showControlPanel(tab: tab)
         },
         onCheckUpdates: { [weak self] in
-          self?.showControlPanel(tab: .control)
+          self?.vm?.openSettingsPane(.general)
+          self?.showControlPanel(tab: nil)
           self?.vm?.checkForUpdates()
         }
       )
@@ -3888,7 +4412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let appMenu = NSMenu()
     appMenu.addItem(withTitle: "关于 AI Turn Meter", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
     appMenu.addItem(NSMenuItem.separator())
-    let openItem = NSMenuItem(title: "打开控制面板…", action: #selector(openControlPanelFromMenu), keyEquivalent: ",")
+    let openItem = NSMenuItem(title: "设置…", action: #selector(openControlPanelFromMenu), keyEquivalent: ",")
     openItem.target = self
     appMenu.addItem(openItem)
     appMenu.addItem(NSMenuItem.separator())
@@ -3932,13 +4456,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   @MainActor
   private func showControlPanel(tab: MainTab? = nil) {
     if let tab = tab {
-      vm?.activeTab = tab
+      switch tab {
+      case .usage: vm?.openSettingsPane(.usage)
+      case .turns: vm?.openSettingsPane(.turns)
+      case .control:
+        if vm?.settingsPane == .usage || vm?.settingsPane == .turns {
+          vm?.openSettingsPane(.general)
+        }
+      }
     }
     window?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
     vm?.refreshDoctorAndBootstrap()
-    if vm?.activeTab == .usage { vm?.fetchUsageSummary() }
-    else if vm?.activeTab == .turns { vm?.fetchRecentTurns() }
   }
 
   @MainActor

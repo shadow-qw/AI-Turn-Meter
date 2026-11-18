@@ -647,9 +647,14 @@ export class TurnStore {
     for (let i = 29; i >= 0; i -= 1) {
       const d = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate() - i);
       const ms = d.getTime();
-      dailyMap.set(toLocalDateKey(ms), { label: toZhMonthDay(ms), acc: createUsageAccumulator() });
+      dailyMap.set(toLocalDateKey(ms), {
+        label: toZhMonthDay(ms),
+        acc: createUsageAccumulator(),
+        models: new Map(),
+      });
     }
     const modelMap = new Map();
+    const projectMap = new Map();
 
     for (const row of rows) {
       const ts = Number(row.completed_at_ms) || 0;
@@ -660,13 +665,31 @@ export class TurnStore {
         addTurnToAccumulator(days30Acc, row, customRates);
         const dayKey = toLocalDateKey(ts);
         const bucket = dailyMap.get(dayKey);
-        if (bucket) addTurnToAccumulator(bucket.acc, row, customRates);
-
         const mName = row.model && row.model !== 'unknown' ? row.model : null;
+        if (bucket) {
+          addTurnToAccumulator(bucket.acc, row, customRates);
+          if (mName) {
+            if (!bucket.models.has(mName)) bucket.models.set(mName, createUsageAccumulator());
+            addTurnToAccumulator(bucket.models.get(mName), row, customRates);
+          }
+        }
+
         if (mName) {
           if (!modelMap.has(mName)) modelMap.set(mName, createUsageAccumulator());
           addTurnToAccumulator(modelMap.get(mName), row, customRates);
         }
+
+        const rawWs = typeof row.workspace_path === 'string' ? row.workspace_path.trim() : '';
+        const projKey = rawWs || '__independent__';
+        if (!projectMap.has(projKey)) {
+          const name = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : 'Independent chats';
+          projectMap.set(projKey, {
+            name,
+            path: rawWs || '未绑定工作区目录',
+            acc: createUsageAccumulator(),
+          });
+        }
+        addTurnToAccumulator(projectMap.get(projKey).acc, row, customRates);
       }
       if (ts <= nowMs) {
         const diff = Math.max(0, nowMs - ts);
@@ -699,16 +722,42 @@ export class TurnStore {
 
     const daily30 = Array.from(dailyMap.entries())
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, { label, acc }]) => {
+      .map(([date, { label, acc, models }]) => {
         const fin = finalizeAccumulator(acc);
+        const dayModels = Array.from(models.entries())
+          .map(([model, mAcc]) => {
+            const mFin = finalizeAccumulator(mAcc);
+            return {
+              model,
+              costUsd: mFin.estimatedCostUsd,
+              totalTokens: mFin.totalTokens,
+            };
+          })
+          .sort((a, b) => ((b.costUsd ?? -1) - (a.costUsd ?? -1)) || (b.totalTokens - a.totalTokens))
+          .slice(0, 4);
         return {
           date,
           label,
           totalTokens: fin.totalTokens,
           costUsd: fin.estimatedCostUsd,
           turnCount: fin.turnCount,
+          models: dayModels,
         };
       });
+
+    const projects = Array.from(projectMap.values())
+      .map(({ name, path, acc }) => {
+        const fin = finalizeAccumulator(acc);
+        return {
+          name,
+          path,
+          costUsd: fin.estimatedCostUsd,
+          totalTokens: fin.totalTokens,
+          turnCount: fin.turnCount,
+        };
+      })
+      .sort((a, b) => ((b.costUsd ?? -1) - (a.costUsd ?? -1)) || (b.totalTokens - a.totalTokens))
+      .slice(0, 6);
 
     const recentWindows = winFinals.map((fin, idx) => {
       const endMs = nowMs - idx * weekMs;
@@ -755,6 +804,7 @@ export class TurnStore {
         turnCount: days30Fin.turnCount,
       },
       daily30,
+      projects,
       recentWindows,
       topModel,
     };
