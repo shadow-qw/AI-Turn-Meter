@@ -40,10 +40,14 @@ import {
   resolveAppPaths,
 } from '../packages/daemon/src/apps.mjs';
 import {
+  applyLocalSshConfig,
+  buildAppLaunchAgentPlist,
   buildLaunchAgentPlist,
+  buildRemoteSshOneLiner,
   cleanCursorHooks,
   patchCursorHooks,
 } from '../packages/daemon/src/installer.mjs';
+import { estimateTurnCost, resolveModelPricing } from '../packages/daemon/src/pricing.mjs';
 
 test('formatting helpers match specification', () => {
   assert.equal(formatTokens(341), '341');
@@ -1579,4 +1583,196 @@ test('isEligibleCdpTarget, cleanTextWithoutPill style stripping, and batched app
   );
   assert.equal(bar.dataset.atmMsgSig.includes('Copied'), false);
   assert.equal(bar.dataset.atmMsgSig.includes('干净的正文回复'), true);
+});
+
+test('Pricing engine computes standard, long-context, cache savings, custom override, and skips unknown models', () => {
+  // gpt-6.1-sol: $2/M in, $0.1/M cacheRead, $10/M out (threshold 272k)
+  const stdCost = estimateTurnCost({
+    model: 'gpt-6.1-sol',
+    callCount: 1,
+    totalInputTokens: 100_000,
+    uncachedInputTokens: 20_000,
+    cacheReadTokens: 80_000,
+    cacheWriteTokens: 0,
+    outputTokens: 5_000,
+  });
+  assert.equal(stdCost.priced, true);
+  // 0.02 * 2 + 0.08 * 0.1 + 0.005 * 10 = 0.04 + 0.008 + 0.05 = 0.098
+  assert.ok(Math.abs(stdCost.costUsd - 0.098) < 1e-6);
+  // savings: 0.08 * (2 - 0.1) = 0.152
+  assert.ok(Math.abs(stdCost.savingsUsd - 0.152) < 1e-6);
+
+  // Single-call context > 272k triggers 2x input/cache and 1.5x output
+  const longCost = estimateTurnCost({
+    model: 'gpt-6.1-sol',
+    callCount: 1,
+    totalInputTokens: 300_000,
+    uncachedInputTokens: 100_000,
+    cacheReadTokens: 200_000,
+    cacheWriteTokens: 0,
+    outputTokens: 10_000,
+  });
+  // 0.1 * 4 + 0.2 * 0.2 + 0.01 * 15 = 0.4 + 0.04 + 0.15 = 0.59
+  assert.ok(Math.abs(longCost.costUsd - 0.59) < 1e-6);
+
+  // Route prefixes & date snapshots resolve cleanly
+  assert.ok(resolveModelPricing('workbuddy/kimi-k3.1-pro'));
+  assert.ok(resolveModelPricing('claude-opus-4-5-20251101'));
+
+  // Unknown models stay unpriced
+  const unknownCost = estimateTurnCost({
+    model: 'unknown',
+    totalInputTokens: 1000,
+    uncachedInputTokens: 1000,
+    cacheReadTokens: 0,
+    outputTokens: 100,
+  });
+  assert.equal(unknownCost.priced, false);
+  assert.equal(unknownCost.costUsd, null);
+
+  // Custom pricing override
+  const customCost = estimateTurnCost(
+    {
+      model: 'my-internal-model',
+      totalInputTokens: 1_000_000,
+      uncachedInputTokens: 500_000,
+      cacheReadTokens: 500_000,
+      outputTokens: 100_000,
+    },
+    { 'my-internal-model': { input: 4.0, cacheRead: 1.0, output: 10.0 } }
+  );
+  assert.equal(customCost.priced, true);
+  // 0.5 * 4 + 0.5 * 1 + 0.1 * 10 = 3.5
+  assert.ok(Math.abs(customCost.costUsd - 3.5) < 1e-6);
+});
+
+test('TurnStore.getUsageSummary & /v1/usage aggregate today, 7d, byTool, byModel, and daily series', async () => {
+  const meter = createMeterServer({
+    port: 0,
+    dbPath: ':memory:',
+    enableWatchers: false,
+    enableCdp: false,
+  });
+  const addr = await meter.start();
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+  try {
+    const now = Date.now();
+    const twoDaysAgo = now - 2 * 86_400_000;
+    const tenDaysAgo = now - 10 * 86_400_000;
+
+    meter.store.upsertTurn({
+      turnUid: 'antigravity:u1:t1',
+      tool: 'antigravity',
+      sessionId: 'u1',
+      turnId: 't1',
+      model: 'gemini-4-hydrogen',
+      completedAtMs: now - 1000,
+      totalInputTokens: 100_000,
+      cacheReadTokens: 90_000,
+      outputTokens: 2_000,
+      tps: 200,
+    });
+    meter.store.upsertTurn({
+      turnUid: 'codex:u2:t2',
+      tool: 'codex',
+      sessionId: 'u2',
+      turnId: 't2',
+      model: 'gpt-6.1-sol',
+      completedAtMs: twoDaysAgo,
+      totalInputTokens: 50_000,
+      cacheReadTokens: 40_000,
+      outputTokens: 1_000,
+      tps: 50,
+    });
+    meter.store.upsertTurn({
+      turnUid: 'cursor:u3:t3',
+      tool: 'cursor',
+      sessionId: 'u3',
+      turnId: 't3',
+      model: 'grok-4.7',
+      completedAtMs: tenDaysAgo,
+      totalInputTokens: 20_000,
+      cacheReadTokens: 10_000,
+      outputTokens: 500,
+      tps: 40,
+    });
+
+    const res7 = await (await fetch(`${baseUrl}/v1/usage?days=7`)).json();
+    assert.equal(res7.totals.turnCount, 2);
+    assert.equal(res7.today.turnCount, 1);
+    assert.equal(res7.byTool.length, 2);
+    assert.equal(res7.byModel.length, 2);
+    assert.equal(res7.daily.length, 7);
+    assert.ok(res7.totals.estimatedCostUsd > 0);
+    assert.ok(res7.totals.cacheSavingsUsd > 0);
+
+    assert.ok(res7.cards);
+    assert.equal(res7.cards.all.today.turnCount, 1);
+    assert.equal(res7.cards.all.currentWindow.turnCount, 2);
+    assert.equal(res7.cards.all.days30.turnCount, 3);
+    assert.equal(res7.cards.all.daily30.length, 30);
+    assert.equal(res7.cards.all.recentWindows.length, 4);
+    assert.equal(res7.cards.all.recentWindows[0].turnCount, 2);
+    assert.equal(res7.cards.all.recentWindows[1].turnCount, 1);
+    assert.equal(res7.cards.all.topModel, 'gemini-4-hydrogen');
+
+    assert.equal(res7.cards.codex.today.turnCount, 0);
+    assert.equal(res7.cards.codex.today.costUsd, 0);
+    assert.equal(res7.cards.codex.currentWindow.turnCount, 1);
+    assert.equal(res7.cards.codex.topModel, 'gpt-6.1-sol');
+
+    assert.equal(res7.cards.antigravity.today.turnCount, 1);
+    assert.equal(res7.cards.antigravity.days30.turnCount, 1);
+    assert.equal(res7.cards.cursor.recentWindows[1].turnCount, 1);
+    assert.equal(res7.cards.codebuddy.days30.turnCount, 0);
+
+    const resAll = await (await fetch(`${baseUrl}/v1/usage?days=all`)).json();
+    assert.equal(resAll.totals.turnCount, 3);
+
+    const stateRes = await (await fetch(`${baseUrl}/v1/state`)).json();
+    assert.equal(stateRes.todaySummary.turnCount, 1);
+  } finally {
+    await meter.stop();
+  }
+});
+
+test('applyLocalSshConfig is idempotent for existing and new Host blocks and builds background app plist', () => {
+  const tmpHome = mkdtempSync(join(tmpdir(), 'atm-ssh-'));
+  try {
+    const sshDir = join(tmpHome, '.ssh');
+    mkdirSync(sshDir, { recursive: true });
+    const cfgPath = join(sshDir, 'config');
+    writeFileSync(
+      cfgPath,
+      ['Host dev-a', '  HostName 10.0.0.2', '  User ubuntu', '', 'Host dev-b', '  HostName 10.0.0.3', ''].join('\n')
+    );
+
+    const r1 = applyLocalSshConfig('dev-a', { port: 47831, homeDir: tmpHome });
+    assert.equal(r1.changed, true);
+    assert.equal(r1.status, 'updated_host_block');
+    const content1 = readFileSync(cfgPath, 'utf8');
+    assert.match(content1, /Host dev-a\n  RemoteForward 47831 127\.0\.0\.1:47831\n  ExitOnForwardFailure no\n  HostName 10\.0\.0\.2/);
+
+    // Second apply must be idempotent
+    const r2 = applyLocalSshConfig('dev-a', { port: 47831, homeDir: tmpHome });
+    assert.equal(r2.changed, false);
+    assert.equal(r2.status, 'already_configured');
+
+    // New host appends cleanly
+    const r3 = applyLocalSshConfig('dev-c', { port: 47831, homeDir: tmpHome });
+    assert.equal(r3.changed, true);
+    assert.equal(r3.status, 'appended_host_block');
+    const content3 = readFileSync(cfgPath, 'utf8');
+    assert.match(content3, /Host dev-c\n  RemoteForward 47831 127\.0\.0\.1:47831\n  ExitOnForwardFailure no/);
+
+    const oneLiner = buildRemoteSshOneLiner('dev-a', { port: 47831 });
+    assert.match(oneLiner, /^ssh dev-a '/);
+    assert.match(oneLiner, /python3 -'/);
+
+    const appPlist = buildAppLaunchAgentPlist({ appExe: '/Applications/AI Turn Meter.app/Contents/MacOS/AITurnMeter' });
+    assert.match(appPlist, /<string>--background<\/string>/);
+    assert.match(appPlist, /com\.local\.ai-turn-meter\.app/);
+  } finally {
+    rmSync(tmpHome, { recursive: true, force: true });
+  }
 });

@@ -141,6 +141,20 @@ export function createMeterServer({
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/v1/usage') {
+      const rawDays = url.searchParams.get('days');
+      const days =
+        rawDays === 'all' || rawDays === '0'
+          ? 0
+          : rawDays
+            ? Math.max(1, Math.round(Number(rawDays) || 7))
+            : 7;
+      const tool = url.searchParams.get('tool') || null;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(store.getUsageSummary({ days, tool })));
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/v1/match') {
       const tool = url.searchParams.get('tool') || null;
       const workspacePath = url.searchParams.get('workspace') || null;

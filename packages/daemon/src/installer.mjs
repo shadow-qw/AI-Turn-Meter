@@ -21,6 +21,7 @@ import {
 } from './apps.mjs';
 
 export const LAUNCH_AGENT_LABEL = 'com.local.ai-turn-meter.daemon';
+export const APP_LAUNCH_AGENT_LABEL = 'com.local.ai-turn-meter.app';
 export const VSIX_EXT_ID = 'local-ai-turn-meter.ai-turn-meter';
 
 export const CURSOR_EVENTS = [
@@ -353,6 +354,210 @@ export function uninstallLaunchAgent({
   return true;
 }
 
+export function resolveInstalledAppExe(homeDir = homedir()) {
+  const candidates = [
+    '/Applications/AI Turn Meter.app/Contents/MacOS/AITurnMeter',
+    join(homeDir, 'Applications', 'AI Turn Meter.app', 'Contents', 'MacOS', 'AITurnMeter'),
+  ];
+  return candidates.find((p) => existsSync(p)) || candidates[0];
+}
+
+export function buildAppLaunchAgentPlist({ appExe = resolveInstalledAppExe() } = {}) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${APP_LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xmlEscape(appExe)}</string>
+    <string>--background</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>
+`;
+}
+
+export function isAppAutostartEnabled({ homeDir = homedir() } = {}) {
+  const plistPath = join(homeDir, 'Library', 'LaunchAgents', `${APP_LAUNCH_AGENT_LABEL}.plist`);
+  return existsSync(plistPath);
+}
+
+export function setAppAutostart(
+  enabled,
+  { appExe = resolveInstalledAppExe(), homeDir = homedir(), dryRun = false, log = defaultLog(dryRun) } = {}
+) {
+  const plistPath = join(homeDir, 'Library', 'LaunchAgents', `${APP_LAUNCH_AGENT_LABEL}.plist`);
+  if (!enabled) {
+    if (!existsSync(plistPath)) return { enabled: false, plistPath };
+    log(`Disable app autostart: ${plistPath}`);
+    if (!dryRun) {
+      try {
+        execFileSync('launchctl', ['bootout', `gui/${process.getuid()}`, plistPath], { stdio: 'ignore' });
+      } catch {}
+      rmSync(plistPath, { force: true });
+    }
+    return { enabled: false, plistPath };
+  }
+
+  if (!existsSync(appExe)) {
+    throw new Error(`未找到应用可执行文件：${appExe}`);
+  }
+  const plist = buildAppLaunchAgentPlist({ appExe });
+  log(`Enable app autostart: ${plistPath}`);
+  if (!dryRun) {
+    mkdirSync(dirname(plistPath), { recursive: true });
+    writeFileSync(plistPath, plist);
+    const uid = process.getuid();
+    try {
+      execFileSync('launchctl', ['bootout', `gui/${uid}`, plistPath], { stdio: 'ignore' });
+    } catch {}
+    try {
+      execFileSync('launchctl', ['bootstrap', `gui/${uid}`, plistPath], { stdio: 'ignore' });
+    } catch {}
+  }
+  return { enabled: true, plistPath, appExe };
+}
+
+export function buildRemoteHooksConfig(port = DEFAULT_DAEMON_PORT) {
+  return {
+    version: 1,
+    hooks: Object.fromEntries(
+      CURSOR_EVENTS.map((ev) => [
+        ev,
+        [
+          {
+            command: `curl -fsS -m 1 -X POST -H "Content-Type: application/json" --data-binary @- http://127.0.0.1:${port}/v1/ingest/cursor-hook >/dev/null 2>&1 || true`,
+          },
+        ],
+      ])
+    ),
+  };
+}
+
+export function applyLocalSshConfig(
+  host,
+  { port = DEFAULT_DAEMON_PORT, homeDir = homedir(), dryRun = false } = {}
+) {
+  const cleanHost = String(host || '').trim();
+  if (!cleanHost || /\s/.test(cleanHost) || cleanHost.startsWith('-')) {
+    throw new Error(`无效的 SSH Host: "${host || ''}"`);
+  }
+
+  const sshDir = join(homeDir, '.ssh');
+  const sshConfigPath = join(sshDir, 'config');
+  const existing = existsSync(sshConfigPath) ? readFileSync(sshConfigPath, 'utf8') : '';
+  const lines = existing ? existing.split(/\r?\n/) : [];
+
+  let hostLineIdx = -1;
+  let blockEndIdx = lines.length;
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const hostMatch = trimmed.match(/^Host\s+(.+)$/i);
+    if (hostMatch) {
+      if (hostLineIdx !== -1) {
+        blockEndIdx = i;
+        break;
+      }
+      const patterns = hostMatch[1].trim().split(/\s+/);
+      if (patterns.includes(cleanHost)) {
+        hostLineIdx = i;
+      }
+    } else if (hostLineIdx !== -1 && /^Match\s+/i.test(trimmed)) {
+      blockEndIdx = i;
+      break;
+    }
+  }
+
+  const forwardLine = `  RemoteForward ${port} 127.0.0.1:${port}`;
+  const exitOptLine = '  ExitOnForwardFailure no';
+
+  if (hostLineIdx !== -1) {
+    const blockLines = lines.slice(hostLineIdx + 1, blockEndIdx);
+    const hasForward = blockLines.some((l) => {
+      const t = l.trim();
+      if (!t || t.startsWith('#')) return false;
+      return new RegExp(`^RemoteForward\\s+${port}\\s+`, 'i').test(t);
+    });
+    if (hasForward) {
+      return { changed: false, status: 'already_configured', path: sshConfigPath, host: cleanHost };
+    }
+    const hasExitOpt = blockLines.some((l) => /^\s*ExitOnForwardFailure\b/i.test(l) && !l.trim().startsWith('#'));
+    const toInsert = hasExitOpt ? [forwardLine] : [forwardLine, exitOptLine];
+    lines.splice(hostLineIdx + 1, 0, ...toInsert);
+  } else {
+    if (lines.length > 0 && lines[lines.length - 1].trim() !== '') {
+      lines.push('');
+    }
+    lines.push(`Host ${cleanHost}`, forwardLine, exitOptLine);
+  }
+
+  const nextContent = `${lines.join('\n').replace(/\n+$/, '')}\n`;
+  if (!dryRun) {
+    mkdirSync(sshDir, { recursive: true, mode: 0o700 });
+    if (existsSync(sshConfigPath)) {
+      copyFileSync(sshConfigPath, `${sshConfigPath}.bak-ai-turn-meter`);
+    }
+    writeFileSync(sshConfigPath, nextContent, { mode: 0o600 });
+    chmodSync(sshConfigPath, 0o600);
+  }
+
+  return {
+    changed: true,
+    status: hostLineIdx !== -1 ? 'updated_host_block' : 'appended_host_block',
+    path: sshConfigPath,
+    host: cleanHost,
+  };
+}
+
+export function buildRemoteHookInstallCommand(port = DEFAULT_DAEMON_PORT) {
+  const py = [
+    'import json,os',
+    'p=os.path.expanduser("~/.cursor/hooks.json")',
+    'os.makedirs(os.path.dirname(p),exist_ok=True)',
+    'd=json.load(open(p)) if os.path.exists(p) else {}',
+    'if not isinstance(d.get("version"),int): d["version"]=1',
+    'h=d.setdefault("hooks",{})',
+    `cmd="curl -fsS -m 1 -X POST -H \\"Content-Type: application/json\\" --data-binary @- http://127.0.0.1:${port}/v1/ingest/cursor-hook >/dev/null 2>&1 || true"`,
+    `evs=${JSON.stringify(CURSOR_EVENTS)}`,
+    'for e in evs:',
+    ' arr=h.get(e) if isinstance(h.get(e),list) else []',
+    ' arr=[x for x in arr if "cursor-hook" not in str((x or {}).get("command",""))]',
+    ' arr.append({"command":cmd})',
+    ' h[e]=arr',
+    'open(p,"w").write(json.dumps(d,indent=2)+"\\n")',
+    'print("OK",p)',
+  ].join('\n');
+  const b64 = Buffer.from(py, 'utf8').toString('base64');
+  return `echo ${b64} | (base64 -d 2>/dev/null || base64 -D) | python3 -`;
+}
+
+export function buildRemoteSshOneLiner(host, { port = DEFAULT_DAEMON_PORT } = {}) {
+  const cleanHost = String(host || '<remote-host>').trim() || '<remote-host>';
+  const remoteCmd = buildRemoteHookInstallCommand(port);
+  return `ssh ${quoteShellArg(cleanHost)} '${remoteCmd}'`;
+}
+
+export function applyRemoteCursorHooks(host, { port = DEFAULT_DAEMON_PORT } = {}) {
+  const cleanHost = String(host || '').trim();
+  if (!cleanHost || /\s/.test(cleanHost) || cleanHost.startsWith('-')) {
+    throw new Error(`无效的 SSH Host: "${host || ''}"`);
+  }
+  const remoteCmd = buildRemoteHookInstallCommand(port);
+  const out = execFileSync(
+    '/usr/bin/ssh',
+    ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', cleanHost, remoteCmd],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000 }
+  );
+  return { ok: true, host: cleanHost, output: out.trim() };
+}
+
 export async function installAll({
   dryRun = false,
   skipCliLink = false,
@@ -380,6 +585,7 @@ export function uninstallAll({ dryRun = false, homeDir = homedir() } = {}) {
   const log = defaultLog(dryRun);
   cleanCursorHooks({ dryRun, homeDir, log });
   uninstallLaunchAgent({ dryRun, homeDir, log });
+  setAppAutostart(false, { dryRun, homeDir, log });
   uninstallVsix({ dryRun, homeDir, log });
   const cliDst = join(homeDir, '.local', 'bin', 'ai-turn-meter');
   if (existsSync(cliDst)) {

@@ -3,6 +3,145 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { formatInlineSummary, normalizeTurn, TOOL_LABELS } from './format.mjs';
+import { defaultCustomPricingPath, estimateTurnCost, loadCustomPricing } from './pricing.mjs';
+
+function startOfLocalDayMs(nowMs = Date.now()) {
+  const d = new Date(nowMs);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+function toLocalDateKey(ms) {
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function toZhMonthDay(ms) {
+  const d = new Date(ms);
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
+}
+
+function formatZhRange(startMs, endMs) {
+  const fmt = (ms) => {
+    const d = new Date(ms);
+    const m = d.getMonth() + 1;
+    const day = d.getDate();
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${m}月${day}日 ${hh}:${mm}`;
+  };
+  return `${fmt(startMs)} – ${fmt(endMs)}`;
+}
+
+const CARD_WINDOW_TITLES = ['当前窗口', '上一窗口', '2 个窗口前', '3 个窗口前'];
+const CARD_TOOL_KEYS = ['codex', 'cursor', 'antigravity', 'codebuddy'];
+
+function createUsageAccumulator() {
+  return {
+    turnCount: 0,
+    callCount: 0,
+    totalInputTokens: 0,
+    uncachedInputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    thinkingTokens: 0,
+    tpsOutputSum: 0,
+    tpsDurationSecSum: 0,
+    estimatedCostUsd: 0,
+    cacheSavingsUsd: 0,
+    pricedTurnCount: 0,
+    unpricedTurnCount: 0,
+  };
+}
+
+function addTurnToAccumulator(acc, row, customRates) {
+  const totalIn = Number(row.total_input_tokens) || 0;
+  const uncachedIn = Number(row.uncached_input_tokens) || 0;
+  const cacheRead = Number(row.cache_read_tokens) || 0;
+  const cacheWrite = Number(row.cache_write_tokens) || 0;
+  const out = Number(row.output_tokens) || 0;
+  const thinking = Number(row.thinking_tokens) || 0;
+  const calls = Math.max(1, Number(row.call_count) || 1);
+  const tps = typeof row.tps === 'number' && Number.isFinite(row.tps) && row.tps > 0 ? row.tps : null;
+
+  acc.turnCount += 1;
+  acc.callCount += calls;
+  acc.totalInputTokens += totalIn;
+  acc.uncachedInputTokens += uncachedIn;
+  acc.cacheReadTokens += cacheRead;
+  acc.cacheWriteTokens += cacheWrite;
+  acc.outputTokens += out;
+  acc.thinkingTokens += thinking;
+  if (tps !== null && out > 0) {
+    acc.tpsOutputSum += out;
+    acc.tpsDurationSecSum += out / tps;
+  }
+
+  const cost = estimateTurnCost(
+    {
+      model: row.model,
+      totalInputTokens: totalIn,
+      uncachedInputTokens: uncachedIn,
+      cacheReadTokens: cacheRead,
+      cacheWriteTokens: cacheWrite,
+      outputTokens: out,
+      callCount: calls,
+    },
+    customRates
+  );
+  if (cost.priced && cost.costUsd !== null) {
+    acc.pricedTurnCount += 1;
+    acc.estimatedCostUsd += cost.costUsd;
+    acc.cacheSavingsUsd += cost.savingsUsd || 0;
+  } else {
+    acc.unpricedTurnCount += 1;
+  }
+}
+
+function finalizeAccumulator(acc) {
+  const totalTokens = acc.totalInputTokens + acc.outputTokens;
+  const cacheRatePct =
+    acc.totalInputTokens > 0
+      ? Number(Math.min(100, Math.max(0, (acc.cacheReadTokens / acc.totalInputTokens) * 100)).toFixed(1))
+      : null;
+  const avgTps =
+    acc.tpsOutputSum > 0 && acc.tpsDurationSecSum > 0
+      ? Number((acc.tpsOutputSum / acc.tpsDurationSecSum).toFixed(1))
+      : null;
+  const estimatedCostUsd =
+    acc.turnCount === 0
+      ? 0
+      : acc.pricedTurnCount > 0
+        ? Number(acc.estimatedCostUsd.toFixed(4))
+        : null;
+  const cacheSavingsUsd =
+    acc.turnCount === 0
+      ? 0
+      : acc.pricedTurnCount > 0
+        ? Number(acc.cacheSavingsUsd.toFixed(4))
+        : null;
+
+  return {
+    turnCount: acc.turnCount,
+    callCount: acc.callCount,
+    totalInputTokens: acc.totalInputTokens,
+    uncachedInputTokens: acc.uncachedInputTokens,
+    cacheReadTokens: acc.cacheReadTokens,
+    cacheWriteTokens: acc.cacheWriteTokens,
+    outputTokens: acc.outputTokens,
+    thinkingTokens: acc.thinkingTokens,
+    totalTokens,
+    cacheRatePct,
+    avgTps,
+    estimatedCostUsd,
+    cacheSavingsUsd,
+    pricedTurnCount: acc.pricedTurnCount,
+    unpricedTurnCount: acc.unpricedTurnCount,
+  };
+}
 
 export function defaultDbPath() {
   return (
@@ -17,11 +156,14 @@ export function defaultDbPath() {
 export class TurnStore {
   /**
    * @param {string} [dbPath]
+   * @param {{ customPricingPath?: string | null }} [opts]
    */
-  constructor(dbPath = defaultDbPath()) {
+  constructor(dbPath = defaultDbPath(), { customPricingPath } = {}) {
     if (dbPath !== ':memory:') {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
+    this.customPricingPath =
+      customPricingPath !== undefined ? customPricingPath : dbPath === ':memory:' ? null : defaultCustomPricingPath();
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec(`
@@ -200,10 +342,14 @@ export class TurnStore {
       cacheWriteTokens: Number(agg.cache_write_tokens),
       outputTokens: Number(agg.output_tokens),
     };
+    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+    const cost = estimateTurnCost(t, customRates);
     return {
       ...t,
       toolLabel: TOOL_LABELS[t.tool] || t.tool,
       inlineText: formatInlineSummary(t),
+      estimatedCostUsd: cost.costUsd,
+      cacheSavingsUsd: cost.savingsUsd,
       sessionTotal,
     };
   }
@@ -306,12 +452,310 @@ export class TurnStore {
     return this.getRecentTurns(1)[0] || null;
   }
 
+  getTodaySummary(nowMs = Date.now(), tool = null) {
+    const startMs = startOfLocalDayMs(nowMs);
+    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+    const rows = tool
+      ? this.db
+          .prepare(`SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ?`)
+          .all(tool, startMs)
+      : this.db
+          .prepare(`SELECT * FROM turns WHERE completed_at_ms >= ?`)
+          .all(startMs);
+    const acc = createUsageAccumulator();
+    for (const row of rows) {
+      addTurnToAccumulator(acc, row, customRates);
+    }
+    return finalizeAccumulator(acc);
+  }
+
+  /**
+   * Aggregate usage, cost, and cache savings over `days` local calendar days (0 or 'all' = all history).
+   * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number }} [opts]
+   */
+  getUsageSummary({ days = 7, tool = null, nowMs = Date.now() } = {}) {
+    const todayStartMs = startOfLocalDayMs(nowMs);
+    const resolvedDays =
+      days === 'all' || days === 0 || days === '0' || days === null
+        ? 0
+        : Math.max(1, Math.round(Number(days) || 7));
+
+    let sinceMs = 0;
+    if (resolvedDays > 0) {
+      const nowDate = new Date(nowMs);
+      sinceMs = new Date(
+        nowDate.getFullYear(),
+        nowDate.getMonth(),
+        nowDate.getDate() - (resolvedDays - 1)
+      ).getTime();
+    }
+
+    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+    const rows = tool
+      ? this.db
+          .prepare(`SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
+          .all(tool, sinceMs)
+      : this.db
+          .prepare(`SELECT * FROM turns WHERE completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
+          .all(sinceMs);
+
+    const totalsAcc = createUsageAccumulator();
+    const todayAcc = createUsageAccumulator();
+    const toolMap = new Map();
+    const modelMap = new Map();
+    const dailyMap = new Map();
+
+    if (resolvedDays >= 1 && resolvedDays <= 90) {
+      const nowDate = new Date(nowMs);
+      for (let i = resolvedDays - 1; i >= 0; i -= 1) {
+        const d = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate() - i);
+        const key = toLocalDateKey(d.getTime());
+        dailyMap.set(key, createUsageAccumulator());
+      }
+    }
+
+    for (const row of rows) {
+      addTurnToAccumulator(totalsAcc, row, customRates);
+      if (row.completed_at_ms >= todayStartMs) {
+        addTurnToAccumulator(todayAcc, row, customRates);
+      }
+
+      const tKey = row.tool;
+      if (!toolMap.has(tKey)) toolMap.set(tKey, createUsageAccumulator());
+      addTurnToAccumulator(toolMap.get(tKey), row, customRates);
+
+      const mName = row.model || 'unknown';
+      const mKey = `${tKey}\0${mName}`;
+      if (!modelMap.has(mKey)) {
+        modelMap.set(mKey, { tool: tKey, model: mName, acc: createUsageAccumulator() });
+      }
+      addTurnToAccumulator(modelMap.get(mKey).acc, row, customRates);
+
+      const dayKey = toLocalDateKey(row.completed_at_ms);
+      if (!dailyMap.has(dayKey)) dailyMap.set(dayKey, createUsageAccumulator());
+      addTurnToAccumulator(dailyMap.get(dayKey), row, customRates);
+    }
+
+    const totals = finalizeAccumulator(totalsAcc);
+    const today = resolvedDays === 1 ? totals : finalizeAccumulator(todayAcc);
+
+    const byTool = Array.from(toolMap.entries())
+      .map(([tKey, acc]) => {
+        const stats = finalizeAccumulator(acc);
+        return {
+          tool: tKey,
+          toolLabel: TOOL_LABELS[tKey] || tKey,
+          sharePct:
+            totals.totalTokens > 0
+              ? Number(((stats.totalTokens / totals.totalTokens) * 100).toFixed(1))
+              : 0,
+          ...stats,
+        };
+      })
+      .sort((a, b) => b.totalTokens - a.totalTokens);
+
+    const byModel = Array.from(modelMap.values())
+      .map(({ tool: tKey, model, acc }) => {
+        const stats = finalizeAccumulator(acc);
+        return {
+          tool: tKey,
+          toolLabel: TOOL_LABELS[tKey] || tKey,
+          model,
+          priced: stats.pricedTurnCount > 0,
+          sharePct:
+            totals.totalTokens > 0
+              ? Number(((stats.totalTokens / totals.totalTokens) * 100).toFixed(1))
+              : 0,
+          ...stats,
+        };
+      })
+      .sort(
+        (a, b) =>
+          (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
+      );
+
+    const daily = Array.from(dailyMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, acc]) => ({
+        date,
+        ...finalizeAccumulator(acc),
+      }));
+
+    const cards = this.buildCardsByTool(nowMs, customRates);
+
+    return {
+      days: resolvedDays,
+      tool: tool || null,
+      sinceMs,
+      generatedAtMs: nowMs,
+      today,
+      totals,
+      byTool,
+      byModel,
+      daily,
+      cards,
+    };
+  }
+
+  buildCodexBarCardSnapshot(rows, nowMs = Date.now(), customRates = null) {
+    const todayStartMs = startOfLocalDayMs(nowMs);
+    const nowDate = new Date(nowMs);
+    const days30StartMs = new Date(
+      nowDate.getFullYear(),
+      nowDate.getMonth(),
+      nowDate.getDate() - 29
+    ).getTime();
+    const weekMs = 7 * 86_400_000;
+
+    const todayAcc = createUsageAccumulator();
+    const days30Acc = createUsageAccumulator();
+    const windowAccs = [
+      createUsageAccumulator(),
+      createUsageAccumulator(),
+      createUsageAccumulator(),
+      createUsageAccumulator(),
+    ];
+    const dailyMap = new Map();
+    for (let i = 29; i >= 0; i -= 1) {
+      const d = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate() - i);
+      const ms = d.getTime();
+      dailyMap.set(toLocalDateKey(ms), { label: toZhMonthDay(ms), acc: createUsageAccumulator() });
+    }
+    const modelMap = new Map();
+
+    for (const row of rows) {
+      const ts = Number(row.completed_at_ms) || 0;
+      if (ts >= todayStartMs) {
+        addTurnToAccumulator(todayAcc, row, customRates);
+      }
+      if (ts >= days30StartMs) {
+        addTurnToAccumulator(days30Acc, row, customRates);
+        const dayKey = toLocalDateKey(ts);
+        const bucket = dailyMap.get(dayKey);
+        if (bucket) addTurnToAccumulator(bucket.acc, row, customRates);
+
+        const mName = row.model && row.model !== 'unknown' ? row.model : null;
+        if (mName) {
+          if (!modelMap.has(mName)) modelMap.set(mName, createUsageAccumulator());
+          addTurnToAccumulator(modelMap.get(mName), row, customRates);
+        }
+      }
+      if (ts <= nowMs) {
+        const diff = Math.max(0, nowMs - ts);
+        const idx = Math.floor(diff / weekMs);
+        if (idx >= 0 && idx < 4) {
+          addTurnToAccumulator(windowAccs[idx], row, customRates);
+        }
+      }
+    }
+
+    const todayFin = finalizeAccumulator(todayAcc);
+    const days30Fin = finalizeAccumulator(days30Acc);
+    const winFinals = windowAccs.map((a) => finalizeAccumulator(a));
+
+    let topModel = null;
+    let topScore = null;
+    for (const [modelName, acc] of modelMap.entries()) {
+      const fin = finalizeAccumulator(acc);
+      const score = [fin.estimatedCostUsd ?? -1, fin.totalTokens, fin.turnCount];
+      if (
+        !topScore ||
+        score[0] > topScore[0] ||
+        (score[0] === topScore[0] && score[1] > topScore[1]) ||
+        (score[0] === topScore[0] && score[1] === topScore[1] && score[2] > topScore[2])
+      ) {
+        topModel = modelName;
+        topScore = score;
+      }
+    }
+
+    const daily30 = Array.from(dailyMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, { label, acc }]) => {
+        const fin = finalizeAccumulator(acc);
+        return {
+          date,
+          label,
+          totalTokens: fin.totalTokens,
+          costUsd: fin.estimatedCostUsd,
+          turnCount: fin.turnCount,
+        };
+      });
+
+    const recentWindows = winFinals.map((fin, idx) => {
+      const endMs = nowMs - idx * weekMs;
+      const startMs = endMs - weekMs;
+      return {
+        index: idx,
+        title: CARD_WINDOW_TITLES[idx],
+        rangeText: formatZhRange(startMs, endMs),
+        costUsd: fin.estimatedCostUsd,
+        totalTokens: fin.totalTokens,
+        turnCount: fin.turnCount,
+      };
+    });
+
+    return {
+      today: {
+        costUsd: todayFin.estimatedCostUsd,
+        totalTokens: todayFin.totalTokens,
+        totalInputTokens: todayFin.totalInputTokens,
+        outputTokens: todayFin.outputTokens,
+        turnCount: todayFin.turnCount,
+        callCount: todayFin.callCount,
+        cacheRatePct: todayFin.cacheRatePct,
+        avgTps: todayFin.avgTps,
+        cacheSavingsUsd: todayFin.cacheSavingsUsd,
+      },
+      currentWindow: {
+        costUsd: winFinals[0].estimatedCostUsd,
+        totalTokens: winFinals[0].totalTokens,
+        turnCount: winFinals[0].turnCount,
+      },
+      days30: {
+        costUsd: days30Fin.estimatedCostUsd,
+        totalTokens: days30Fin.totalTokens,
+        turnCount: days30Fin.turnCount,
+      },
+      daily30,
+      recentWindows,
+      topModel,
+    };
+  }
+
+  buildCardsByTool(nowMs = Date.now(), customRates = null) {
+    const nowDate = new Date(nowMs);
+    const days30StartMs = new Date(
+      nowDate.getFullYear(),
+      nowDate.getMonth(),
+      nowDate.getDate() - 29
+    ).getTime();
+    const minMs = Math.min(days30StartMs, nowMs - 28 * 86_400_000);
+    const rows = this.db
+      .prepare(`SELECT * FROM turns WHERE completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
+      .all(minMs);
+
+    const byTool = new Map(CARD_TOOL_KEYS.map((k) => [k, []]));
+    for (const r of rows) {
+      if (byTool.has(r.tool)) byTool.get(r.tool).push(r);
+    }
+
+    const cards = {
+      all: this.buildCodexBarCardSnapshot(rows, nowMs, customRates),
+    };
+    for (const k of CARD_TOOL_KEYS) {
+      cards[k] = this.buildCodexBarCardSnapshot(byTool.get(k) || [], nowMs, customRates);
+    }
+    return cards;
+  }
+
   getState(limit = 20) {
     const recent = this.getRecentTurns(limit);
     return {
       updatedAtMs: Date.now(),
       latest: recent[0] || null,
       byTool: this.getLatestByTool(),
+      todaySummary: this.getTodaySummary(),
       recent,
     };
   }
