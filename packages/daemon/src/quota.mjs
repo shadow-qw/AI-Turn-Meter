@@ -11,6 +11,7 @@ const execFileAsync = promisify(execFile);
 const CACHE_TTL_MS = 45_000;
 let cachedResult = null;
 let cachedAtMs = 0;
+let cachedCookieKey = '';
 let inflightPromise = null;
 
 function clampPct(v) {
@@ -472,42 +473,280 @@ export async function fetchAntigravityQuota(nowMs = Date.now()) {
   return empty;
 }
 
-export function fetchCursorQuota() {
+function normalizeCursorCookieInput(raw) {
+  if (typeof raw !== 'string') return null;
+  let text = raw.trim();
+  if (!text) return null;
+  if (text.toLowerCase().startsWith('cookie:')) {
+    text = text.slice(7).trim();
+  }
+  if (!text) return null;
+  if (text.includes('WorkosCursorSessionToken=')) return text;
+  if (text.includes('=')) return text;
+  return `WorkosCursorSessionToken=${encodeURIComponent(text)}`;
+}
+
+function readCodexBarCursorSessionCookie() {
+  try {
+    const p = join(homedir(), 'Library/Application Support/CodexBar/cursor-session.json');
+    if (!existsSync(p)) return null;
+    const raw = JSON.parse(readFileSync(p, 'utf8'));
+    if (typeof raw?.cookieHeader === 'string' && raw.cookieHeader.trim()) {
+      return raw.cookieHeader.trim();
+    }
+    if (Array.isArray(raw?.cookies)) {
+      const pairs = raw.cookies
+        .filter((c) => c && c.name && c.value)
+        .map((c) => `${c.name}=${c.value}`);
+      if (pairs.length > 0) return pairs.join('; ');
+    }
+    if (Array.isArray(raw)) {
+      const pairs = raw
+        .filter((c) => c && c.name && c.value)
+        .map((c) => `${c.name}=${c.value}`);
+      if (pairs.length > 0) return pairs.join('; ');
+    }
+  } catch {}
+  return null;
+}
+
+function resolveCursorJwtCookie(rawToken) {
+  if (typeof rawToken !== 'string') return null;
+  const trimmed = rawToken.trim();
+  if (!trimmed || trimmed.startsWith('cursor-safe-storage:')) return null;
+  const payload = decodeJwtPayload(trimmed);
+  if (!payload || typeof payload.sub !== 'string') return null;
+  if (typeof payload.exp === 'number' && payload.exp * 1000 <= Date.now() + 60_000) {
+    return null;
+  }
+  const userId = payload.sub.split('|').filter(Boolean).pop();
+  if (!userId) return null;
+  return {
+    userId,
+    cookieHeader: `WorkosCursorSessionToken=${userId}%3A%3A${trimmed}`,
+  };
+}
+
+async function cursorApiJson(url, cookieHeader, { method = 'GET', body = null } = {}) {
+  try {
+    const headers = {
+      Cookie: cookieHeader,
+      Accept: 'application/json',
+      Origin: 'https://cursor.com',
+      Referer: 'https://cursor.com/dashboard?tab=usage',
+    };
+    if (body !== null) {
+      headers['Content-Type'] = 'application/json';
+    }
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body !== null ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true, cursorCookie = null } = {}) {
   const empty = { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null };
+  let accountEmail = null;
+  let planTitle = null;
+  let teamId = null;
+  let cookieHeader = normalizeCursorCookieInput(cursorCookie);
+  let userId = null;
+
   try {
     const dbPath = join(homedir(), 'Library/Application Support/Cursor/User/globalStorage/state.vscdb');
-    if (!existsSync(dbPath)) return empty;
-    const db = new DatabaseSync(dbPath, { readOnly: true });
-    try {
-      const getVal = (key) => db.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get(key)?.value;
-      const accountEmail = getVal('cursorAuth/cachedEmail') || null;
-      const membership = getVal('cursorAuth/stripeMembershipType');
-      let teamName = null;
+    if (existsSync(dbPath)) {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
       try {
-        const teamObj = JSON.parse(getVal('cursorAuth/cachedTeam') || 'null');
-        teamName = teamObj?.name || null;
-      } catch {}
+        const getVal = (key) => db.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get(key)?.value;
+        accountEmail = getVal('cursorAuth/cachedEmail') || null;
+        const membership = getVal('cursorAuth/stripeMembershipType');
+        let teamName = null;
+        try {
+          const teamObj = JSON.parse(getVal('cursorAuth/cachedTeam') || 'null');
+          teamName = teamObj?.name || null;
+          if (typeof teamObj?.teamId === 'number') teamId = teamObj.teamId;
+        } catch {}
 
-      const planNames = {
-        enterprise: 'Enterprise',
-        pro: 'Pro',
-        pro_plus: 'Pro+',
-        ultra: 'Ultra',
-        team: 'Team',
-        free: 'Free',
-        free_trial: 'Pro Trial',
-        hobby: 'Hobby',
-      };
-      const basePlan = membership ? planNames[String(membership).toLowerCase()] || String(membership) : null;
-      const planTitle = basePlan && teamName ? `${basePlan} · ${teamName}` : basePlan || teamName;
+        if (!cookieHeader) {
+          const jwtRes = resolveCursorJwtCookie(getVal('cursorAuth/accessToken'));
+          if (jwtRes) {
+            cookieHeader = jwtRes.cookieHeader;
+            userId = jwtRes.userId;
+          }
+        }
+        if (!userId) {
+          const authId = getVal('cursorAuth/stripeMembershipAuthId');
+          if (typeof authId === 'string' && authId.includes('|')) {
+            userId = authId.split('|').filter(Boolean).pop() || null;
+          }
+        }
 
-      return { accountEmail, planTitle, quotaWindows: [], resetCreditsText: null };
-    } finally {
-      db.close();
+        const planNames = {
+          enterprise: 'Enterprise',
+          pro: 'Pro',
+          pro_plus: 'Pro+',
+          ultra: 'Ultra',
+          team: 'Team',
+          free: 'Free',
+          free_trial: 'Pro Trial',
+          hobby: 'Hobby',
+        };
+        const basePlan = membership ? planNames[String(membership).toLowerCase()] || String(membership) : null;
+        planTitle = basePlan && teamName ? `${basePlan} · ${teamName}` : basePlan || teamName;
+      } finally {
+        db.close();
+      }
     }
-  } catch {
-    return empty;
+  } catch {}
+
+  if (!cookieHeader) {
+    cookieHeader = readCodexBarCursorSessionCookie();
   }
+  if (!cookieHeader || !allowNetwork) {
+    return { accountEmail, planTitle, quotaWindows: [], resetCreditsText: null };
+  }
+
+  const summary = await cursorApiJson('https://cursor.com/api/usage-summary', cookieHeader);
+  if (!summary) {
+    return { accountEmail, planTitle, quotaWindows: [], resetCreditsText: null };
+  }
+
+  if (!accountEmail && summary.email) accountEmail = summary.email;
+  const startMs = summary.billingCycleStart ? Date.parse(summary.billingCycleStart) : NaN;
+  const endMs = summary.billingCycleEnd ? Date.parse(summary.billingCycleEnd) : NaN;
+  const cycleSecs =
+    Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
+      ? (endMs - startMs) / 1000
+      : 30 * 86400;
+  const resetAtMs = Number.isFinite(endMs) ? endMs : null;
+
+  let usedUSD = null;
+  let limitUSD = null;
+  let usedPct = null;
+
+  const plan = summary.individualUsage?.plan;
+  const overall = summary.individualUsage?.overall;
+  const pooled = summary.teamUsage?.pooled;
+
+  // Check verified team/enterprise personal spend budget if available
+  if ((summary.membershipType === 'enterprise' || summary.membershipType === 'team' || summary.isTeam) && accountEmail) {
+    const teamsRes = await cursorApiJson('https://cursor.com/api/dashboard/teams', cookieHeader);
+    const teams = Array.isArray(teamsRes?.teams) ? teamsRes.teams : [];
+    const targetTeamId =
+      teams.find((t) => t.id === teamId)?.id ??
+      (teams.length === 1 ? teams[0]?.id : teamId);
+    if (typeof targetTeamId === 'number') {
+      const spendRes = await cursorApiJson('https://cursor.com/api/dashboard/get-team-spend', cookieHeader, {
+        method: 'POST',
+        body: { teamId: targetTeamId, page: 1, pageSize: 50 },
+      });
+      const members = Array.isArray(spendRes?.teamMemberSpend) ? spendRes.teamMemberSpend : [];
+      const me = members.find(
+        (m) =>
+          (m.email && accountEmail && m.email.toLowerCase() === accountEmail.toLowerCase()) ||
+          (userId && m.userId === userId)
+      );
+      if (me) {
+        const effLimit = Number(me.effectivePerUserLimitDollars ?? me.monthlyLimitDollars);
+        const spendCents = Number(me.overallSpendCents);
+        if (Number.isFinite(effLimit) && effLimit > 0 && Number.isFinite(spendCents) && spendCents >= 0) {
+          usedUSD = spendCents / 100;
+          limitUSD = effLimit;
+          usedPct = (usedUSD / limitUSD) * 100;
+        }
+      }
+    }
+  }
+
+  if (usedPct === null && plan) {
+    if (typeof plan.totalPercentUsed === 'number' && Number.isFinite(plan.totalPercentUsed)) {
+      usedPct = plan.totalPercentUsed;
+    } else if (typeof plan.apiPercentUsed === 'number' && typeof plan.autoPercentUsed === 'number') {
+      usedPct = (plan.apiPercentUsed + plan.autoPercentUsed) / 2;
+    } else if (typeof plan.limit === 'number' && plan.limit > 0 && typeof plan.used === 'number') {
+      usedUSD = plan.used / 100;
+      limitUSD = plan.limit / 100;
+      usedPct = (plan.used / plan.limit) * 100;
+    }
+    if (usedUSD === null && typeof plan.used === 'number' && typeof plan.limit === 'number' && plan.limit > 0) {
+      usedUSD = plan.used / 100;
+      limitUSD = plan.limit / 100;
+    }
+  }
+
+  if (usedPct === null && overall && typeof overall.limit === 'number' && overall.limit > 0 && typeof overall.used === 'number') {
+    usedUSD = overall.used / 100;
+    limitUSD = overall.limit / 100;
+    usedPct = (overall.used / overall.limit) * 100;
+  }
+
+  if (usedPct === null && pooled && typeof pooled.limit === 'number' && pooled.limit > 0 && typeof pooled.used === 'number') {
+    usedUSD = pooled.used / 100;
+    limitUSD = pooled.limit / 100;
+    usedPct = (pooled.used / pooled.limit) * 100;
+  }
+
+  const quotaWindows = [];
+  if (usedPct !== null) {
+    const budgetNote =
+      usedUSD !== null && limitUSD !== null && limitUSD > 0
+        ? `已用 $${usedUSD.toFixed(2)} / $${Math.round(limitUSD)}`
+        : null;
+    const win = computeQuotaWindow({
+      id: 'cursor-plan',
+      title: '套餐额度',
+      usedPct,
+      windowSeconds: cycleSecs,
+      resetAtMs,
+      nowMs,
+      extraNote: budgetNote,
+    });
+    if (win) quotaWindows.push(win);
+  } else if (userId) {
+    const reqUsage = await cursorApiJson(
+      `https://cursor.com/api/usage?user=${encodeURIComponent(userId)}`,
+      cookieHeader
+    );
+    const maxReq = Number(reqUsage?.['gpt-4']?.maxRequestUsage);
+    const usedReq = Number(reqUsage?.['gpt-4']?.numRequestsTotal ?? reqUsage?.['gpt-4']?.numRequests);
+    if (Number.isFinite(maxReq) && maxReq > 0 && Number.isFinite(usedReq) && usedReq >= 0) {
+      const win = computeQuotaWindow({
+        id: 'cursor-requests',
+        title: '快速请求',
+        usedPct: (usedReq / maxReq) * 100,
+        windowSeconds: cycleSecs,
+        resetAtMs,
+        nowMs,
+        extraNote: `${Math.round(usedReq)} / ${Math.round(maxReq)} 次`,
+      });
+      if (win) quotaWindows.push(win);
+    }
+  }
+
+  const onDemandUsed = summary.individualUsage?.onDemand?.used ?? summary.teamUsage?.onDemand?.used;
+  const onDemandLimit = summary.individualUsage?.onDemand?.limit ?? summary.teamUsage?.onDemand?.limit;
+  let resetCreditsText = null;
+  if (typeof onDemandUsed === 'number' && onDemandUsed > 0) {
+    const usdStr = `$${(onDemandUsed / 100).toFixed(2)}`;
+    resetCreditsText =
+      typeof onDemandLimit === 'number' && onDemandLimit > 0
+        ? `按量超额已用 ${usdStr} / $${(onDemandLimit / 100).toFixed(0)}`
+        : `按量超额已用 ${usdStr}`;
+  }
+
+  return {
+    accountEmail,
+    planTitle: planTitle || (summary.membershipType ? String(summary.membershipType) : null),
+    quotaWindows,
+    resetCreditsText,
+  };
 }
 
 export function fetchCodeBuddyQuota() {
@@ -546,20 +785,25 @@ export function fetchCodeBuddyQuota() {
   }
 }
 
-export async function getAllQuotas(nowMs = Date.now(), { forceRefresh = false, allowNetwork = true } = {}) {
-  if (!forceRefresh && cachedResult && nowMs - cachedAtMs < CACHE_TTL_MS) {
+export async function getAllQuotas(
+  nowMs = Date.now(),
+  { forceRefresh = false, allowNetwork = true, cursorCookie = null } = {}
+) {
+  const cookieKey = cursorCookie ? String(cursorCookie).trim() : '';
+  if (!forceRefresh && cachedResult && cachedCookieKey === cookieKey && nowMs - cachedAtMs < CACHE_TTL_MS) {
     return cachedResult;
   }
-  if (!forceRefresh && inflightPromise) {
+  if (!forceRefresh && inflightPromise && cachedCookieKey === cookieKey) {
     return inflightPromise;
   }
+  cachedCookieKey = cookieKey;
 
   inflightPromise = (async () => {
-    const [codex, antigravity] = await Promise.all([
+    const [codex, antigravity, cursor] = await Promise.all([
       fetchCodexQuota(nowMs, { allowNetwork }),
       fetchAntigravityQuota(nowMs),
+      fetchCursorQuota(nowMs, { allowNetwork, cursorCookie }),
     ]);
-    const cursor = fetchCursorQuota();
     const codebuddy = fetchCodeBuddyQuota();
 
     const overviewWindows = [];
@@ -573,6 +817,14 @@ export async function getAllQuotas(nowMs = Date.now(), { forceRefresh = false, a
         subtitle: c5h.subtitle
           ? `${c5h.subtitle}${cWk ? ` · 每周 ${Math.round(cWk.remainingPct)}%` : ''}`
           : (cWk ? `每周剩余 ${Math.round(cWk.remainingPct)}%` : null),
+      });
+    }
+    if (cursor.quotaWindows.length > 0) {
+      const curWin = cursor.quotaWindows[0];
+      overviewWindows.push({
+        ...curWin,
+        id: 'overview-cursor',
+        title: 'Cursor',
       });
     }
     if (antigravity.quotaWindows.length > 0) {

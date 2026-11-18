@@ -1730,6 +1730,27 @@ test('TurnStore.getUsageSummary & /v1/usage aggregate today, 7d, byTool, byModel
 
     const resAll = await (await fetch(`${baseUrl}/v1/usage?days=all`)).json();
     assert.equal(resAll.totals.turnCount, 3);
+    assert.ok(Array.isArray(resAll.byProject) && resAll.byProject.length >= 1);
+
+    const cfgInlineOff = await (
+      await fetch(`${baseUrl}/v1/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inlineTools: { antigravity: false } }),
+      })
+    ).json();
+    assert.equal(cfgInlineOff.config.inlineTools.antigravity, false);
+    const matchOff = await (await fetch(`${baseUrl}/v1/match?tool=antigravity`)).json();
+    assert.equal(matchOff.disabled, true);
+    assert.equal(matchOff.turn, null);
+
+    await fetch(`${baseUrl}/v1/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inlineTools: { antigravity: true } }),
+    });
+    const matchOn = await (await fetch(`${baseUrl}/v1/match?tool=antigravity`)).json();
+    assert.ok(matchOn.turn);
 
     const stateRes = await (await fetch(`${baseUrl}/v1/state`)).json();
     assert.equal(stateRes.todaySummary.turnCount, 1);

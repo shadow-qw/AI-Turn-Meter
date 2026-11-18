@@ -503,6 +503,7 @@ export class TurnStore {
     const todayAcc = createUsageAccumulator();
     const toolMap = new Map();
     const modelMap = new Map();
+    const projectMap = new Map();
     const dailyMap = new Map();
 
     if (resolvedDays >= 1 && resolvedDays <= 90) {
@@ -530,6 +531,18 @@ export class TurnStore {
         modelMap.set(mKey, { tool: tKey, model: mName, acc: createUsageAccumulator() });
       }
       addTurnToAccumulator(modelMap.get(mKey).acc, row, customRates);
+
+      const rawWs = typeof row.workspace_path === 'string' ? row.workspace_path.trim() : '';
+      const projKey = rawWs || '__independent__';
+      if (!projectMap.has(projKey)) {
+        const name = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : 'Independent chats';
+        projectMap.set(projKey, {
+          name,
+          path: rawWs || '未绑定工作区目录',
+          acc: createUsageAccumulator(),
+        });
+      }
+      addTurnToAccumulator(projectMap.get(projKey).acc, row, customRates);
 
       const dayKey = toLocalDateKey(row.completed_at_ms);
       if (!dailyMap.has(dayKey)) dailyMap.set(dayKey, createUsageAccumulator());
@@ -574,6 +587,24 @@ export class TurnStore {
           (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
       );
 
+    const byProject = Array.from(projectMap.values())
+      .map(({ name, path, acc }) => {
+        const stats = finalizeAccumulator(acc);
+        return {
+          name,
+          path,
+          sharePct:
+            totals.totalTokens > 0
+              ? Number(((stats.totalTokens / totals.totalTokens) * 100).toFixed(1))
+              : 0,
+          ...stats,
+        };
+      })
+      .sort(
+        (a, b) =>
+          (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
+      );
+
     const daily = Array.from(dailyMap.entries())
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([date, acc]) => ({
@@ -592,6 +623,7 @@ export class TurnStore {
       totals,
       byTool,
       byModel,
+      byProject,
       daily,
       cards,
     };

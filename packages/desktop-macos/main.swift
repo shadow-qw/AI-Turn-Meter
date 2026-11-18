@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct TurnSummary: Decodable, Identifiable {
   var id: String { turnUid ?? "\(tool ?? "turn")-\(completedAtMs ?? 0)-\(inlineText ?? "")" }
@@ -170,6 +171,23 @@ struct CodexBarCardSnapshot: Decodable {
   let topModel: String?
 }
 
+struct UsageProjectRow: Decodable, Identifiable {
+  var id: String { "\(name)-\(path)" }
+  let name: String
+  let path: String
+  let sharePct: Double
+  let turnCount: Int
+  let callCount: Int
+  let totalInputTokens: Int
+  let cacheReadTokens: Int
+  let outputTokens: Int
+  let totalTokens: Int
+  let cacheRatePct: Double?
+  let avgTps: Double?
+  let estimatedCostUsd: Double?
+  let cacheSavingsUsd: Double?
+}
+
 struct UsageSummaryResponse: Decodable {
   let days: Int
   let tool: String?
@@ -177,6 +195,7 @@ struct UsageSummaryResponse: Decodable {
   let totals: UsageTotals
   let byTool: [UsageToolRow]
   let byModel: [UsageModelRow]
+  let byProject: [UsageProjectRow]?
   let daily: [UsageDailyPoint]
   let cards: [String: CodexBarCardSnapshot]?
 }
@@ -192,6 +211,9 @@ struct DaemonStateResponse: Decodable {
 struct MeterConfigPayload: Decodable {
   let enabled: Bool
   let tools: [String: Bool]
+  let inlineEnabled: Bool?
+  let inlineTools: [String: Bool]?
+  let hasCursorCookie: Bool?
 }
 
 struct StatusAppEntry: Decodable {
@@ -456,7 +478,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "aiTurnMeter.showRecentWindowsInMenu"
   }
 
-  @Published var version: String = "0.2.13"
+  @Published var version: String = "0.2.14"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -470,6 +492,16 @@ final class MeterViewModel: ObservableObject {
     "cursor": true,
     "codebuddy": true,
   ]
+  @Published var inlineMasterEnabled: Bool = true
+  @Published var inlineToolToggles: [String: Bool] = [
+    "antigravity": true,
+    "codex": true,
+    "cursor": true,
+    "codebuddy": true,
+  ]
+  @Published var hasCursorCookie: Bool = false
+  @Published var showCursorCookieSheet: Bool = false
+  @Published var cursorCookieDraft: String = ""
 
   @Published var showMenuBarExtra: Bool = UserDefaults.standard.object(forKey: PrefKey.showMenuBarExtra) as? Bool ?? true
   @Published var menuBarDisplayMode: MenuBarDisplayMode = {
@@ -547,6 +579,10 @@ final class MeterViewModel: ObservableObject {
 
   func isToolEnabled(_ key: String) -> Bool {
     toolToggles[key] ?? true
+  }
+
+  func isInlineToolEnabled(_ key: String) -> Bool {
+    inlineToolToggles[key] ?? true
   }
 
   func setShowMenuBarExtra(_ value: Bool) {
@@ -785,11 +821,20 @@ final class MeterViewModel: ObservableObject {
     self.recentTurnsByTool = grouped
   }
 
+  private func applyDaemonConfig(_ cfg: MeterConfigPayload) {
+    self.masterEnabled = cfg.enabled
+    for (k, v) in cfg.tools { self.toolToggles[k] = v }
+    if let ie = cfg.inlineEnabled { self.inlineMasterEnabled = ie }
+    if let it = cfg.inlineTools {
+      for (k, v) in it { self.inlineToolToggles[k] = v }
+    }
+    if let hasCookie = cfg.hasCursorCookie { self.hasCursorCookie = hasCookie }
+  }
+
   private func applyDaemonState(_ parsed: DaemonStateResponse) {
     self.lastSyncedAt = Date()
     if let cfg = parsed.config {
-      self.masterEnabled = cfg.enabled
-      for (k, v) in cfg.tools { self.toolToggles[k] = v }
+      applyDaemonConfig(cfg)
     }
     if let today = parsed.todaySummary {
       let prevTurns = self.todaySummary?.turnCount ?? -1
@@ -826,9 +871,11 @@ final class MeterViewModel: ObservableObject {
     }
   }
 
-  func fetchUsageSummary(silent: Bool = false) {
+  func fetchUsageSummary(silent: Bool = false, forceRefresh: Bool = false) {
+    let toolQs = usageToolFilter == "all" ? "" : "&tool=\(usageToolFilter)"
+    let refreshQs = forceRefresh ? "&refresh=1" : ""
     guard let url = URL(
-      string: "http://127.0.0.1:\(daemonPort)/v1/usage?days=\(usageDays)\(usageToolFilter == "all" ? "" : "&tool=\(usageToolFilter)")"
+      string: "http://127.0.0.1:\(daemonPort)/v1/usage?days=\(usageDays)\(toolQs)\(refreshQs)"
     ) else { return }
     if !silent { usageLoading = true }
     var req = URLRequest(url: url, timeoutInterval: 6)
@@ -882,8 +929,7 @@ final class MeterViewModel: ObservableObject {
     self.apps = st.apps
     self.lastSyncedAt = Date()
     if let cfg = st.config {
-      self.masterEnabled = cfg.enabled
-      for (k, v) in cfg.tools { self.toolToggles[k] = v }
+      applyDaemonConfig(cfg)
     }
     if let state = st.state {
       if let today = state.todaySummary {
@@ -981,6 +1027,63 @@ final class MeterViewModel: ObservableObject {
       body["enabled"] = true
     }
     postConfig(body, quietBanner: false, bannerText: "\(displayTitle(for: key)) 已\(enabled ? "开启" : "关闭")")
+  }
+
+  func setInlineMasterEnabled(_ enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    inlineMasterEnabled = enabled
+    postConfig(
+      ["inlineEnabled": enabled],
+      quietBanner: false,
+      bannerText: enabled ? "已开启软件内置 TPS 显示" : "已关闭软件内置 TPS 显示"
+    )
+  }
+
+  func setInlineToolEnabled(_ key: String, enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    inlineToolToggles[key] = enabled
+    var body: [String: Any] = ["inlineTools": [key: enabled]]
+    if enabled && !inlineMasterEnabled {
+      inlineMasterEnabled = true
+      body["inlineEnabled"] = true
+    }
+    postConfig(
+      body,
+      quietBanner: false,
+      bannerText: "\(displayTitle(for: key)) 内置 TPS 已\(enabled ? "开启" : "关闭")"
+    )
+  }
+
+  func saveCursorCookie(_ raw: String?) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    hasCursorCookie = !trimmed.isEmpty
+    postConfig(
+      ["cursorCookie": trimmed],
+      quietBanner: false,
+      bannerText: trimmed.isEmpty ? "已清除 Cursor 会话 Cookie" : "已保存 Cursor 会话 Cookie，正在同步额度…"
+    )
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+      self?.fetchUsageSummary(silent: false, forceRefresh: true)
+    }
+  }
+
+  func exportUsageCsv() {
+    guard let data = usageData else { return }
+    var lines = ["date,turns,total_input_tokens,output_tokens,total_tokens,estimated_cost_usd,cache_savings_usd"]
+    for pt in data.daily where pt.totalTokens > 0 || pt.turnCount > 0 {
+      let usdStr = pt.estimatedCostUsd.map { String(format: "%.6f", $0) } ?? ""
+      let savStr = pt.cacheSavingsUsd.map { String(format: "%.6f", $0) } ?? ""
+      lines.append("\(pt.date),\(pt.turnCount),\(pt.totalInputTokens),\(pt.outputTokens),\(pt.totalTokens),\(usdStr),\(savStr)")
+    }
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [.commaSeparatedText]
+    panel.nameFieldStringValue = "ai-turn-meter-usage-\(usageDays == 0 ? "all" : "\(usageDays)d").csv"
+    if panel.runModal() == .OK, let url = panel.url {
+      try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+      statusBanner = "已导出用量账单：\(url.lastPathComponent)"
+      bannerIsError = false
+    }
   }
 
   private func postConfig(_ bodyObj: [String: Any], quietBanner: Bool, bannerText: String = "") {
@@ -1615,6 +1718,42 @@ struct ContentView: View {
     .sheet(isPresented: $vm.showSshSheet) {
       RemoteSshSheetView(vm: vm)
     }
+    .sheet(isPresented: $vm.showCursorCookieSheet) {
+      VStack(alignment: .leading, spacing: 12) {
+        Text("配置 Cursor 会话 Cookie")
+          .font(.headline)
+        Text("在浏览器打开 cursor.com/dashboard?tab=usage，复制任意请求头中的 Cookie（含 WorkosCursorSessionToken）粘贴至此。")
+          .font(.system(size: 12))
+          .foregroundColor(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+        TextField("WorkosCursorSessionToken=user_...%3A%3AeyJ...", text: $vm.cursorCookieDraft)
+          .textFieldStyle(.roundedBorder)
+          .font(.system(size: 11.5, design: .monospaced))
+        HStack {
+          if let url = URL(string: "https://cursor.com/dashboard?tab=usage") {
+            Button("打开 Cursor 网页") { NSWorkspace.shared.open(url) }
+              .controlSize(.small)
+          }
+          if vm.hasCursorCookie {
+            Button("清除", role: .destructive) {
+              vm.showCursorCookieSheet = false
+              vm.saveCursorCookie(nil)
+            }
+            .controlSize(.small)
+          }
+          Spacer()
+          Button("取消") { vm.showCursorCookieSheet = false }
+          Button("保存") {
+            let val = vm.cursorCookieDraft
+            vm.showCursorCookieSheet = false
+            vm.saveCursorCookie(val)
+          }
+          .buttonStyle(.borderedProminent)
+        }
+      }
+      .padding(18)
+      .frame(width: 460)
+    }
     .sheet(isPresented: $vm.showUpdateSheet) {
       VStack(alignment: .leading, spacing: 14) {
         Text("检查软件更新")
@@ -1761,7 +1900,7 @@ private struct ProviderSettingsDetailView: View {
 
             Button {
               vm.refreshDoctorAndBootstrap()
-              vm.fetchUsageSummary()
+              vm.fetchUsageSummary(forceRefresh: true)
             } label: {
               Image(systemName: "arrow.clockwise")
                 .font(.system(size: 12))
@@ -1809,12 +1948,47 @@ private struct ProviderSettingsDetailView: View {
           .padding(.horizontal, 14)
           .padding(.vertical, 10)
 
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "软件内置 TPS 显示") {
+            Toggle("", isOn: Binding(
+              get: { installed && vm.inlineMasterEnabled && vm.isInlineToolEnabled(key) && vm.isActiveOverall },
+              set: { vm.setInlineToolEnabled(key, enabled: $0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .controlSize(.small)
+            .disabled(!installed || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
+          }
+
           if card?.accountEmail != nil || card?.planTitle != nil {
             Divider().padding(.leading, 14)
             settingsKVRow(
               title: "账户",
               value: [card?.accountEmail, card?.planTitle].compactMap { $0 }.joined(separator: " · ")
             )
+          }
+
+          if key == "cursor" {
+            Divider().padding(.leading, 14)
+            HStack(spacing: 8) {
+              Text("会话 Cookie")
+                .font(.system(size: 12.5))
+              Spacer()
+              if let url = URL(string: "https://cursor.com/dashboard?tab=usage") {
+                Button("打开网页") { NSWorkspace.shared.open(url) }
+                  .buttonStyle(.borderless)
+                  .font(.system(size: 12))
+                  .foregroundColor(CodexBarPalette.accentBlue)
+              }
+              Button(vm.hasCursorCookie ? "已配置 · 修改" : "配置…") {
+                vm.cursorCookieDraft = ""
+                vm.showCursorCookieSheet = true
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.mini)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
           }
 
           if let turn = latestTurn {
@@ -1949,6 +2123,17 @@ private struct GeneralSettingsPaneView: View {
             .toggleStyle(.switch)
             .labelsHidden()
             .disabled(vm.busy || vm.runtime.runningFromDmg)
+          }
+
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "软件内置 TPS 显示") {
+            Toggle("", isOn: Binding(
+              get: { vm.inlineMasterEnabled },
+              set: { vm.setInlineMasterEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .disabled(!vm.masterEnabled || vm.busy || vm.runtime.runningFromDmg)
           }
 
           Divider().padding(.leading, 14)
@@ -2146,31 +2331,42 @@ private struct AboutSettingsPaneView: View {
 struct UsageSummaryTabView: View {
   @ObservedObject var vm: MeterViewModel
   @State private var hoveredDay: UsageDailyPoint? = nil
-  @State private var heroHovered = false
   @State private var hoveredPeriod: Int? = nil
   @State private var hoveredToolChip: String? = nil
-  @State private var hoveredGroupMode: String? = nil
+  @State private var chartMetric: String = "cost"
 
   private let dayOptions: [(Int, String)] = [
     (1, "今日"),
-    (7, "近 7 天"),
-    (30, "近 30 天"),
+    (7, "7 天"),
+    (30, "30 天"),
+    (90, "90 天"),
     (0, "全部"),
   ]
 
+  private let groupTabs: [(String, String)] = [
+    ("tool", "提供商"),
+    ("model", "模型"),
+    ("project", "项目"),
+    ("daily", "每日账单"),
+  ]
+
   private var selectedPeriodTitle: String {
-    dayOptions.first(where: { $0.0 == vm.usageDays })?.1 ?? "近 \(vm.usageDays) 天"
+    dayOptions.first(where: { $0.0 == vm.usageDays })?.1 ?? "\(vm.usageDays) 天"
   }
 
   private var selectedToolLabel: String {
-    vm.usageToolFilter == "all" ? "全部客户端" : vm.displayTitle(for: vm.usageToolFilter)
+    vm.usageToolFilter == "all" ? "全部提供商" : vm.displayTitle(for: vm.usageToolFilter)
+  }
+
+  private func dayMetricValue(_ pt: UsageDailyPoint) -> Double {
+    chartMetric == "cost" ? max(0, pt.estimatedCostUsd ?? 0) : Double(max(0, pt.totalTokens))
   }
 
   var body: some View {
-    VStack(spacing: 11) {
-      // Modern Capsule Filters Row
+    VStack(spacing: 12) {
+      // Top Range + Tool Filters + Export
       HStack(spacing: 8) {
-        HStack(spacing: 3) {
+        HStack(spacing: 2) {
           ForEach(dayOptions, id: \.0) { opt in
             let active = vm.usageDays == opt.0
             let hovered = hoveredPeriod == opt.0
@@ -2179,21 +2375,21 @@ struct UsageSummaryTabView: View {
               vm.fetchUsageSummary()
             }
             .buttonStyle(.plain)
-            .font(.system(size: 11, weight: active ? .semibold : .medium))
-            .foregroundColor(hovered ? .white : (active ? .primary : .secondary))
-            .padding(.horizontal, 9)
-            .padding(.vertical, 4.5)
-            .background(hovered ? CodexBarPalette.accentBlue : (active ? Color.primary.opacity(0.10) : Color.clear))
-            .clipShape(Capsule())
+            .font(.system(size: 11, weight: active ? .medium : .regular))
+            .foregroundColor(active ? .primary : (hovered ? .primary : .secondary))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(active ? Color.primary.opacity(0.10) : (hovered ? Color.primary.opacity(0.05) : Color.clear))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             .onHover { inside in
               if inside { hoveredPeriod = opt.0 }
               else if hoveredPeriod == opt.0 { hoveredPeriod = nil }
             }
           }
         }
-        .padding(3)
-        .background(Color.primary.opacity(0.06))
-        .clipShape(Capsule())
+        .padding(2)
+        .background(Color.primary.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
         Spacer()
 
@@ -2208,260 +2404,245 @@ struct UsageSummaryTabView: View {
 
         if vm.usageLoading {
           ProgressView().controlSize(.small)
+        } else {
+          Button {
+            vm.fetchUsageSummary(forceRefresh: true)
+          } label: {
+            Image(systemName: "arrow.clockwise")
+              .font(.system(size: 11.5))
+              .foregroundColor(.secondary)
+          }
+          .buttonStyle(.borderless)
+          .help("刷新")
         }
+
+        Button("导出") {
+          vm.exportUsageCsv()
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.mini)
+        .disabled(vm.usageData == nil)
       }
 
       if let data = vm.usageData {
         ScrollView {
-          VStack(spacing: 11) {
-            // CodexBar-style Hero Card (neutral by default, blue gradient on hover)
-            VStack(alignment: .leading, spacing: 14) {
-              HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                  HStack(spacing: 6) {
-                    Text(selectedToolLabel)
-                      .font(.system(size: 14, weight: .bold))
-                      .foregroundColor(heroHovered ? .white : .primary)
-                    Text("·")
-                      .foregroundColor(heroHovered ? .white.opacity(0.55) : .secondary.opacity(0.6))
-                    Text(selectedPeriodTitle)
+          VStack(alignment: .leading, spacing: 14) {
+            // Hero Spend & Token Mix Card
+            SettingsGroupCard {
+              VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline) {
+                  VStack(alignment: .leading, spacing: 2) {
+                    Text("\(selectedToolLabel) · \(selectedPeriodTitle)")
                       .font(.system(size: 12.5, weight: .medium))
-                      .foregroundColor(heroHovered ? .white.opacity(0.86) : .secondary)
-                  }
-                  Text("按模型官方 API 单价估算 · 本地离线统计，非订阅账单")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(heroHovered ? .white.opacity(0.72) : .secondary)
-                }
-                Spacer()
-                Text(vm.relativeUpdateLabel())
-                  .font(.system(size: 10.5, weight: .medium))
-                  .foregroundColor(heroHovered ? .white.opacity(0.9) : .secondary)
-                  .padding(.horizontal, 8)
-                  .padding(.vertical, 3)
-                  .background(heroHovered ? Color.white.opacity(0.16) : Color.primary.opacity(0.06))
-                  .clipShape(Capsule())
-              }
-
-              HStack(alignment: .center, spacing: 14) {
-                VStack(alignment: .leading, spacing: 5) {
-                  Text("API 等效估算费用")
-                    .font(.system(size: 11))
-                    .foregroundColor(heroHovered ? .white.opacity(0.78) : .secondary)
-                  Text(MeterFormat.usd(data.totals.estimatedCostUsd))
-                    .font(.system(size: 30, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundColor(heroHovered ? .white : .primary)
-                    .minimumScaleFactor(0.7)
-                    .lineLimit(1)
-
-                  HStack(spacing: 8) {
-                    if let saved = data.totals.cacheSavingsUsd, saved > 0 {
-                      Text("缓存节省 \(MeterFormat.usd(saved))")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(heroHovered ? .white.opacity(0.92) : .secondary)
-                    } else if data.totals.unpricedTurnCount > 0 {
-                      Text("含 \(data.totals.unpricedTurnCount) 轮未定价模型")
-                        .font(.system(size: 11))
-                        .foregroundColor(heroHovered ? .white.opacity(0.8) : .secondary)
-                    } else {
-                      Text("共 \(data.totals.turnCount) 轮对话")
-                        .font(.system(size: 11))
-                        .foregroundColor(heroHovered ? .white.opacity(0.85) : .secondary)
-                    }
-                  }
-                }
-                .frame(minWidth: 165, alignment: .leading)
-
-                Spacer(minLength: 4)
-
-                VStack(spacing: 7) {
-                  HStack(spacing: 7) {
-                    heroTile(
-                      title: "总 Token",
-                      value: MeterFormat.tokens(data.totals.totalTokens),
-                      sub: "入 \(MeterFormat.tokens(data.totals.totalInputTokens)) · 出 \(MeterFormat.tokens(data.totals.outputTokens))"
-                    )
-                    heroTile(
-                      title: "平均缓存命中",
-                      value: MeterFormat.pct(data.totals.cacheRatePct),
-                      sub: "\(data.totals.turnCount) 轮 · \(data.totals.callCount) 次"
-                    )
-                  }
-                  HStack(spacing: 7) {
-                    heroTile(
-                      title: "平均输出速度",
-                      value: MeterFormat.tps(data.totals.avgTps),
-                      sub: "基于模型流式采样"
-                    )
-                    heroTile(
-                      title: "今日已消耗",
-                      value: MeterFormat.usd(data.today.estimatedCostUsd),
-                      sub: "\(MeterFormat.tokens(data.today.totalTokens)) token"
-                    )
-                  }
-                }
-              }
-            }
-            .padding(14)
-            .background(
-              Group {
-                if heroHovered {
-                  LinearGradient(
-                    colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                  )
-                } else {
-                  Color(nsColor: .controlBackgroundColor)
-                }
-              }
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-            .overlay(
-              RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .stroke(heroHovered ? Color.clear : Color.primary.opacity(0.08), lineWidth: 1)
-            )
-            .onHover { heroHovered = $0 }
-
-            // Daily Trend Bars (Hover Interactive)
-            if !data.daily.isEmpty {
-              let visibleDays = Array(data.daily.suffix(14))
-              let maxTok = max(1, visibleDays.map(\.totalTokens).max() ?? 1)
-              let maxUsd = visibleDays.compactMap(\.estimatedCostUsd).max() ?? 0
-
-              VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                  Text("每日用量趋势")
-                    .font(.system(size: 12, weight: .semibold))
-                  Spacer()
-                  if let pt = hoveredDay {
-                    Text("\(pt.date) · \(MeterFormat.usd(pt.estimatedCostUsd)) · \(MeterFormat.tokens(pt.totalTokens)) (\(pt.turnCount) 轮)")
-                      .font(.system(size: 11, weight: .semibold))
+                      .foregroundColor(.secondary)
+                    Text(MeterFormat.usd(data.totals.estimatedCostUsd))
+                      .font(.system(size: 28, weight: .bold))
                       .monospacedDigit()
-                      .foregroundColor(CodexBarPalette.accentBlue)
-                  } else {
-                    Text(maxUsd > 0 ? "日峰值 \(MeterFormat.usd(maxUsd)) · 悬停柱条查看详情" : "悬停柱条查看单日明细")
-                      .font(.system(size: 10.5))
+                  }
+                  Spacer()
+                  if let saved = data.totals.cacheSavingsUsd, saved > 0 {
+                    Text("缓存节省 \(MeterFormat.usd(saved))")
+                      .font(.system(size: 11.5))
+                      .monospacedDigit()
                       .foregroundColor(.secondary)
                   }
                 }
 
-                HStack(alignment: .bottom, spacing: 6) {
-                  ForEach(visibleDays) { pt in
-                    let frac = CGFloat(pt.totalTokens) / CGFloat(maxTok)
-                    let isHovered = hoveredDay?.id == pt.id
-                    VStack(spacing: 3) {
-                      if pt.totalTokens > 0 {
-                        Text(MeterFormat.usd(pt.estimatedCostUsd))
-                          .font(.system(size: 9))
-                          .monospacedDigit()
-                          .foregroundColor(isHovered ? CodexBarPalette.accentBlue : .secondary)
-                          .lineLimit(1)
-                      }
-                      RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(
-                          pt.totalTokens > 0
-                            ? LinearGradient(
-                                colors: isHovered
-                                  ? [CodexBarPalette.accentBlue, CodexBarPalette.cardTop]
-                                  : [CodexBarPalette.cardTop.opacity(0.85), CodexBarPalette.cardBottom.opacity(0.75)],
-                                startPoint: .top,
-                                endPoint: .bottom
-                              )
-                            : LinearGradient(
-                                colors: [Color.primary.opacity(0.08), Color.primary.opacity(0.08)],
-                                startPoint: .top,
-                                endPoint: .bottom
-                              )
-                        )
-                        .frame(height: max(4, frac * 60))
-                      Text(MeterFormat.shortDate(pt.date))
-                        .font(.system(size: 9.5, weight: isHovered ? .semibold : .regular))
-                        .foregroundColor(isHovered ? .primary : .secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .contentShape(Rectangle())
-                    .onHover { hovering in
-                      if hovering { hoveredDay = pt }
-                      else if hoveredDay?.id == pt.id { hoveredDay = nil }
-                    }
-                  }
+                Divider()
+
+                HStack(spacing: 0) {
+                  summaryCol(title: "总 Token", value: MeterFormat.tokens(data.totals.totalTokens))
+                  summaryCol(title: "输入", value: MeterFormat.tokens(data.totals.totalInputTokens))
+                  summaryCol(title: "缓存率", value: MeterFormat.pct(data.totals.cacheRatePct))
+                  summaryCol(title: "输出", value: MeterFormat.tokens(data.totals.outputTokens))
+                  summaryCol(title: "今日", value: MeterFormat.usd(data.today.estimatedCostUsd))
                 }
-                .frame(height: 94, alignment: .bottom)
               }
-              .padding(12)
-              .background(Color(nsColor: .controlBackgroundColor))
-              .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-              .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                  .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-              )
+              .padding(14)
             }
 
-            // Breakdown Card: Ranked by Model or Client
-            VStack(alignment: .leading, spacing: 10) {
-              HStack {
-                HStack(spacing: 3) {
-                  groupModeButton(id: "model", label: "按模型排行")
-                  groupModeButton(id: "tool", label: "按客户端占比")
-                }
-                .padding(3)
-                .background(Color.primary.opacity(0.06))
-                .clipShape(Capsule())
+            // Historical Daily Trend Card (Supports up to 90 bars + cost/token scale)
+            if !data.daily.isEmpty {
+              let visibleDays = Array(data.daily.suffix(90))
+              let maxVal = max(0.000001, visibleDays.map(dayMetricValue).max() ?? 0)
+              let peakDate = visibleDays.max(by: { dayMetricValue($0) < dayMetricValue($1) })?.date
 
-                Spacer()
-                Text("支持 ~/.local/share/ai-turn-meter/custom-pricing.json 自定义单价")
+              SettingsGroupCard {
+                VStack(alignment: .leading, spacing: 10) {
+                  HStack {
+                    if let pt = hoveredDay {
+                      Text("\(pt.date) · \(MeterFormat.usd(pt.estimatedCostUsd)) · \(MeterFormat.tokens(pt.totalTokens)) · \(pt.turnCount) 轮")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundColor(.primary)
+                    } else {
+                      let peakUsd = visibleDays.compactMap(\.estimatedCostUsd).max() ?? 0
+                      let peakTok = visibleDays.map(\.totalTokens).max() ?? 0
+                      Text("日峰值 \(chartMetric == "cost" ? MeterFormat.usd(peakUsd) : MeterFormat.tokens(peakTok))")
+                        .font(.system(size: 11.5))
+                        .monospacedDigit()
+                        .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Picker("", selection: $chartMetric) {
+                      Text("费用").tag("cost")
+                      Text("Token").tag("tokens")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.mini)
+                    .frame(width: 100)
+                  }
+
+                  VStack(spacing: 0) {
+                    HStack(alignment: .bottom, spacing: 2) {
+                      ForEach(visibleDays) { pt in
+                        let val = dayMetricValue(pt)
+                        let frac = val > 0 ? CGFloat(val / maxVal) : 0
+                        let isHov = hoveredDay?.id == pt.id
+                        let isPeak = val > 0 && pt.date == peakDate
+
+                        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                          .fill(
+                            val > 0
+                              ? (isHov ? CodexBarPalette.accentBlue : CodexBarPalette.tealBar)
+                              : Color.primary.opacity(0.08)
+                          )
+                          .frame(maxWidth: .infinity)
+                          .frame(height: val > 0 ? max(4, frac * 68) : 2)
+                          .overlay(alignment: .top) {
+                            if isPeak {
+                              RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                                .fill(Color(nsColor: .systemYellow))
+                                .frame(height: 3)
+                            }
+                          }
+                          .contentShape(Rectangle())
+                          .onHover { inside in
+                            if inside { hoveredDay = pt }
+                            else if hoveredDay?.id == pt.id { hoveredDay = nil }
+                          }
+                      }
+                    }
+                    .frame(height: 70, alignment: .bottom)
+
+                    Rectangle()
+                      .fill(Color.primary.opacity(0.10))
+                      .frame(height: 1)
+                  }
+
+                  HStack {
+                    if let first = visibleDays.first {
+                      Text(MeterFormat.shortDate(first.date))
+                    }
+                    Spacer()
+                    if let last = visibleDays.last {
+                      Text(MeterFormat.shortDate(last.date))
+                    }
+                  }
                   .font(.system(size: 10))
                   .foregroundColor(.secondary)
-              }
-
-              if vm.usageGroupMode == "tool" {
-                if data.byTool.isEmpty {
-                  emptyTip("所选周期内暂无统计记录")
-                } else {
-                  ForEach(Array(data.byTool.enumerated()), id: \.element.id) { idx, row in
-                    breakdownRow(
-                      rank: idx + 1,
-                      color: vm.toolAccentColor(for: row.tool),
-                      title: row.toolLabel,
-                      badge: "\(String(format: "%.1f", row.sharePct))%",
-                      share: row.sharePct / 100.0,
-                      detail: "\(row.turnCount) 轮 · \(row.callCount) 次 · 入 \(MeterFormat.tokens(row.totalInputTokens)) (缓存 \(MeterFormat.pct(row.cacheRatePct))) · 出 \(MeterFormat.tokens(row.outputTokens)) · \(MeterFormat.tps(row.avgTps))",
-                      costText: MeterFormat.usd(row.estimatedCostUsd)
-                    )
-                  }
                 }
-              } else {
-                if data.byModel.isEmpty {
-                  emptyTip("所选周期内暂无模型记录")
-                } else {
-                  ForEach(Array(data.byModel.prefix(15).enumerated()), id: \.element.id) { idx, row in
-                    breakdownRow(
-                      rank: idx + 1,
-                      color: vm.toolAccentColor(for: row.tool),
-                      title: row.model,
-                      badge: row.toolLabel,
-                      share: row.sharePct / 100.0,
-                      detail: "\(row.turnCount) 轮 · \(row.callCount) 次 · 入 \(MeterFormat.tokens(row.totalInputTokens)) (缓存 \(MeterFormat.pct(row.cacheRatePct))) · 出 \(MeterFormat.tokens(row.outputTokens)) · \(MeterFormat.tps(row.avgTps))",
-                      costText: row.priced ? MeterFormat.usd(row.estimatedCostUsd) : "未定价"
-                    )
-                  }
-                }
+                .padding(14)
               }
             }
-            .padding(12)
-            .background(Color(nsColor: .controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-              RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-            )
+
+            // 4-Dimension Historical Breakdown (Providers / Models / Projects / Daily Ledger)
+            SettingsGroupCard {
+              VStack(alignment: .leading, spacing: 10) {
+                Picker("", selection: $vm.usageGroupMode) {
+                  ForEach(groupTabs, id: \.0) { t in
+                    Text(t.1).tag(t.0)
+                  }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(maxWidth: 320, alignment: .leading)
+
+                Divider()
+
+                switch vm.usageGroupMode {
+                case "tool":
+                  if data.byTool.isEmpty {
+                    emptyTip("暂无记录")
+                  } else {
+                    ForEach(Array(data.byTool.enumerated()), id: \.element.id) { idx, row in
+                      if idx > 0 { Divider() }
+                      breakdownRow(
+                        title: row.toolLabel,
+                        subtitle: "\(row.turnCount) 轮 · \(MeterFormat.tokens(row.totalTokens)) · 缓存 \(MeterFormat.pct(row.cacheRatePct))",
+                        share: row.sharePct / 100.0,
+                        costText: MeterFormat.usd(row.estimatedCostUsd)
+                      )
+                    }
+                  }
+                case "project":
+                  let projs = data.byProject ?? []
+                  if projs.isEmpty {
+                    emptyTip("暂无项目记录")
+                  } else {
+                    ForEach(Array(projs.enumerated()), id: \.element.id) { idx, row in
+                      if idx > 0 { Divider() }
+                      breakdownRow(
+                        title: row.name,
+                        subtitle: "\(row.path) · \(row.turnCount) 轮 · \(MeterFormat.tokens(row.totalTokens))",
+                        share: row.sharePct / 100.0,
+                        costText: MeterFormat.usd(row.estimatedCostUsd)
+                      )
+                    }
+                  }
+                case "daily":
+                  let activeDays = Array(data.daily.filter { $0.totalTokens > 0 || $0.turnCount > 0 }.reversed())
+                  if activeDays.isEmpty {
+                    emptyTip("暂无每日明细")
+                  } else {
+                    ForEach(Array(activeDays.enumerated()), id: \.element.id) { idx, pt in
+                      if idx > 0 { Divider() }
+                      HStack {
+                        Text(pt.date)
+                          .font(.system(size: 12, weight: .medium))
+                          .monospacedDigit()
+                        Text("\(pt.turnCount) 轮")
+                          .font(.system(size: 11))
+                          .foregroundColor(.secondary)
+                        Spacer()
+                        Text("入 \(MeterFormat.tokens(pt.totalInputTokens)) · 出 \(MeterFormat.tokens(pt.outputTokens))")
+                          .font(.system(size: 11))
+                          .monospacedDigit()
+                          .foregroundColor(.secondary)
+                        Text(MeterFormat.usd(pt.estimatedCostUsd))
+                          .font(.system(size: 12.5, weight: .semibold))
+                          .monospacedDigit()
+                          .frame(width: 72, alignment: .trailing)
+                      }
+                      .padding(.vertical, 6)
+                    }
+                  }
+                default:
+                  if data.byModel.isEmpty {
+                    emptyTip("暂无模型记录")
+                  } else {
+                    ForEach(Array(data.byModel.enumerated()), id: \.element.id) { idx, row in
+                      if idx > 0 { Divider() }
+                      breakdownRow(
+                        title: row.model,
+                        subtitle: "\(row.toolLabel) · \(row.turnCount) 轮 · \(MeterFormat.tokens(row.totalTokens))",
+                        share: row.sharePct / 100.0,
+                        costText: row.priced ? MeterFormat.usd(row.estimatedCostUsd) : "未定价"
+                      )
+                    }
+                  }
+                }
+              }
+              .padding(14)
+            }
           }
-          .padding(.bottom, 4)
+          .padding(.bottom, 8)
         }
       } else {
         Spacer()
-        Text(vm.usageLoading ? "正在加载统计数据…" : "暂无统计数据")
+        Text(vm.usageLoading ? "正在加载…" : "暂无统计数据")
           .font(.system(size: 12.5))
           .foregroundColor(.secondary)
         Spacer()
@@ -2469,138 +2650,81 @@ struct UsageSummaryTabView: View {
     }
   }
 
+  private func summaryCol(title: String, value: String) -> some View {
+    VStack(alignment: .leading, spacing: 2) {
+      Text(title)
+        .font(.system(size: 10.5))
+        .foregroundColor(.secondary)
+      Text(value)
+        .font(.system(size: 13.5, weight: .semibold))
+        .monospacedDigit()
+        .lineLimit(1)
+        .minimumScaleFactor(0.8)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
   private func filterChip(key: String, label: String) -> some View {
     let active = vm.usageToolFilter == key
     let hovered = hoveredToolChip == key
-    let color = vm.toolAccentColor(for: key)
-    return Button {
+    return Button(label) {
       vm.usageToolFilter = key
       vm.fetchUsageSummary()
-    } label: {
-      HStack(spacing: 4) {
-        if key != "all" {
-          Circle().fill(hovered ? Color.white : color).frame(width: 6, height: 6)
-        }
-        Text(label)
-          .font(.system(size: 11, weight: active ? .semibold : .medium))
-      }
-      .foregroundColor(hovered ? .white : (active ? .primary : .primary.opacity(0.82)))
-      .padding(.horizontal, 9)
-      .padding(.vertical, 4.5)
-      .background(hovered ? color : (active ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05)))
-      .clipShape(Capsule())
     }
     .buttonStyle(.plain)
+    .font(.system(size: 11, weight: active ? .medium : .regular))
+    .foregroundColor(active ? .primary : (hovered ? .primary : .secondary))
+    .padding(.horizontal, 8)
+    .padding(.vertical, 4)
+    .background(active ? Color.primary.opacity(0.10) : (hovered ? Color.primary.opacity(0.05) : Color.clear))
+    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     .onHover { inside in
       if inside { hoveredToolChip = key }
       else if hoveredToolChip == key { hoveredToolChip = nil }
     }
   }
 
-  private func groupModeButton(id: String, label: String) -> some View {
-    let active = vm.usageGroupMode == id
-    let hovered = hoveredGroupMode == id
-    return Button(label) {
-      vm.usageGroupMode = id
-    }
-    .buttonStyle(.plain)
-    .font(.system(size: 11, weight: active ? .semibold : .medium))
-    .foregroundColor(hovered ? .white : (active ? .primary : .secondary))
-    .padding(.horizontal, 10)
-    .padding(.vertical, 4)
-    .background(hovered ? CodexBarPalette.accentBlue : (active ? Color.primary.opacity(0.10) : Color.clear))
-    .clipShape(Capsule())
-    .onHover { inside in
-      if inside { hoveredGroupMode = id }
-      else if hoveredGroupMode == id { hoveredGroupMode = nil }
-    }
-  }
-
-  private func heroTile(title: String, value: String, sub: String) -> some View {
-    VStack(alignment: .leading, spacing: 2.5) {
-      Text(title)
-        .font(.system(size: 10))
-        .foregroundColor(heroHovered ? .white.opacity(0.75) : .secondary)
-      Text(value)
-        .font(.system(size: 14, weight: .bold))
-        .monospacedDigit()
-        .foregroundColor(heroHovered ? .white : .primary)
-        .lineLimit(1)
-        .minimumScaleFactor(0.8)
-      Text(sub)
-        .font(.system(size: 9.5))
-        .foregroundColor(heroHovered ? .white.opacity(0.72) : .secondary)
-        .lineLimit(1)
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(.horizontal, 10)
-    .padding(.vertical, 7)
-    .background(heroHovered ? Color.white.opacity(0.14) : Color.primary.opacity(0.045))
-    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-  }
-
   private func breakdownRow(
-    rank: Int,
-    color: Color,
     title: String,
-    badge: String,
+    subtitle: String,
     share: Double,
-    detail: String,
     costText: String
   ) -> some View {
-    VStack(alignment: .leading, spacing: 5) {
-      HStack(spacing: 6) {
-        Text("#\(rank)")
-          .font(.system(size: 10, weight: .bold))
-          .monospacedDigit()
-          .foregroundColor(rank <= 3 ? color : .secondary)
-          .frame(width: 22, alignment: .leading)
-
-        Circle()
-          .fill(color)
-          .frame(width: 7, height: 7)
-
+    VStack(alignment: .leading, spacing: 4) {
+      HStack {
         Text(title)
-          .font(.system(size: 12, weight: .semibold))
+          .font(.system(size: 12, weight: .medium))
           .lineLimit(1)
-
-        Text(badge)
-          .font(.system(size: 10, weight: .medium))
-          .foregroundColor(color)
-          .padding(.horizontal, 6)
-          .padding(.vertical, 1.5)
-          .background(color.opacity(0.12))
-          .clipShape(Capsule())
-
+          .truncationMode(.middle)
         Spacer()
-
         Text(costText)
-          .font(.system(size: 12.5, weight: .bold))
+          .font(.system(size: 12.5, weight: .semibold))
           .monospacedDigit()
       }
 
       GeometryReader { geo in
         ZStack(alignment: .leading) {
-          Capsule().fill(Color.primary.opacity(0.08))
+          Capsule().fill(Color.primary.opacity(0.07))
           Capsule()
-            .fill(color.opacity(0.85))
+            .fill(CodexBarPalette.tealBar)
             .frame(width: max(4, geo.size.width * CGFloat(min(1, max(0, share)))))
         }
       }
-      .frame(height: 5.5)
+      .frame(height: 4)
 
-      Text(detail)
+      Text(subtitle)
         .font(.system(size: 10.5))
         .foregroundColor(.secondary)
         .monospacedDigit()
         .lineLimit(1)
+        .truncationMode(.middle)
     }
-    .padding(.vertical, 4)
+    .padding(.vertical, 6)
   }
 
   private func emptyTip(_ msg: String) -> some View {
     Text(msg)
-      .font(.system(size: 11.5))
+      .font(.system(size: 12))
       .foregroundColor(.secondary)
       .frame(maxWidth: .infinity, alignment: .center)
       .padding(.vertical, 18)

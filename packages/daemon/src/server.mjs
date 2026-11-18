@@ -17,21 +17,43 @@ function loadMeterConfig(configPath) {
   const defaults = {
     enabled: true,
     tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    inlineEnabled: true,
+    inlineTools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    cursorCookie: null,
   };
   if (!configPath || !existsSync(configPath)) return defaults;
   try {
     const raw = JSON.parse(readFileSync(configPath, 'utf8'));
     const tools = { ...defaults.tools };
+    const inlineTools = { ...defaults.inlineTools };
     for (const k of TOOL_KEYS) {
       if (typeof raw?.tools?.[k] === 'boolean') tools[k] = raw.tools[k];
+      if (typeof raw?.inlineTools?.[k] === 'boolean') inlineTools[k] = raw.inlineTools[k];
     }
+    const cursorCookie =
+      typeof raw?.cursorCookie === 'string' && raw.cursorCookie.trim()
+        ? raw.cursorCookie.trim()
+        : null;
     return {
       enabled: typeof raw?.enabled === 'boolean' ? raw.enabled : true,
       tools,
+      inlineEnabled: typeof raw?.inlineEnabled === 'boolean' ? raw.inlineEnabled : true,
+      inlineTools,
+      cursorCookie,
     };
   } catch {
     return defaults;
   }
+}
+
+function publicConfig(cfg) {
+  return {
+    enabled: cfg.enabled,
+    tools: cfg.tools,
+    inlineEnabled: cfg.inlineEnabled !== false,
+    inlineTools: cfg.inlineTools,
+    hasCursorCookie: Boolean(cfg.cursorCookie && cfg.cursorCookie.trim()),
+  };
 }
 
 export function createMeterServer({
@@ -56,6 +78,12 @@ export function createMeterServer({
     return config.tools[tool] !== false;
   }
 
+  function isInlineEnabled(tool) {
+    if (!config.enabled || config.inlineEnabled === false) return false;
+    if (!tool) return true;
+    return config.tools[tool] !== false && config.inlineTools[tool] !== false;
+  }
+
   function persistConfig() {
     if (!configPath) return;
     mkdirSync(dirname(configPath), { recursive: true });
@@ -77,13 +105,13 @@ export function createMeterServer({
 
   function onTurnsChanged(records) {
     if (!records || records.length === 0) return;
-    const state = { ...store.getState(), config };
+    const state = { ...store.getState(), config: publicConfig(config) };
     broadcast('state', state);
     for (const r of records) {
       broadcast('turn', r);
     }
     if (cdpInjector) {
-      const changedTools = [...new Set(records.map((r) => r.tool))].filter((t) => isToolEnabled(t));
+      const changedTools = [...new Set(records.map((r) => r.tool))].filter((t) => isInlineEnabled(t));
       if (changedTools.length > 0) {
         cdpInjector.pushAll({ force: true, tools: changedTools }).catch(() => {});
       }
@@ -100,7 +128,7 @@ export function createMeterServer({
 
   if (enableCdp) {
     cdpInjector = new CdpInlineInjector({
-      shouldPushTool: (tool) => isToolEnabled(tool),
+      shouldPushTool: (tool) => isInlineEnabled(tool),
       getTurnsForTool: (tool) => {
         const recent = store.getRecentTurns(60, tool);
         if (tool === 'antigravity') {
@@ -125,13 +153,13 @@ export function createMeterServer({
     if (req.method === 'GET' && url.pathname === '/v1/state') {
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ...store.getState(limit), config }));
+      res.end(JSON.stringify({ ...store.getState(limit), config: publicConfig(config) }));
       return;
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/config') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(config));
+      res.end(JSON.stringify(publicConfig(config)));
       return;
     }
 
@@ -152,8 +180,11 @@ export function createMeterServer({
             ? Math.max(1, Math.round(Number(rawDays) || 7))
             : 7;
       const tool = url.searchParams.get('tool') || null;
+      const forceRefresh = url.searchParams.get('refresh') === '1';
       const sendUsage = async () => {
-        const quotasByTool = enableQuotaProbe ? await getAllQuotas().catch(() => null) : null;
+        const quotasByTool = enableQuotaProbe
+          ? await getAllQuotas(Date.now(), { forceRefresh, cursorCookie: config.cursorCookie }).catch(() => null)
+          : null;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(store.getUsageSummary({ days, tool, quotasByTool })));
       };
@@ -170,7 +201,7 @@ export function createMeterServer({
       const tool = url.searchParams.get('tool') || null;
       const workspacePath = url.searchParams.get('workspace') || null;
       const workspaceHash = url.searchParams.get('workspaceHash') || null;
-      if (!config.enabled || (tool && !isToolEnabled(tool))) {
+      if (!isInlineEnabled(tool)) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ turn: null, disabled: true }));
         return;
@@ -188,7 +219,7 @@ export function createMeterServer({
         Connection: 'keep-alive',
       });
       sseClients.add(res);
-      res.write(`event: state\ndata: ${JSON.stringify({ ...store.getState(), config })}\n\n`);
+      res.write(`event: state\ndata: ${JSON.stringify({ ...store.getState(), config: publicConfig(config) })}\n\n`);
       const keepAlive = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -224,30 +255,43 @@ export function createMeterServer({
         try {
           const payload = JSON.parse(body);
           if (url.pathname === '/v1/config') {
-            const prevEnabled = config.enabled;
-            const prevTools = { ...config.tools };
+            const prevInline = Object.fromEntries(TOOL_KEYS.map((k) => [k, isInlineEnabled(k)]));
+            let refreshQuota = false;
             if (typeof payload?.enabled === 'boolean') config.enabled = payload.enabled;
             if (payload?.tools && typeof payload.tools === 'object') {
               for (const k of TOOL_KEYS) {
                 if (typeof payload.tools[k] === 'boolean') config.tools[k] = payload.tools[k];
               }
             }
-            persistConfig();
-            broadcast('state', { ...store.getState(), config });
-            if (cdpInjector) {
-              if (!config.enabled && prevEnabled) {
-                cdpInjector.clearAll().catch(() => {});
-              } else {
-                for (const k of TOOL_KEYS) {
-                  const was = prevEnabled && prevTools[k] !== false;
-                  const now = isToolEnabled(k);
-                  if (was && !now) cdpInjector.clearTool(k).catch(() => {});
-                  else if (!was && now) cdpInjector.pushAll({ force: true, tools: [k] }).catch(() => {});
-                }
+            if (typeof payload?.inlineEnabled === 'boolean') config.inlineEnabled = payload.inlineEnabled;
+            if (payload?.inlineTools && typeof payload.inlineTools === 'object') {
+              for (const k of TOOL_KEYS) {
+                if (typeof payload.inlineTools[k] === 'boolean') config.inlineTools[k] = payload.inlineTools[k];
               }
             }
+            if (payload?.cursorCookie !== undefined) {
+              config.cursorCookie =
+                typeof payload.cursorCookie === 'string' && payload.cursorCookie.trim()
+                  ? payload.cursorCookie.trim()
+                  : null;
+              refreshQuota = true;
+            }
+            persistConfig();
+            const pubCfg = publicConfig(config);
+            broadcast('state', { ...store.getState(), config: pubCfg });
+            if (cdpInjector) {
+              for (const k of TOOL_KEYS) {
+                const was = prevInline[k];
+                const now = isInlineEnabled(k);
+                if (was && !now) cdpInjector.clearTool(k).catch(() => {});
+                else if (!was && now) cdpInjector.pushAll({ force: true, tools: [k] }).catch(() => {});
+              }
+            }
+            if (refreshQuota && enableQuotaProbe) {
+              getAllQuotas(Date.now(), { forceRefresh: true, cursorCookie: config.cursorCookie }).catch(() => {});
+            }
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, config }));
+            res.end(JSON.stringify({ ok: true, config: pubCfg }));
             return;
           }
 
