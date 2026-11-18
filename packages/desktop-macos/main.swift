@@ -272,8 +272,7 @@ enum MeterFormat {
   }
 
   static func usd(_ val: Double?) -> String {
-    guard let val = val, val.isFinite else { return "N/A" }
-    if val <= 0 { return "$0.00" }
+    guard let val = val, val.isFinite, val > 0 else { return "$0.00" }
     if val < 0.01 { return String(format: "$%.4f", val) }
     return String(format: "$%.2f", val)
   }
@@ -457,7 +456,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "aiTurnMeter.showRecentWindowsInMenu"
   }
 
-  @Published var version: String = "0.2.12"
+  @Published var version: String = "0.2.13"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -1407,7 +1406,6 @@ private struct SettingsAppPaneItem: Identifiable {
   let pane: SettingsPane
   let title: String
   let icon: String
-  let color: Color
 }
 
 struct ContentView: View {
@@ -1416,12 +1414,12 @@ struct ContentView: View {
   @State private var hoveredPane: SettingsPane? = nil
 
   private let appPanes: [SettingsAppPaneItem] = [
-    SettingsAppPaneItem(id: "general", pane: .general, title: "通用", icon: "gearshape.fill", color: Color.gray),
-    SettingsAppPaneItem(id: "usage", pane: .usage, title: "用量与支出", icon: "chart.bar.fill", color: Color.green),
-    SettingsAppPaneItem(id: "menubar", pane: .menuBar, title: "菜单栏与菜单", icon: "menubar.rectangle", color: CodexBarPalette.accentBlue),
-    SettingsAppPaneItem(id: "turns", pane: .turns, title: "最近轮次", icon: "clock.arrow.circlepath", color: Color.indigo),
-    SettingsAppPaneItem(id: "remote", pane: .remote, title: "远程与钩子", icon: "bolt.horizontal.circle.fill", color: Color.orange),
-    SettingsAppPaneItem(id: "about", pane: .about, title: "关于", icon: "info.circle.fill", color: CodexBarPalette.tealBar),
+    SettingsAppPaneItem(id: "general", pane: .general, title: "通用", icon: "gearshape"),
+    SettingsAppPaneItem(id: "usage", pane: .usage, title: "用量", icon: "chart.bar"),
+    SettingsAppPaneItem(id: "turns", pane: .turns, title: "轮次", icon: "clock"),
+    SettingsAppPaneItem(id: "menubar", pane: .menuBar, title: "菜单栏", icon: "menubar.rectangle"),
+    SettingsAppPaneItem(id: "remote", pane: .remote, title: "远程", icon: "network"),
+    SettingsAppPaneItem(id: "about", pane: .about, title: "关于", icon: "info.circle"),
   ]
 
   private var filteredAppPanes: [SettingsAppPaneItem] {
@@ -1439,51 +1437,32 @@ struct ContentView: View {
     }
   }
 
-  private var enabledProviderCount: Int {
-    ["codex", "cursor", "antigravity", "codebuddy"].filter {
-      (vm.apps[$0]?.installed ?? false) && vm.isToolEnabled($0) && vm.isActiveOverall
-    }.count
-  }
-
-  private var latestOverallTurn: TurnSummary? {
-    var best: TurnSummary? = nil
-    for key in vm.orderedKeys {
-      guard vm.isToolEnabled(key),
-            let turn = vm.apps[key]?.latestTurn else { continue }
-      if best == nil || (turn.completedAtMs ?? 0) > (best?.completedAtMs ?? 0) {
-        best = turn
-      }
-    }
-    return best
-  }
-
   var body: some View {
     VStack(spacing: 0) {
       if vm.runtime.runningFromDmg {
         HStack(spacing: 10) {
           Image(systemName: "externaldrive.badge.exclamationmark")
             .foregroundColor(.orange)
-          Text("请先将「AI Turn Meter.app」拖入「应用程序」后再打开使用。")
+          Text("请先将「AI Turn Meter.app」拖入「应用程序」")
             .font(.system(size: 12))
           Spacer()
           Button("打开应用程序") { vm.openApplicationsFolder() }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
+            .buttonStyle(.bordered)
             .controlSize(.small)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .background(Color.orange.opacity(0.12))
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.08))
         Divider()
       }
 
       if let msg = vm.statusBanner {
         HStack(spacing: 8) {
-          Image(systemName: vm.bannerIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-            .foregroundColor(vm.bannerIsError ? .red : .green)
+          Image(systemName: vm.bannerIsError ? "exclamationmark.triangle" : "checkmark.circle")
+            .foregroundColor(vm.bannerIsError ? .red : .secondary)
           Text(msg)
             .font(.system(size: 12))
-            .lineLimit(2)
+            .lineLimit(1)
           Spacer()
           Button("关闭") { vm.statusBanner = nil }
             .buttonStyle(.plain)
@@ -1491,88 +1470,19 @@ struct ContentView: View {
             .foregroundColor(.secondary)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background((vm.bannerIsError ? Color.red : Color.green).opacity(0.1))
+        .padding(.vertical, 7)
+        .background(Color.primary.opacity(0.04))
         Divider()
       }
 
       HStack(spacing: 0) {
-        // Left Sidebar with AI Turn Meter Branded Live Telemetry Header
+        // Minimal Linear / Apple Notes Sidebar
         VStack(alignment: .leading, spacing: 0) {
-          VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 9) {
-              ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                  .fill(LinearGradient(
-                    colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                  ))
-                  .frame(width: 28, height: 28)
-                Image(systemName: "gauge.with.dots.needle.67percent")
-                  .font(.system(size: 13.5, weight: .semibold))
-                  .foregroundColor(.white)
-              }
-
-              VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                  Text("AI Turn Meter")
-                    .font(.system(size: 12.5, weight: .semibold))
-                  Circle()
-                    .fill(vm.isActiveOverall ? Color(red: 0.20, green: 0.72, blue: 0.42) : (vm.daemonOnline ? .orange : .gray))
-                    .frame(width: 6, height: 6)
-                }
-                Text("v\(vm.version) · \(vm.isActiveOverall ? "实时采集" : (vm.daemonOnline ? "已暂停" : "后台未启"))")
-                  .font(.system(size: 10))
-                  .foregroundColor(.secondary)
-              }
-            }
-
-            Button {
-              vm.openSettingsPane(.usage)
-            } label: {
-              HStack(spacing: 5) {
-                Image(systemName: "bolt.fill")
-                  .font(.system(size: 9.5, weight: .semibold))
-                  .foregroundColor(CodexBarPalette.accentBlue)
-                Text(latestOverallTurn?.tps.map { MeterFormat.tps($0) } ?? "-- tok/s")
-                  .font(.system(size: 11, weight: .semibold))
-                  .monospacedDigit()
-                  .foregroundColor(.primary)
-                Spacer()
-                if let saved = vm.todaySummary?.cacheSavingsUsd, saved > 0 {
-                  Text("省 \(MeterFormat.usd(saved))")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .monospacedDigit()
-                    .foregroundColor(Color(red: 0.16, green: 0.62, blue: 0.36))
-                } else if let rate = vm.todaySummary?.cacheRatePct {
-                  Text("缓存 \(MeterFormat.pct(rate))")
-                    .font(.system(size: 10.5))
-                    .monospacedDigit()
-                    .foregroundColor(.secondary)
-                }
-              }
-              .padding(.horizontal, 8)
-              .padding(.vertical, 5)
-              .background(CodexBarPalette.accentBlue.opacity(0.08))
-              .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-              .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                  .stroke(CodexBarPalette.accentBlue.opacity(0.16), lineWidth: 1)
-              )
-            }
-            .buttonStyle(.plain)
-            .help("查看全量 TPS、缓存与费用仪表盘")
-          }
-          .padding(.horizontal, 12)
-          .padding(.top, 12)
-          .padding(.bottom, 8)
-
           HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
-              .font(.system(size: 11.5))
+              .font(.system(size: 11))
               .foregroundColor(.secondary)
-            TextField("搜索设置", text: $searchText)
+            TextField("搜索", text: $searchText)
               .textFieldStyle(.plain)
               .font(.system(size: 12))
             if !searchText.isEmpty {
@@ -1586,83 +1496,62 @@ struct ContentView: View {
               .buttonStyle(.plain)
             }
           }
-          .padding(.horizontal, 9)
-          .padding(.vertical, 5.5)
-          .background(Color(nsColor: .controlBackgroundColor))
-          .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-          .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-              .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-          )
-          .padding(.horizontal, 12)
+          .padding(.horizontal, 8)
+          .padding(.vertical, 5)
+          .background(Color.primary.opacity(0.05))
+          .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+          .padding(.horizontal, 10)
+          .padding(.top, 12)
           .padding(.bottom, 10)
 
           ScrollView {
             VStack(alignment: .leading, spacing: 2) {
               ForEach(filteredAppPanes) { item in
-                sidebarRow(
-                  pane: item.pane,
-                  isSelected: vm.settingsPane == item.pane
-                ) {
-                  ZStack {
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                      .fill(item.color)
-                      .frame(width: 20, height: 20)
-                    Image(systemName: item.icon)
-                      .font(.system(size: 10.5, weight: .semibold))
-                      .foregroundColor(.white)
-                  }
+                let isSelected = vm.settingsPane == item.pane
+                sidebarRow(pane: item.pane, isSelected: isSelected) {
+                  Image(systemName: item.icon)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundColor(isSelected ? .primary : .secondary)
+                    .frame(width: 18)
                   Text(item.title)
-                    .font(.system(size: 12.5, weight: vm.settingsPane == item.pane ? .semibold : .regular))
+                    .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
                     .foregroundColor(.primary)
-                  Spacer()
+                    .lineLimit(1)
+                  Spacer(minLength: 0)
                 }
               }
 
               if !providerKeys.isEmpty {
-                HStack {
-                  Text("提供商")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.secondary)
-                  Spacer()
-                  Text("\(enabledProviderCount) 个已开启")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(.secondary)
-                }
-                .padding(.horizontal, 10)
-                .padding(.top, 14)
-                .padding(.bottom, 4)
+                Text("提供商")
+                  .font(.system(size: 11, weight: .medium))
+                  .foregroundColor(.secondary)
+                  .padding(.horizontal, 10)
+                  .padding(.top, 14)
+                  .padding(.bottom, 4)
 
                 ForEach(providerKeys, id: \.self) { key in
                   let entry = vm.apps[key]
                   let installed = entry?.installed ?? false
                   let enabled = vm.isToolEnabled(key)
+                  let isSelected = vm.settingsPane == .provider(key)
                   let dotColor: Color = {
-                    if !installed || !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.45) }
+                    if !installed || !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.35) }
                     if key != "antigravity" && entry?.cdpPort == nil { return .orange }
                     return Color(red: 0.20, green: 0.72, blue: 0.42)
                   }()
 
-                  sidebarRow(
-                    pane: .provider(key),
-                    isSelected: vm.settingsPane == .provider(key)
-                  ) {
-                    ToolGlyph.iconView(for: key, size: 15)
-                      .foregroundColor(installed ? vm.toolAccentColor(for: key) : .secondary.opacity(0.6))
-                      .frame(width: 20)
+                  sidebarRow(pane: .provider(key), isSelected: isSelected) {
+                    ToolGlyph.iconView(for: key, size: 14)
+                      .foregroundColor(installed ? .primary : .secondary.opacity(0.6))
+                      .frame(width: 18)
                     Text(vm.toolShortTitle(for: key))
-                      .font(.system(size: 12.5, weight: vm.settingsPane == .provider(key) ? .semibold : .regular))
+                      .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
                       .foregroundColor(installed ? .primary : .secondary)
-                    Spacer()
-                    if let tps = entry?.latestTurn?.tps, tps > 0, installed && enabled && vm.isActiveOverall {
-                      Text(MeterFormat.tps(tps))
-                        .font(.system(size: 10))
-                        .monospacedDigit()
-                        .foregroundColor(.secondary)
-                    }
+                      .lineLimit(1)
+                    Spacer(minLength: 4)
                     Circle()
                       .fill(dotColor)
-                      .frame(width: 6.5, height: 6.5)
+                      .frame(width: 6, height: 6)
                   }
                 }
               }
@@ -1671,7 +1560,7 @@ struct ContentView: View {
             .padding(.bottom, 12)
           }
         }
-        .frame(width: 215)
+        .frame(width: 196)
         .background(Color(nsColor: .windowBackgroundColor))
 
         Divider()
@@ -1698,10 +1587,10 @@ struct ContentView: View {
           }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .underPageBackgroundColor).opacity(0.45))
+        .background(Color(nsColor: .underPageBackgroundColor).opacity(0.30))
       }
     }
-    .frame(minWidth: 740, minHeight: 540)
+    .frame(minWidth: 720, minHeight: 520)
     .onAppear { vm.ensureStarted() }
     .onChange(of: vm.settingsPane) { newPane in
       switch newPane {
@@ -1718,10 +1607,10 @@ struct ContentView: View {
     .alert("确认彻底卸载？", isPresented: $vm.showUninstallAlert) {
       Button("取消", role: .cancel) {}
       Button("卸载", role: .destructive) {
-        vm.runAction(args: ["uninstall"], successText: "已移除后台服务、Cursor Hooks 与 IDE 扩展")
+        vm.runAction(args: ["uninstall"], successText: "已移除后台服务与扩展")
       }
     } message: {
-      Text("将停止后台服务，移除开机自启、Cursor Hooks 与 IDE 扩展；历史统计库会保留。")
+      Text("将停止后台服务并移除 Hooks 与 IDE 扩展，历史统计库会保留。")
     }
     .sheet(isPresented: $vm.showSshSheet) {
       RemoteSshSheetView(vm: vm)
@@ -1768,8 +1657,8 @@ struct ContentView: View {
       .padding(.vertical, 6)
       .frame(maxWidth: .infinity, alignment: .leading)
       .background(
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-          .fill(isSelected ? Color.primary.opacity(0.11) : (isHovered ? Color.primary.opacity(0.05) : Color.clear))
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+          .fill(isSelected ? Color.primary.opacity(0.08) : (isHovered ? Color.primary.opacity(0.04) : Color.clear))
       )
       .contentShape(Rectangle())
     }
@@ -1792,10 +1681,10 @@ private struct SettingsGroupCard<Content: View>: View {
       content
     }
     .background(Color(nsColor: .controlBackgroundColor))
-    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     .overlay(
-      RoundedRectangle(cornerRadius: 11, style: .continuous)
-        .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+      RoundedRectangle(cornerRadius: 10, style: .continuous)
+        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
     )
   }
 }
@@ -1819,20 +1708,13 @@ private func settingsKVRow(title: String, value: String, valueColor: Color = .se
 
 private func settingsControlRow<Accessory: View>(
   title: String,
-  subtitle: String? = nil,
   @ViewBuilder accessory: () -> Accessory
 ) -> some View {
   HStack(spacing: 12) {
-    VStack(alignment: .leading, spacing: 2) {
-      Text(title)
-        .font(.system(size: 12.5))
-      if let subtitle = subtitle, !subtitle.isEmpty {
-        Text(subtitle)
-          .font(.system(size: 10.5))
-          .foregroundColor(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
-      }
-    }
+    Text(title)
+      .font(.system(size: 12.5))
+      .foregroundColor(.primary)
+      .lineLimit(1)
     Spacer(minLength: 12)
     accessory()
   }
@@ -1850,243 +1732,124 @@ private struct ProviderSettingsDetailView: View {
     let enabled = vm.isToolEnabled(key)
     let active = installed && vm.isActiveOverall && enabled
     let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
-    let accent = vm.toolAccentColor(for: key)
     let card = vm.usageData?.cards?[key]
     let latestTurn = entry?.latestTurn
     let windows = card?.quotaWindows ?? []
 
-    let latestTpsDisplay: String = {
-      if let tps = latestTurn?.tps, tps > 0 { return MeterFormat.tps(tps) }
-      if let raw = card?.latestTpsText, !raw.isEmpty {
-        return raw.hasPrefix("均 ") ? String(raw.dropFirst(2)) : raw
-      }
-      return "--"
-    }()
-
-    let statusBadgeText: String = {
+    let statusText: String = {
       if !installed { return "未安装" }
       if !vm.daemonOnline { return "后台未启动" }
       if !vm.masterEnabled { return "全局暂停" }
       if !enabled { return "已关闭" }
-      if let port = entry?.cdpPort { return "消息旁已连接 · CDP:\(port)" }
-      return "状态栏监控中"
-    }()
-
-    let statusBadgeColor: Color = {
-      if !installed || !enabled || !vm.daemonOnline || !vm.masterEnabled { return .secondary }
-      if entry?.cdpPort != nil { return Color(red: 0.16, green: 0.65, blue: 0.38) }
-      return .orange
+      if let port = entry?.cdpPort { return "正常运行 · CDP:\(port)" }
+      return "正常运行"
     }()
 
     ScrollView {
-      VStack(alignment: .leading, spacing: 16) {
-        // 1. Distinctive Hero Banner Card (accent-tinted badge, connection status & quick actions)
+      VStack(alignment: .leading, spacing: 18) {
+        // Card 1: Clean Provider Header & Core Info
         SettingsGroupCard {
-          VStack(spacing: 0) {
-            HStack(spacing: 12) {
-              ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                  .fill(installed ? accent.opacity(0.15) : Color.primary.opacity(0.06))
-                  .frame(width: 40, height: 40)
-                ToolGlyph.iconView(for: key, size: 22)
-                  .foregroundColor(installed ? accent : .secondary)
-              }
+          HStack(spacing: 10) {
+            ToolGlyph.iconView(for: key, size: 20)
+              .foregroundColor(installed ? .primary : .secondary)
+              .frame(width: 24, height: 24)
 
-              VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                  Text(vm.displayTitle(for: key))
-                    .font(.system(size: 16, weight: .bold))
-                  Text(statusBadgeText)
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundColor(statusBadgeColor)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(statusBadgeColor.opacity(0.12))
-                    .clipShape(Capsule())
-                }
+            Text(vm.displayTitle(for: key))
+              .font(.system(size: 14.5, weight: .semibold))
 
-                HStack(spacing: 6) {
-                  if let email = card?.accountEmail {
-                    Text(email)
-                      .font(.system(size: 11))
-                      .foregroundColor(.secondary)
-                      .lineLimit(1)
-                    Text("·").foregroundColor(.secondary.opacity(0.6))
-                  }
-                  if let plan = card?.planTitle {
-                    Text(plan)
-                      .font(.system(size: 11))
-                      .foregroundColor(.secondary)
-                    Text("·").foregroundColor(.secondary.opacity(0.6))
-                  }
-                  Text(vm.relativeUpdateLabel())
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                }
-              }
+            Spacer()
 
-              Spacer(minLength: 8)
-
-              Button {
-                vm.refreshDoctorAndBootstrap()
-                vm.fetchUsageSummary()
-              } label: {
-                Image(systemName: "arrow.clockwise")
-                  .font(.system(size: 12, weight: .medium))
-                  .foregroundColor(.secondary)
-              }
-              .buttonStyle(.borderless)
-              .help("刷新状态、TPS 与额度")
-
-              Toggle("", isOn: Binding(
-                get: { installed && enabled && vm.isActiveOverall },
-                set: { vm.setToolEnabled(key, enabled: $0) }
-              ))
-              .toggleStyle(.switch)
-              .labelsHidden()
-              .controlSize(.regular)
-              .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
+            Button {
+              vm.refreshDoctorAndBootstrap()
+              vm.fetchUsageSummary()
+            } label: {
+              Image(systemName: "arrow.clockwise")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
             }
-            .padding(14)
-            .background(
-              LinearGradient(
-                colors: [accent.opacity(0.09), accent.opacity(0.01)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-              )
-            )
+            .buttonStyle(.borderless)
+            .help("刷新")
 
-            if installed {
-              Divider()
+            Toggle("", isOn: Binding(
+              get: { installed && enabled && vm.isActiveOverall },
+              set: { vm.setToolEnabled(key, enabled: $0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .controlSize(.small)
+            .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
+          }
+          .padding(.horizontal, 14)
+          .padding(.vertical, 11)
+
+          Divider().padding(.leading, 14)
+
+          HStack(spacing: 8) {
+            Text("状态")
+              .font(.system(size: 12.5))
+            Spacer()
+            if needsInline && !vm.runtime.runningFromDmg {
+              Button("开启消息旁") {
+                vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.mini)
+              .disabled(vm.busy)
+            } else if installed, let appPath = entry?.appPath {
+              Button("打开") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.mini)
+            }
+            Text(statusText)
+              .font(.system(size: 12.5))
+              .foregroundColor(active ? .secondary : .orange)
+          }
+          .padding(.horizontal, 14)
+          .padding(.vertical, 10)
+
+          if card?.accountEmail != nil || card?.planTitle != nil {
+            Divider().padding(.leading, 14)
+            settingsKVRow(
+              title: "账户",
+              value: [card?.accountEmail, card?.planTitle].compactMap { $0 }.joined(separator: " · ")
+            )
+          }
+
+          if let turn = latestTurn {
+            let summaryText = turn.inlineText ?? turn.tps.map { MeterFormat.tps($0) }
+            if let summary = summaryText, !summary.isEmpty {
+              Divider().padding(.leading, 14)
               HStack(spacing: 8) {
-                if needsInline && !vm.runtime.runningFromDmg {
-                  Button(vm.inlineBtnLabel(for: key)) {
-                    vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
-                  }
-                  .buttonStyle(.borderedProminent)
-                  .tint(accent)
-                  .controlSize(.small)
-                  .disabled(vm.busy)
-                }
-                if let ver = vm.vsixVersions[key] {
-                  Text("VSIX v\(ver)")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2.5)
-                    .background(Color.primary.opacity(0.05))
-                    .clipShape(Capsule())
-                }
+                Text("最近轮次")
+                  .font(.system(size: 12.5))
                 Spacer()
-                Button("历史轮次…") {
+                Text(summary)
+                  .font(.system(size: 12))
+                  .monospacedDigit()
+                  .foregroundColor(.secondary)
+                  .lineLimit(1)
+                  .truncationMode(.middle)
+                Button("查看") {
                   vm.recentTurnsFilterTool = key
                   vm.openSettingsPane(.turns)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                if let appPath = entry?.appPath {
-                  Button("打开应用") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
-                  }
-                  .buttonStyle(.bordered)
-                  .controlSize(.small)
-                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 12))
+                .foregroundColor(CodexBarPalette.accentBlue)
               }
               .padding(.horizontal, 14)
-              .padding(.vertical, 9)
+              .padding(.vertical, 10)
             }
           }
         }
 
-        // 2. Signature AI Turn Meter Section: Live TPS Telemetry & Inline Pill Preview
+        // Card 2: Quota & Spend (Core Focus)
         VStack(alignment: .leading, spacing: 8) {
-          Text("实时速率与消息旁胶囊")
-            .font(.system(size: 13.5, weight: .semibold))
-            .padding(.horizontal, 2)
-
-          SettingsGroupCard {
-            HStack(spacing: 0) {
-              telemetryTile(
-                title: "最近一轮速率",
-                value: latestTpsDisplay,
-                detail: latestTurn?.model.flatMap { $0 == "unknown" ? nil : $0 } ?? "等待对话",
-                valueColor: accent
-              )
-              Divider().frame(height: 44)
-              telemetryTile(
-                title: "今日均速",
-                value: MeterFormat.tps(card?.today.avgTps),
-                detail: "\(card?.today.callCount ?? 0) 次模型调用"
-              )
-              Divider().frame(height: 44)
-              telemetryTile(
-                title: "今日缓存命中",
-                value: MeterFormat.pct(card?.today.cacheRatePct),
-                detail: "\(card?.today.turnCount ?? 0) 轮对话"
-              )
-              Divider().frame(height: 44)
-              telemetryTile(
-                title: "缓存节省费用",
-                value: MeterFormat.usd(card?.today.cacheSavingsUsd),
-                detail: "今日估算 \(MeterFormat.usd(card?.today.costUsd))",
-                valueColor: Color(red: 0.16, green: 0.62, blue: 0.36)
-              )
-            }
-            .padding(.vertical, 12)
-
-            Divider().padding(.leading, 14)
-
-            VStack(alignment: .leading, spacing: 7) {
-              HStack {
-                Text("消息旁胶囊实况")
-                  .font(.system(size: 11.5, weight: .semibold))
-                  .foregroundColor(.secondary)
-                Spacer()
-                if let ts = latestTurn?.completedAtMs, ts > 0 {
-                  Text(MeterFormat.timeText(ts))
-                    .font(.system(size: 10.5))
-                    .foregroundColor(.secondary)
-                }
-              }
-
-              HStack(spacing: 6) {
-                Image(systemName: "bolt.fill")
-                  .font(.system(size: 10.5, weight: .semibold))
-                  .foregroundColor(accent)
-                Text(latestTurn?.inlineText ?? card?.latestTurnSubline ?? "发送一轮对话后，将在此实时预览胶囊数值")
-                  .font(.system(size: 11.5, weight: .medium))
-                  .monospacedDigit()
-                  .foregroundColor(active ? .primary : .secondary)
-                  .lineLimit(1)
-                Spacer(minLength: 0)
-              }
-              .padding(.horizontal, 10)
-              .padding(.vertical, 7)
-              .background(accent.opacity(0.08))
-              .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-              .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                  .stroke(accent.opacity(0.22), lineWidth: 1)
-              )
-
-              if let preview = latestTurn?.replyPreview, !preview.isEmpty {
-                Text("最近回复: \(preview)")
-                  .font(.system(size: 10.5))
-                  .foregroundColor(.secondary)
-                  .lineLimit(1)
-                  .truncationMode(.tail)
-              }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-          }
-        }
-
-        // 3. Quota & Usage Section
-        VStack(alignment: .leading, spacing: 8) {
-          Text("套餐额度与费用")
-            .font(.system(size: 13.5, weight: .semibold))
+          Text("额度与用量")
+            .font(.system(size: 12.5, weight: .semibold))
+            .foregroundColor(.secondary)
             .padding(.horizontal, 2)
 
           SettingsGroupCard {
@@ -2100,46 +1863,19 @@ private struct ProviderSettingsDetailView: View {
               Divider().padding(.leading, 14)
             }
             settingsKVRow(
-              title: "今日估算用量",
+              title: "今日",
               value: "\(MeterFormat.usd(card?.today.costUsd)) · \(MeterFormat.tokens(card?.today.totalTokens ?? 0))"
             )
             Divider().padding(.leading, 14)
             settingsKVRow(
-              title: "近 30 天估算用量",
+              title: "近 30 天",
               value: "\(MeterFormat.usd(card?.days30.costUsd)) · \(MeterFormat.tokens(card?.days30.totalTokens ?? 0))"
             )
           }
         }
       }
-      .padding(20)
+      .padding(24)
     }
-  }
-
-  private func telemetryTile(
-    title: String,
-    value: String,
-    detail: String,
-    valueColor: Color = .primary
-  ) -> some View {
-    VStack(alignment: .leading, spacing: 3) {
-      Text(title)
-        .font(.system(size: 10.5))
-        .foregroundColor(.secondary)
-        .lineLimit(1)
-      Text(value)
-        .font(.system(size: 15, weight: .bold))
-        .monospacedDigit()
-        .foregroundColor(valueColor)
-        .lineLimit(1)
-        .minimumScaleFactor(0.8)
-      Text(detail)
-        .font(.system(size: 10))
-        .foregroundColor(.secondary)
-        .lineLimit(1)
-        .truncationMode(.middle)
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(.horizontal, 12)
   }
 
   private func providerQuotaRow(win: CardQuotaWindow) -> some View {
@@ -2149,7 +1885,7 @@ private struct ProviderSettingsDetailView: View {
     return VStack(alignment: .leading, spacing: 6) {
       HStack {
         Text("\(win.title) 剩余 \(pctRounded)%")
-          .font(.system(size: 12.5, weight: .semibold))
+          .font(.system(size: 12.5, weight: .medium))
           .monospacedDigit()
         Spacer()
         if let resetText = win.resetText, !resetText.isEmpty {
@@ -2163,10 +1899,10 @@ private struct ProviderSettingsDetailView: View {
       GeometryReader { geo in
         ZStack(alignment: .leading) {
           Capsule()
-            .fill(Color.primary.opacity(0.10))
+            .fill(Color.primary.opacity(0.09))
           if clamped > 0 {
             Capsule()
-              .fill(Color(red: 0.24, green: 0.72, blue: 0.48))
+              .fill(CodexBarPalette.tealBar)
               .frame(width: max(5, geo.size.width * CGFloat(clamped)))
           }
           if let pacePct = win.pacePct {
@@ -2177,7 +1913,7 @@ private struct ProviderSettingsDetailView: View {
                 .fill(Color(nsColor: .controlBackgroundColor))
                 .frame(width: 5.0, height: 8)
               RoundedRectangle(cornerRadius: 0.75)
-                .fill(Color(red: 0.14, green: 0.56, blue: 0.34))
+                .fill(CodexBarPalette.paceGreen)
                 .frame(width: 2.0, height: 8)
             }
             .offset(x: paceX)
@@ -2204,114 +1940,82 @@ private struct GeneralSettingsPaneView: View {
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
-        VStack(alignment: .leading, spacing: 8) {
-          Text("通用与驻留")
-            .font(.system(size: 13.5, weight: .semibold))
-            .padding(.horizontal, 2)
+        SettingsGroupCard {
+          settingsControlRow(title: "开启采集与显示") {
+            Toggle("", isOn: Binding(
+              get: { vm.masterEnabled },
+              set: { vm.setMasterEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .disabled(vm.busy || vm.runtime.runningFromDmg)
+          }
 
-          SettingsGroupCard {
-            settingsControlRow(
-              title: "全局统计与消息旁显示",
-              subtitle: "控制后台采样与顶部状态栏及消息旁胶囊的总开关"
-            ) {
-              Toggle("", isOn: Binding(
-                get: { vm.masterEnabled },
-                set: { vm.setMasterEnabled($0) }
-              ))
-              .toggleStyle(.switch)
-              .labelsHidden()
-              .disabled(vm.busy || vm.runtime.runningFromDmg)
-            }
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "开机自动启动") {
+            Toggle("", isOn: Binding(
+              get: { vm.launchAtLogin },
+              set: { vm.setLaunchAtLogin($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .disabled(vm.busy || vm.runtime.runningFromDmg)
+          }
 
-            Divider().padding(.leading, 14)
-            settingsControlRow(
-              title: "开机自动启动",
-              subtitle: "登录 macOS 时静默后台启动并常驻顶部菜单栏"
-            ) {
-              Toggle("", isOn: Binding(
-                get: { vm.launchAtLogin },
-                set: { vm.setLaunchAtLogin($0) }
-              ))
-              .toggleStyle(.switch)
-              .labelsHidden()
-              .disabled(vm.busy || vm.runtime.runningFromDmg)
-            }
-
-            Divider().padding(.leading, 14)
-            settingsControlRow(
-              title: "隐藏程序坞 (Dock) 图标",
-              subtitle: "开启后仅驻留在系统顶部菜单栏"
-            ) {
-              Toggle("", isOn: Binding(
-                get: { vm.hideDockIcon },
-                set: { vm.setHideDockIcon($0) }
-              ))
-              .toggleStyle(.switch)
-              .labelsHidden()
-            }
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "隐藏程序坞图标") {
+            Toggle("", isOn: Binding(
+              get: { vm.hideDockIcon },
+              set: { vm.setHideDockIcon($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
           }
         }
 
-        if vm.isActiveOverall && !vm.appsNeedingInlineCdp.isEmpty {
-          VStack(alignment: .leading, spacing: 8) {
-            Text("消息旁胶囊接入")
-              .font(.system(size: 13.5, weight: .semibold))
-              .padding(.horizontal, 2)
-
-            SettingsGroupCard {
-              settingsControlRow(
-                title: "一键接入支持客户端",
-                subtitle: "为 Codex / Cursor / CodeBuddy 开启消息旁 Token、速率与费用胶囊"
-              ) {
-                Button("全部开启") {
-                  vm.runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(CodexBarPalette.accentBlue)
-                .controlSize(.small)
-                .disabled(vm.busy || vm.runtime.runningFromDmg)
-              }
-            }
-          }
-        }
-
-        VStack(alignment: .leading, spacing: 8) {
-          Text("维护与更新")
-            .font(.system(size: 13.5, weight: .semibold))
-            .padding(.horizontal, 2)
-
-          SettingsGroupCard {
-            settingsControlRow(title: "软件更新", subtitle: "当前版本 v\(vm.version)") {
-              Button("检查更新…") {
-                vm.checkForUpdates()
-              }
-              .buttonStyle(.bordered)
-              .controlSize(.small)
-            }
-
-            Divider().padding(.leading, 14)
-            settingsControlRow(title: "修复扩展与后台服务", subtitle: "重新同步 VSIX 扩展、Cursor Hooks 与 LaunchAgent") {
-              Button("重新同步") {
-                vm.runAction(args: ["install"], successText: "已重新同步全部配置与扩展")
+        SettingsGroupCard {
+          if vm.isActiveOverall && !vm.appsNeedingInlineCdp.isEmpty {
+            settingsControlRow(title: "接入消息旁胶囊") {
+              Button("全部开启") {
+                vm.runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
               }
               .buttonStyle(.bordered)
               .controlSize(.small)
               .disabled(vm.busy || vm.runtime.runningFromDmg)
             }
-
             Divider().padding(.leading, 14)
-            settingsControlRow(title: "完全卸载本地配置", subtitle: "停止后台服务并移除 Hooks 与扩展（保留历史记录库）") {
-              Button("卸载…", role: .destructive) {
-                vm.showUninstallAlert = true
-              }
-              .buttonStyle(.bordered)
-              .controlSize(.small)
-              .disabled(vm.busy)
+          }
+
+          settingsControlRow(title: "检查更新 (v\(vm.version))") {
+            Button("检查…") {
+              vm.checkForUpdates()
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+          }
+
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "同步扩展与后台配置") {
+            Button("重新同步") {
+              vm.runAction(args: ["install"], successText: "已重新同步全部配置")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(vm.busy || vm.runtime.runningFromDmg)
+          }
+
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "卸载本地配置") {
+            Button("卸载…", role: .destructive) {
+              vm.showUninstallAlert = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(vm.busy)
           }
         }
       }
-      .padding(20)
+      .padding(24)
     }
   }
 }
@@ -2322,92 +2026,45 @@ private struct MenuBarSettingsPaneView: View {
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
-        VStack(alignment: .leading, spacing: 8) {
-          Text("顶部菜单栏")
-            .font(.system(size: 13.5, weight: .semibold))
-            .padding(.horizontal, 2)
+        SettingsGroupCard {
+          settingsControlRow(title: "显示顶部菜单栏图标") {
+            Toggle("", isOn: Binding(
+              get: { vm.showMenuBarExtra },
+              set: { vm.setShowMenuBarExtra($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+          }
 
-          SettingsGroupCard {
-            settingsControlRow(
-              title: "显示顶部菜单栏状态图标",
-              subtitle: "在系统顶部菜单栏展示概览与实时用量卡片"
-            ) {
-              Toggle("", isOn: Binding(
-                get: { vm.showMenuBarExtra },
-                set: { vm.setShowMenuBarExtra($0) }
-              ))
-              .toggleStyle(.switch)
+          if vm.showMenuBarExtra {
+            Divider().padding(.leading, 14)
+            settingsControlRow(title: "菜单栏文本") {
+              Picker("", selection: Binding(
+                get: { vm.menuBarDisplayMode },
+                set: { vm.setMenuBarDisplayMode($0) }
+              )) {
+                ForEach(MenuBarDisplayMode.allCases, id: \.self) { m in
+                  Text(m.title).tag(m)
+                }
+              }
               .labelsHidden()
-            }
-
-            if vm.showMenuBarExtra {
-              Divider().padding(.leading, 14)
-              settingsControlRow(
-                title: "菜单栏标题内容",
-                subtitle: "决定顶部图标右侧显示剩余额度、今日费用或实时速率"
-              ) {
-                Picker("", selection: Binding(
-                  get: { vm.menuBarDisplayMode },
-                  set: { vm.setMenuBarDisplayMode($0) }
-                )) {
-                  ForEach(MenuBarDisplayMode.allCases, id: \.self) { m in
-                    Text(m.title).tag(m)
-                  }
-                }
-                .labelsHidden()
-                .frame(width: 165)
-                .controlSize(.small)
-              }
-
-              Divider().padding(.leading, 14)
-              VStack(alignment: .leading, spacing: 8) {
-                Text("快速切换状态栏常驻数值")
-                  .font(.system(size: 11))
-                  .foregroundColor(.secondary)
-                HStack(spacing: 6) {
-                  ForEach([MenuBarDisplayMode.tps, .quotaRemaining, .todayCost, .iconOnly], id: \.self) { preset in
-                    let isSelected = vm.menuBarDisplayMode == preset
-                    Button(preset == .tps ? "实时速度 (TPS)" : preset.title) {
-                      vm.setMenuBarDisplayMode(preset)
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
-                    .foregroundColor(isSelected ? .white : .primary)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 4.5)
-                    .background(
-                      Capsule().fill(isSelected ? CodexBarPalette.accentBlue : Color.primary.opacity(0.07))
-                    )
-                  }
-                }
-              }
-              .padding(.horizontal, 14)
-              .padding(.vertical, 10)
+              .frame(width: 160)
+              .controlSize(.small)
             }
           }
-        }
 
-        VStack(alignment: .leading, spacing: 8) {
-          Text("菜单卡片选项")
-            .font(.system(size: 13.5, weight: .semibold))
-            .padding(.horizontal, 2)
-
-          SettingsGroupCard {
-            settingsControlRow(
-              title: "在菜单卡片中显示「最近窗口」",
-              subtitle: "开启后在菜单卡片底部展开近 4 个 7 天滑动窗口明细（默认关闭，悬停卡片仍可查看详细图表与项目分解）"
-            ) {
-              Toggle("", isOn: Binding(
-                get: { vm.showRecentWindowsInMenu },
-                set: { vm.setShowRecentWindowsInMenu($0) }
-              ))
-              .toggleStyle(.switch)
-              .labelsHidden()
-            }
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "在菜单卡片中显示「最近窗口」") {
+            Toggle("", isOn: Binding(
+              get: { vm.showRecentWindowsInMenu },
+              set: { vm.setShowRecentWindowsInMenu($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
           }
         }
       }
-      .padding(20)
+      .padding(24)
     }
   }
 }
@@ -2418,50 +2075,35 @@ private struct RemoteHooksSettingsPaneView: View {
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
-        VStack(alignment: .leading, spacing: 8) {
-          Text("Remote-SSH 远程配置")
-            .font(.system(size: 13.5, weight: .semibold))
-            .padding(.horizontal, 2)
-
-          SettingsGroupCard {
-            settingsControlRow(
-              title: "Cursor Remote-SSH 自动注入",
-              subtitle: "向 ~/.ssh/config 与远端主机一键写入端口转发，使远端 Cursor 对话同步到本地汇总"
-            ) {
-              Button("配置…") {
-                vm.knownSshHosts = MeterRuntime.readSshConfigHosts()
-                if vm.sshHost.isEmpty, let first = vm.knownSshHosts.first {
-                  vm.sshHost = first
-                }
-                vm.sshApplyStatus = nil
-                vm.generateSshSnippet()
-                vm.showSshSheet = true
+        SettingsGroupCard {
+          settingsControlRow(title: "Cursor Remote-SSH") {
+            Button("配置…") {
+              vm.knownSshHosts = MeterRuntime.readSshConfigHosts()
+              if vm.sshHost.isEmpty, let first = vm.knownSshHosts.first {
+                vm.sshHost = first
               }
-              .buttonStyle(.bordered)
-              .controlSize(.small)
+              vm.sshApplyStatus = nil
+              vm.generateSshSnippet()
+              vm.showSshSheet = true
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
           }
         }
 
-        VStack(alignment: .leading, spacing: 8) {
-          Text("本地服务与扩展状态")
-            .font(.system(size: 13.5, weight: .semibold))
-            .padding(.horizontal, 2)
-
-          SettingsGroupCard {
-            settingsKVRow(title: "守护进程状态", value: vm.daemonOnline ? "运行中 (127.0.0.1:\(vm.daemonPort))" : "未运行")
-            Divider().padding(.leading, 14)
-            settingsKVRow(title: "LaunchAgent", value: vm.launchAgentLoaded ? "已加载" : (vm.launchAgentExists ? "已注册未加载" : "未注册"))
-            ForEach(["cursor", "codebuddy"], id: \.self) { key in
-              if let ver = vm.vsixVersions[key] {
-                Divider().padding(.leading, 14)
-                settingsKVRow(title: "\(vm.displayTitle(for: key)) 扩展", value: "v\(ver)")
-              }
+        SettingsGroupCard {
+          settingsKVRow(title: "守护进程", value: vm.daemonOnline ? "127.0.0.1:\(vm.daemonPort)" : "未运行")
+          Divider().padding(.leading, 14)
+          settingsKVRow(title: "LaunchAgent", value: vm.launchAgentLoaded ? "已加载" : (vm.launchAgentExists ? "未加载" : "未注册"))
+          ForEach(["cursor", "codebuddy"], id: \.self) { key in
+            if let ver = vm.vsixVersions[key] {
+              Divider().padding(.leading, 14)
+              settingsKVRow(title: "\(vm.displayTitle(for: key)) 扩展", value: "v\(ver)")
             }
           }
         }
       }
-      .padding(20)
+      .padding(24)
     }
   }
 }
@@ -2470,48 +2112,34 @@ private struct AboutSettingsPaneView: View {
   @ObservedObject var vm: MeterViewModel
 
   var body: some View {
-    VStack(spacing: 14) {
+    VStack(spacing: 12) {
       Spacer()
-      ZStack {
-        RoundedRectangle(cornerRadius: 16, style: .continuous)
-          .fill(LinearGradient(
-            colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-          ))
-          .frame(width: 56, height: 56)
-        Image(systemName: "gauge.with.dots.needle.67percent")
-          .font(.system(size: 26, weight: .semibold))
-          .foregroundColor(.white)
-      }
+      Image(systemName: "gauge.with.dots.needle.67percent")
+        .font(.system(size: 34, weight: .medium))
+        .foregroundColor(.secondary)
       Text("AI Turn Meter")
-        .font(.system(size: 17, weight: .bold))
-      Text("版本 v\(vm.version)")
+        .font(.system(size: 16, weight: .semibold))
+      Text("v\(vm.version)")
         .font(.system(size: 12))
         .foregroundColor(.secondary)
-      Text("本地统一监控 Antigravity、Codex Desktop、Cursor 与 CodeBuddy CN 的轮次耗时、Token 缓存与套餐额度。")
-        .font(.system(size: 12))
-        .foregroundColor(.secondary)
-        .multilineTextAlignment(.center)
-        .frame(maxWidth: 360)
 
-      HStack(spacing: 10) {
-        Button("检查更新…") {
+      HStack(spacing: 12) {
+        Button("检查更新") {
           vm.checkForUpdates()
         }
-        .buttonStyle(.borderedProminent)
-        .tint(CodexBarPalette.accentBlue)
+        .buttonStyle(.bordered)
         .controlSize(.small)
 
         if let url = URL(string: "https://github.com/shadow-qw/AI-Turn-Meter") {
-          Link("GitHub 仓库", destination: url)
+          Link("GitHub", destination: url)
             .font(.system(size: 12))
         }
       }
+      .padding(.top, 4)
       Spacer()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .padding(20)
+    .padding(24)
   }
 }
 
@@ -3786,19 +3414,8 @@ private struct CostHistoryDetailFlyoutView: View {
         }
       }
 
-      // Live TPS & Cache Telemetry line + 30-day total estimate
+      // 30-day total estimate + disclaimer
       VStack(alignment: .leading, spacing: 2) {
-        if card.latestTpsText != nil || (card.today.avgTps ?? 0) > 0 || card.today.cacheRatePct != nil {
-          let tpsDisplay = card.latestTpsText.map { $0.hasPrefix("均 ") ? String($0.dropFirst(2)) : $0 }
-            ?? MeterFormat.tps(card.today.avgTps)
-          let cachePart = card.today.cacheRatePct.map { " · 缓存 \(MeterFormat.pct($0))" } ?? ""
-          let savedPart = ((card.today.cacheSavingsUsd ?? 0) > 0) ? " · 已省 \(MeterFormat.usd(card.today.cacheSavingsUsd))" : ""
-          Text("实时速率: \(tpsDisplay)\(cachePart)\(savedPart)")
-            .font(.system(size: 11, weight: .medium))
-            .monospacedDigit()
-            .foregroundColor(.primary.opacity(0.85))
-            .lineLimit(1)
-        }
         Text("估算总计 (近 30 天): \(MeterFormat.usd(card.days30.costUsd))")
           .font(.system(size: 11.5))
           .monospacedDigit()
@@ -4048,53 +3665,6 @@ private struct CodexBarStyleCardView: View {
         )
       }
 
-      // Live TPS & Cache Telemetry Strip (AI Turn Meter signature)
-      if card.latestTpsText != nil || (card.today.avgTps ?? 0) > 0 || card.today.cacheRatePct != nil {
-        HStack(spacing: 6) {
-          HStack(spacing: 4) {
-            Image(systemName: "bolt.fill")
-              .font(.system(size: 9.5, weight: .semibold))
-              .foregroundColor(isCardHovered ? .white : CodexBarPalette.accentBlue)
-            Text(
-              resolvedTpsBadge.map { $0.hasPrefix("均 ") ? String($0.dropFirst(2)) : $0 }
-                ?? MeterFormat.tps(card.today.avgTps)
-            )
-            .font(.system(size: 10.5, weight: .semibold))
-            .monospacedDigit()
-            .foregroundColor(primaryText)
-            if (card.today.avgTps ?? 0) > 0 && resolvedTpsBadge != nil {
-              Text("均 \(MeterFormat.tps(card.today.avgTps).replacingOccurrences(of: " tok/s", with: ""))")
-                .font(.system(size: 9.5))
-                .monospacedDigit()
-                .foregroundColor(secondaryText)
-            }
-          }
-
-          Spacer(minLength: 4)
-
-          HStack(spacing: 5) {
-            if let cacheRate = card.today.cacheRatePct {
-              Text("缓存 \(MeterFormat.pct(cacheRate))")
-                .font(.system(size: 10, weight: .medium))
-                .monospacedDigit()
-                .foregroundColor(secondaryText)
-            }
-            if let saved = card.today.cacheSavingsUsd, saved > 0 {
-              Text("省 \(MeterFormat.usd(saved))")
-                .font(.system(size: 10, weight: .semibold))
-                .monospacedDigit()
-                .foregroundColor(isCardHovered ? .white.opacity(0.95) : Color(red: 0.16, green: 0.62, blue: 0.36))
-            }
-          }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-          RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .fill(isCardHovered ? Color.white.opacity(0.14) : CodexBarPalette.tealBar.opacity(0.10))
-        )
-      }
-
       // 30-day Mini Usage Chart
       if !card.daily30.isEmpty {
         MiniUsageBarsView(points: card.daily30, cardHovered: isCardHovered)
@@ -4130,14 +3700,25 @@ private struct CodexBarStyleCardView: View {
         }
       }
 
-      // Clean Unboxed Footer Lines
+      // Quiet Unboxed Footer Lines
       VStack(alignment: .leading, spacing: 2) {
         if let topModel = card.topModel {
-          Text("最常用模型: \(topModel)")
+          let tpsSuffix: String = resolvedTpsBadge.map {
+            let clean = $0.hasPrefix("均 ") ? String($0.dropFirst(2)) : $0
+            return " · \(clean)"
+          } ?? ""
+          Text("最常用模型: \(topModel)\(tpsSuffix)")
             .font(.system(size: 10.5))
+            .monospacedDigit()
             .foregroundColor(secondaryText)
             .lineLimit(1)
             .truncationMode(.middle)
+        } else if let tps = resolvedTpsBadge {
+          Text("最近速率: \(tps)")
+            .font(.system(size: 10.5))
+            .monospacedDigit()
+            .foregroundColor(secondaryText)
+            .lineLimit(1)
         }
         Text("根据 Token 用量估算 · 不是订阅账单")
           .font(.system(size: 10))

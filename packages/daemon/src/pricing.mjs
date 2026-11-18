@@ -256,6 +256,12 @@ function normalizeModelCandidates(rawModel) {
     // Normalize claude-opus-5-5 -> claude-opus-5.5
     const dotted = noDate.replace(/(\d+)-(\d+)(?=-|$)/g, '$1.$2');
     candidates.add(dotted);
+    // Map newer gpt-6.<minor>-<tier> (e.g. gpt-6.2-astra) to known 6.1 / 6 tier rates
+    const gpt6Match = dotted.match(/^gpt-6\.\d+-([a-z]+)$/);
+    if (gpt6Match) {
+      candidates.add(`gpt-6.1-${gpt6Match[1]}`);
+      candidates.add(`gpt-6-${gpt6Match[1]}`);
+    }
   }
 
   for (const c of Array.from(candidates)) {

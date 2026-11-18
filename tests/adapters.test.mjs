@@ -1616,9 +1616,10 @@ test('Pricing engine computes standard, long-context, cache savings, custom over
   // 0.1 * 4 + 0.2 * 0.2 + 0.01 * 15 = 0.4 + 0.04 + 0.15 = 0.59
   assert.ok(Math.abs(longCost.costUsd - 0.59) < 1e-6);
 
-  // Route prefixes & date snapshots resolve cleanly
+  // Route prefixes, minor revisions & date snapshots resolve cleanly
   assert.ok(resolveModelPricing('workbuddy/kimi-k3.1-pro'));
   assert.ok(resolveModelPricing('claude-opus-4-5-20251101'));
+  assert.ok(resolveModelPricing('gpt-6.2-astra'));
 
   // Unknown models stay unpriced
   const unknownCost = estimateTurnCost({
