@@ -597,21 +597,32 @@ export class TurnStore {
     };
   }
 
-  buildLatestTurnSubline(rows, todayFin) {
+  buildLatestTurnMetrics(rows, todayFin) {
     const latestRow = rows.length > 0 ? rows[rows.length - 1] : null;
-    const parts = [];
+    let tpsText = null;
     if (latestRow && typeof latestRow.tps === 'number' && Number.isFinite(latestRow.tps) && latestRow.tps > 0) {
-      parts.push(`最近速率 ${formatTps(latestRow.tps)}`);
+      tpsText = formatTps(latestRow.tps);
     } else if (todayFin && typeof todayFin.avgTps === 'number' && Number.isFinite(todayFin.avgTps) && todayFin.avgTps > 0) {
-      parts.push(`今日均速 ${formatTps(todayFin.avgTps)}`);
+      tpsText = `均 ${formatTps(todayFin.avgTps)}`;
     }
-    if (latestRow) {
+
+    let cacheText = null;
+    if (latestRow && Number(latestRow.cache_read_tokens) > 0 && Number(latestRow.total_input_tokens) > 0) {
       const cacheStr = formatCacheRate(latestRow.cache_read_tokens, latestRow.total_input_tokens);
       if (cacheStr !== '--') {
-        parts.push(`缓存 ${cacheStr}`);
+        cacheText = `缓存 ${cacheStr}`;
       }
     }
-    return parts.length > 0 ? parts.join(' · ') : null;
+
+    const parts = [];
+    if (tpsText) parts.push(tpsText.startsWith('均 ') ? `今日均速 ${tpsText.slice(2)}` : `最近速率 ${tpsText}`);
+    if (cacheText) parts.push(cacheText);
+
+    return {
+      latestTpsText: tpsText,
+      latestCacheText: cacheText,
+      latestTurnSubline: parts.length > 0 ? parts.join(' · ') : null,
+    };
   }
 
   buildCodexBarCardSnapshot(rows, nowMs = Date.now(), customRates = null, quotaInfo = null) {
@@ -712,12 +723,16 @@ export class TurnStore {
       };
     });
 
+    const latestMetrics = this.buildLatestTurnMetrics(rows, todayFin);
+
     return {
       accountEmail: quotaInfo?.accountEmail ?? null,
       planTitle: quotaInfo?.planTitle ?? null,
       quotaWindows: Array.isArray(quotaInfo?.quotaWindows) ? quotaInfo.quotaWindows : [],
       resetCreditsText: quotaInfo?.resetCreditsText ?? null,
-      latestTurnSubline: this.buildLatestTurnSubline(rows, todayFin),
+      latestTpsText: latestMetrics.latestTpsText,
+      latestCacheText: latestMetrics.latestCacheText,
+      latestTurnSubline: latestMetrics.latestTurnSubline,
       today: {
         costUsd: todayFin.estimatedCostUsd,
         totalTokens: todayFin.totalTokens,

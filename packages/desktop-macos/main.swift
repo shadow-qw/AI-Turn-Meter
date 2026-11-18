@@ -141,6 +141,8 @@ struct CodexBarCardSnapshot: Decodable {
   let planTitle: String?
   let quotaWindows: [CardQuotaWindow]?
   let resetCreditsText: String?
+  let latestTpsText: String?
+  let latestCacheText: String?
   let latestTurnSubline: String?
   let today: CardTodayMetrics
   let currentWindow: CardWindowMetrics
@@ -426,7 +428,7 @@ final class MeterViewModel: ObservableObject {
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
   }
 
-  @Published var version: String = "0.2.8"
+  @Published var version: String = "0.2.9"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -2748,6 +2750,90 @@ struct RemoteSshSheetView: View {
   }
 }
 
+private final class PopoverMenuActionBox: NSObject {
+  let block: () -> Void
+  init(_ block: @escaping () -> Void) {
+    self.block = block
+  }
+}
+
+@MainActor
+private final class DisplayPrefsMenuController: NSObject {
+  static let shared = DisplayPrefsMenuController()
+
+  private func makeItem(
+    title: String,
+    checked: Bool = false,
+    enabled: Bool = true,
+    action: (() -> Void)? = nil
+  ) -> NSMenuItem {
+    let item = NSMenuItem(
+      title: title,
+      action: action != nil ? #selector(handleItem(_:)) : nil,
+      keyEquivalent: ""
+    )
+    item.target = self
+    item.isEnabled = enabled
+    item.state = checked ? .on : .off
+    if let action = action {
+      item.representedObject = PopoverMenuActionBox(action)
+    }
+    return item
+  }
+
+  @objc private func handleItem(_ sender: NSMenuItem) {
+    if let box = sender.representedObject as? PopoverMenuActionBox {
+      box.block()
+    }
+  }
+
+  func present(vm: MeterViewModel) {
+    let menu = NSMenu()
+    menu.autoenablesItems = false
+
+    let modeItem = NSMenuItem(title: "菜单栏文本（\(vm.menuBarDisplayMode.title)）", action: nil, keyEquivalent: "")
+    let modeSub = NSMenu()
+    modeSub.autoenablesItems = false
+    for mode in MenuBarDisplayMode.allCases {
+      modeSub.addItem(makeItem(title: mode.title, checked: vm.menuBarDisplayMode == mode) {
+        vm.setMenuBarDisplayMode(mode)
+      })
+    }
+    modeItem.submenu = modeSub
+    menu.addItem(modeItem)
+
+    menu.addItem(NSMenuItem.separator())
+
+    menu.addItem(makeItem(title: "隐藏程序坞 (Dock) 图标", checked: vm.hideDockIcon) {
+      vm.setHideDockIcon(!vm.hideDockIcon)
+    })
+
+    if !vm.runtime.runningFromDmg {
+      menu.addItem(makeItem(
+        title: "开机自动启动菜单栏",
+        checked: vm.launchAtLogin,
+        enabled: !vm.busy
+      ) {
+        vm.setLaunchAtLogin(!vm.launchAtLogin)
+      })
+    }
+
+    if vm.daemonOnline && !vm.runtime.runningFromDmg {
+      menu.addItem(NSMenuItem.separator())
+      menu.addItem(makeItem(title: vm.masterEnabled ? "暂停全部监控显示" : "恢复全部监控显示") {
+        vm.setMasterEnabled(!vm.masterEnabled)
+      })
+    }
+
+    if let ev = NSApp.currentEvent, let view = ev.window?.contentView {
+      let pt = view.convert(ev.locationInWindow, from: nil)
+      menu.popUp(positioning: nil, at: NSPoint(x: pt.x + 6, y: pt.y), in: view)
+    } else {
+      menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+  }
+}
+
 private struct ProviderSwitcherBar: View {
   @ObservedObject var vm: MeterViewModel
   @Binding var selection: String
@@ -2755,8 +2841,16 @@ private struct ProviderSwitcherBar: View {
 
   private let switcherKeys = ["all", "codex", "cursor", "antigravity", "codebuddy"]
 
+  private func indicatorFraction(for key: String, installed: Bool, active: Bool) -> Double {
+    guard key != "all", installed, active else { return 0 }
+    if let rem = vm.usageData?.cards?[key]?.quotaWindows?.first?.remainingPct {
+      return max(0.08, min(1.0, rem / 100.0))
+    }
+    return 1.0
+  }
+
   var body: some View {
-    HStack(spacing: 4) {
+    HStack(spacing: 3) {
       ForEach(switcherKeys, id: \.self) { key in
         let isSelected = selection == key
         let isHovered = hoveredKey == key
@@ -2764,29 +2858,39 @@ private struct ProviderSwitcherBar: View {
         let entry = vm.apps[key]
         let installed = isAll || (entry?.installed ?? false)
         let active = !isAll && installed && vm.isActiveOverall && vm.isToolEnabled(key)
-        let indicatorColor: Color = {
-          if isAll { return .clear }
+        let frac = indicatorFraction(for: key, installed: installed, active: active)
+        let fillColor: Color = {
+          if isHovered { return .white.opacity(0.92) }
           if active { return vm.toolAccentColor(for: key) }
-          if installed { return Color.gray.opacity(0.35) }
-          return .clear
-        }()
-        let bottomIndicator: Color = {
-          if isHovered { return .clear }
-          if isSelected { return indicatorColor != .clear ? indicatorColor : CodexBarPalette.accentBlue }
-          return indicatorColor
+          return Color.gray.opacity(0.45)
         }()
 
         Button {
           selection = key
         } label: {
-          VStack(spacing: 3) {
+          VStack(spacing: 2.5) {
             Image(systemName: ToolGlyph.iconName(for: key))
-              .font(.system(size: 13.5, weight: .semibold))
-              .frame(height: 15)
+              .font(.system(size: 12.5, weight: .semibold))
+              .frame(height: 14)
             Text(vm.toolShortTitle(for: key))
               .font(.system(size: 9.5, weight: isSelected ? .semibold : .medium))
               .lineLimit(1)
-              .minimumScaleFactor(0.78)
+              .minimumScaleFactor(0.72)
+              .padding(.horizontal, 1)
+
+            ZStack(alignment: .leading) {
+              Capsule()
+                .fill(isAll ? Color.clear : (isHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.14)))
+              if !isAll && frac > 0 {
+                Capsule()
+                  .fill(fillColor)
+                  .frame(width: max(3, 26 * CGFloat(frac)))
+              } else if isAll && isSelected && !isHovered {
+                Capsule()
+                  .fill(CodexBarPalette.accentBlue)
+              }
+            }
+            .frame(width: 26, height: 2)
           }
           .foregroundColor(
             isHovered
@@ -2794,20 +2898,12 @@ private struct ProviderSwitcherBar: View {
               : (isSelected ? .primary : (installed ? .primary.opacity(0.82) : .secondary.opacity(0.55)))
           )
           .frame(maxWidth: .infinity)
-          .padding(.vertical, 6)
-          .padding(.horizontal, 2)
+          .padding(.vertical, 4.5)
+          .padding(.horizontal, 1)
           .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
               .fill(isHovered ? CodexBarPalette.accentBlue : (isSelected ? Color.primary.opacity(0.08) : Color.clear))
           )
-          .overlay(alignment: .bottom) {
-            if bottomIndicator != .clear {
-              Capsule()
-                .fill(bottomIndicator)
-                .frame(width: 24, height: 2.5)
-                .offset(y: 1)
-            }
-          }
           .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2817,9 +2913,9 @@ private struct ProviderSwitcherBar: View {
         }
       }
     }
-    .padding(.horizontal, 10)
-    .padding(.top, 8)
-    .padding(.bottom, 6)
+    .padding(.horizontal, 8)
+    .padding(.top, 6)
+    .padding(.bottom, 5)
   }
 }
 
@@ -2851,33 +2947,33 @@ private struct MiniUsageBarsView: View {
   var body: some View {
     let maxVal = max(0.000001, points.map(metricValue).max() ?? 0)
 
-    VStack(spacing: 4) {
+    VStack(spacing: 3) {
       HStack {
         if let pt = hovered {
           Text("\(pt.label) · \(MeterFormat.usd(pt.costUsd)) · \(MeterFormat.tokens(pt.totalTokens))")
-            .font(.system(size: 10, weight: .semibold))
+            .font(.system(size: 9.5, weight: .semibold))
             .monospacedDigit()
             .foregroundColor(cardHovered ? .white : .primary)
             .lineLimit(1)
         } else {
           Text("近 30 天趋势")
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: 9.5, weight: .medium))
             .foregroundColor(cardHovered ? .white.opacity(0.78) : .secondary)
         }
         Spacer()
         Text(peakLabel)
-          .font(.system(size: 10.5, weight: .semibold))
+          .font(.system(size: 9.5, weight: .semibold))
           .monospacedDigit()
           .foregroundColor(cardHovered ? .white.opacity(0.88) : .primary.opacity(0.82))
       }
 
-      HStack(alignment: .bottom, spacing: 2.5) {
+      HStack(alignment: .bottom, spacing: 2) {
         ForEach(points) { pt in
           let val = metricValue(pt)
           let ratio = val > 0 ? CGFloat(val / maxVal) : 0
           let isHovered = hovered?.id == pt.id
 
-          RoundedRectangle(cornerRadius: 2, style: .continuous)
+          RoundedRectangle(cornerRadius: 1.5, style: .continuous)
             .fill(
               val > 0
                 ? (cardHovered
@@ -2888,7 +2984,7 @@ private struct MiniUsageBarsView: View {
                     : Color.primary.opacity(isHovered ? 0.35 : 0.15))
             )
             .frame(maxWidth: .infinity)
-            .frame(height: val > 0 ? max(5, ratio * 34) : 2.5)
+            .frame(height: val > 0 ? max(4, ratio * 24) : 2.0)
             .contentShape(Rectangle())
             .onHover { inside in
               if inside { hovered = pt }
@@ -2896,7 +2992,7 @@ private struct MiniUsageBarsView: View {
             }
         }
       }
-      .frame(height: 36, alignment: .bottom)
+      .frame(height: 26, alignment: .bottom)
     }
   }
 }
@@ -2910,7 +3006,7 @@ private struct CodexBarStyleCardView: View {
   private var isAll: Bool { selection == "all" }
 
   private var headerTitle: String {
-    isAll ? "全部客户端" : vm.displayTitle(for: selection)
+    isAll ? "全部客户端" : vm.toolShortTitle(for: selection)
   }
 
   private var primaryText: Color {
@@ -2951,41 +3047,51 @@ private struct CodexBarStyleCardView: View {
     return best
   }
 
+  private var resolvedTpsBadge: String? {
+    if let tps = card.latestTpsText, !tps.isEmpty {
+      return tps
+    }
+    if let raw = latestTurn?.tps, raw > 0 {
+      return MeterFormat.tps(raw)
+    }
+    return nil
+  }
+
   private var visibleWindows: [CardRecentWindow] {
     card.recentWindows.filter { $0.index == 0 || $0.turnCount > 0 }
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 11) {
-      // Card Header (CodexBar style: Email / Plan on the right)
+    VStack(alignment: .leading, spacing: 8) {
+      // Card Header (CodexBar compact density: concise title + Email / Plan)
       HStack(alignment: .top) {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 1.5) {
           Text(headerTitle)
-            .font(.system(size: 16, weight: .bold))
+            .font(.system(size: 13.5, weight: .bold))
             .foregroundColor(primaryText)
           Text(vm.relativeUpdateLabel())
-            .font(.system(size: 10.5))
+            .font(.system(size: 9.5))
             .foregroundColor(secondaryText)
         }
 
-        Spacer()
+        Spacer(minLength: 6)
 
-        VStack(alignment: .trailing, spacing: 2) {
+        VStack(alignment: .trailing, spacing: 1.5) {
           Text(card.accountEmail ?? statusLabel)
-            .font(.system(size: 11.5, weight: .semibold))
+            .font(.system(size: 11, weight: .semibold))
             .foregroundColor(primaryText)
             .lineLimit(1)
           Text(card.planTitle ?? "本地监控")
-            .font(.system(size: 10))
+            .font(.system(size: 9.5))
             .foregroundColor(secondaryText)
             .lineLimit(1)
         }
       }
 
-      // Primary Quota Windows (CodexBar style: Remaining % + Reset countdown + Pace marker)
+      // Primary Quota Windows (Remaining % + Reset countdown + Pace marker)
       let windows = card.quotaWindows ?? []
       if !windows.isEmpty {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 7) {
           ForEach(windows) { win in
             quotaBlock(win: win)
           }
@@ -2996,28 +3102,28 @@ private struct CodexBarStyleCardView: View {
             isAll
               ? "正在同步客户端登录与额度信息…"
               : ((vm.apps[selection]?.installed ?? false)
-                  ? "企业/团队或按量模式 · 无固定个人会话限额"
+                  ? "企业/团队按量模式 · 无固定个人会话限额"
                   : "未检测到该客户端安装")
           )
-          .font(.system(size: 11))
+          .font(.system(size: 10))
           .foregroundColor(secondaryText)
           .lineLimit(1)
-          Spacer()
+          Spacer(minLength: 4)
           Text(statusLabel)
-            .font(.system(size: 10.5, weight: .medium))
+            .font(.system(size: 9.5, weight: .medium))
             .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
         }
-        .padding(.vertical, 2)
       }
 
       if let resetCredits = card.resetCreditsText, !resetCredits.isEmpty {
-        VStack(alignment: .leading, spacing: 2) {
+        HStack {
           Text("限额重置额度")
-            .font(.system(size: 11.5, weight: .bold))
+            .font(.system(size: 10.5, weight: .bold))
             .foregroundColor(primaryText)
+          Spacer()
           Text(resetCredits)
-            .font(.system(size: 10.5, weight: .medium))
-            .foregroundColor(isCardHovered ? .white.opacity(0.88) : .primary.opacity(0.85))
+            .font(.system(size: 10, weight: .medium))
+            .foregroundColor(isCardHovered ? .white.opacity(0.9) : .secondary)
         }
       }
 
@@ -3026,9 +3132,9 @@ private struct CodexBarStyleCardView: View {
         .frame(height: 1)
 
       // Cost & Usage 3x2 Dual-Column Grid
-      VStack(alignment: .leading, spacing: 8) {
+      VStack(alignment: .leading, spacing: 5.5) {
         Text("费用与用量")
-          .font(.system(size: 12.5, weight: .bold))
+          .font(.system(size: 11, weight: .bold))
           .foregroundColor(primaryText)
 
         metricGridRow(
@@ -3058,24 +3164,24 @@ private struct CodexBarStyleCardView: View {
 
       // Recent Rolling 7-day Windows
       if !visibleWindows.isEmpty {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
           Text("最近窗口")
-            .font(.system(size: 11, weight: .semibold))
+            .font(.system(size: 10, weight: .semibold))
             .foregroundColor(isCardHovered ? .white.opacity(0.92) : .primary.opacity(0.9))
 
           ForEach(visibleWindows) { win in
             HStack(alignment: .top) {
-              VStack(alignment: .leading, spacing: 1) {
+              VStack(alignment: .leading, spacing: 0.5) {
                 Text(win.title)
-                  .font(.system(size: 11.5, weight: .semibold))
+                  .font(.system(size: 10.5, weight: .semibold))
                   .foregroundColor(primaryText)
                 Text("估算：\(win.rangeText)")
-                  .font(.system(size: 9.5))
+                  .font(.system(size: 9))
                   .foregroundColor(secondaryText)
               }
               Spacer()
               Text("\(MeterFormat.usd(win.costUsd)) · \(MeterFormat.tokens(win.totalTokens))")
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.system(size: 10.5, weight: .semibold))
                 .monospacedDigit()
                 .foregroundColor(primaryText)
             }
@@ -3083,33 +3189,31 @@ private struct CodexBarStyleCardView: View {
         }
       }
 
-      // Footer Model, TPS Sub-label & Disclaimer
-      VStack(alignment: .leading, spacing: 1.5) {
-        if let topModel = card.topModel {
-          Text("最常用模型：\(topModel)")
-            .font(.system(size: 10.5, weight: .medium))
-            .foregroundColor(isCardHovered ? .white.opacity(0.9) : .primary.opacity(0.85))
-            .lineLimit(1)
+      // HIG Sub-label Pill Badges + Disclaimer
+      VStack(alignment: .leading, spacing: 4) {
+        if card.topModel != nil || resolvedTpsBadge != nil || card.latestCacheText != nil {
+          HStack(spacing: 4) {
+            if let topModel = card.topModel {
+              footerBadge(icon: "cpu", text: topModel)
+            }
+            if let tps = resolvedTpsBadge {
+              footerBadge(icon: "bolt.fill", text: tps)
+                .layoutPriority(1)
+            }
+            if let cache = card.latestCacheText {
+              footerBadge(icon: "checkmark.seal", text: cache)
+                .layoutPriority(1)
+            }
+            Spacer(minLength: 0)
+          }
         }
-        if let subline = card.latestTurnSubline, !subline.isEmpty {
-          Text(subline)
-            .font(.system(size: 9.5))
-            .monospacedDigit()
-            .foregroundColor(secondaryText)
-            .lineLimit(1)
-        } else if let tps = latestTurn?.tps, tps > 0 {
-          Text("最近速率 \(MeterFormat.tps(tps))")
-            .font(.system(size: 9.5))
-            .monospacedDigit()
-            .foregroundColor(secondaryText)
-            .lineLimit(1)
-        }
+
         Text("根据 Token 用量估算 · 不是订阅账单")
-          .font(.system(size: 9.5))
+          .font(.system(size: 9))
           .foregroundColor(secondaryText)
       }
     }
-    .padding(13)
+    .padding(11)
     .background(
       Group {
         if isCardHovered {
@@ -3123,13 +3227,31 @@ private struct CodexBarStyleCardView: View {
         }
       }
     )
-    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     .overlay(
-      RoundedRectangle(cornerRadius: 12, style: .continuous)
+      RoundedRectangle(cornerRadius: 10, style: .continuous)
         .stroke(isCardHovered ? Color.clear : Color.primary.opacity(0.08), lineWidth: 1)
     )
     .onHover { isCardHovered = $0 }
-    .padding(.horizontal, 10)
+    .padding(.horizontal, 8)
+  }
+
+  private func footerBadge(icon: String, text: String) -> some View {
+    HStack(spacing: 3) {
+      Image(systemName: icon)
+        .font(.system(size: 8.5, weight: .semibold))
+      Text(text)
+        .font(.system(size: 9.5, weight: .medium))
+        .monospacedDigit()
+        .lineLimit(1)
+        .truncationMode(.middle)
+    }
+    .foregroundColor(isCardHovered ? .white.opacity(0.92) : .secondary)
+    .padding(.horizontal, 6)
+    .padding(.vertical, 2)
+    .background(
+      Capsule().fill(isCardHovered ? Color.white.opacity(0.16) : Color.primary.opacity(0.06))
+    )
   }
 
   private func quotaBlock(win: CardQuotaWindow) -> some View {
@@ -3140,16 +3262,16 @@ private struct CodexBarStyleCardView: View {
     let tickColor = isCardHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.16)
     let paceTickColor = isCardHovered ? Color.white.opacity(0.95) : Color.primary.opacity(0.65)
 
-    return VStack(alignment: .leading, spacing: 4) {
+    return VStack(alignment: .leading, spacing: 3) {
       HStack {
         Text("\(win.title) 剩余 \(pctRounded)%")
-          .font(.system(size: 12, weight: .bold))
+          .font(.system(size: 11.5, weight: .bold))
           .monospacedDigit()
           .foregroundColor(primaryText)
         Spacer()
         if let resetText = win.resetText, !resetText.isEmpty {
           Text(resetText)
-            .font(.system(size: 10.5, weight: .medium))
+            .font(.system(size: 9.5, weight: .medium))
             .monospacedDigit()
             .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
             .lineLimit(1)
@@ -3163,34 +3285,34 @@ private struct CodexBarStyleCardView: View {
           if clamped > 0 {
             Capsule()
               .fill(fillColor)
-              .frame(width: max(5, geo.size.width * CGFloat(clamped)))
+              .frame(width: max(4, geo.size.width * CGFloat(clamped)))
           }
           // Subtle 25/50/75 tick marks
           HStack {
             Spacer()
-            Rectangle().fill(tickColor).frame(width: 1, height: 7)
+            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
             Spacer()
-            Rectangle().fill(tickColor).frame(width: 1, height: 7)
+            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
             Spacer()
-            Rectangle().fill(tickColor).frame(width: 1, height: 7)
+            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
             Spacer()
           }
           // Expected remaining pace marker
           if let pacePct = win.pacePct {
             let paceFrac = min(1.0, max(0.0, pacePct / 100.0))
-            let paceX = min(geo.size.width - 2.2, max(0, geo.size.width * CGFloat(paceFrac) - 1.1))
+            let paceX = min(geo.size.width - 2.0, max(0, geo.size.width * CGFloat(paceFrac) - 1.0))
             RoundedRectangle(cornerRadius: 1)
               .fill(paceTickColor)
-              .frame(width: 2.2, height: 10)
+              .frame(width: 2.0, height: 8.5)
               .offset(x: paceX)
           }
         }
       }
-      .frame(height: 7)
+      .frame(height: 5.5)
 
       if let sub = win.subtitle, !sub.isEmpty {
         Text(sub)
-          .font(.system(size: 10))
+          .font(.system(size: 9.5))
           .monospacedDigit()
           .foregroundColor(secondaryText)
           .lineLimit(1)
@@ -3204,25 +3326,28 @@ private struct CodexBarStyleCardView: View {
     rightLabel: String,
     rightVal: String
   ) -> some View {
-    HStack(alignment: .top, spacing: 10) {
-      VStack(alignment: .leading, spacing: 1.5) {
+    HStack(alignment: .top, spacing: 8) {
+      VStack(alignment: .leading, spacing: 1) {
         Text(leftLabel)
-          .font(.system(size: 10.5, weight: .medium))
+          .font(.system(size: 9.5, weight: .medium))
           .foregroundColor(secondaryText)
+          .lineLimit(1)
+          .minimumScaleFactor(0.85)
         Text(leftVal)
-          .font(.system(size: 15, weight: .bold))
+          .font(.system(size: 13, weight: .bold))
           .monospacedDigit()
           .foregroundColor(primaryText)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
 
-      VStack(alignment: .leading, spacing: 1.5) {
+      VStack(alignment: .leading, spacing: 1) {
         Text(rightLabel)
-          .font(.system(size: 10.5, weight: .medium))
+          .font(.system(size: 9.5, weight: .medium))
           .foregroundColor(secondaryText)
           .lineLimit(1)
+          .minimumScaleFactor(0.85)
         Text(rightVal)
-          .font(.system(size: 15, weight: .bold))
+          .font(.system(size: 13, weight: .bold))
           .monospacedDigit()
           .foregroundColor(primaryText)
       }
@@ -3242,29 +3367,29 @@ private struct PopoverActionRow: View {
 
   var body: some View {
     Button(action: action) {
-      HStack(spacing: 8) {
+      HStack(spacing: 6) {
         Text(title)
-          .font(.system(size: 12.5))
+          .font(.system(size: 12))
           .foregroundColor(hovering ? .white : .primary)
         Spacer()
         if let badge = badgeText, !badge.isEmpty {
           Text(badge)
-            .font(.system(size: 10.5))
+            .font(.system(size: 10))
             .foregroundColor(hovering ? .white.opacity(0.9) : .secondary)
         }
         if let trailing = trailingSymbol {
           Image(systemName: trailing)
-            .font(.system(size: 10.5, weight: .semibold))
+            .font(.system(size: 10, weight: .semibold))
             .foregroundColor(hovering ? .white : .secondary)
         }
         if let shortcut = shortcut {
           Text(shortcut)
-            .font(.system(size: 11))
+            .font(.system(size: 10.5))
             .foregroundColor(hovering ? .white.opacity(0.9) : .secondary)
         }
       }
-      .padding(.horizontal, 10)
-      .padding(.vertical, 5.5)
+      .padding(.horizontal, 9)
+      .padding(.vertical, 4)
       .frame(maxWidth: .infinity, alignment: .leading)
       .background(
         RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -3282,8 +3407,6 @@ struct MenuBarPopoverView: View {
   let onOpenMainTab: (MainTab) -> Void
   let onCheckUpdates: () -> Void
   let onClosePopover: () -> Void
-
-  @State private var showDisplayPrefs = false
 
   private var activeCard: CodexBarCardSnapshot {
     if let snapshot = vm.usageData?.cards?[vm.popoverSelection] {
@@ -3311,6 +3434,8 @@ struct MenuBarPopoverView: View {
       planTitle: nil,
       quotaWindows: nil,
       resetCreditsText: nil,
+      latestTpsText: nil,
+      latestCacheText: nil,
       latestTurnSubline: nil,
       today: emptyToday,
       currentWindow: emptyWin,
@@ -3321,81 +3446,33 @@ struct MenuBarPopoverView: View {
     )
   }
 
+  private var showsContextStrip: Bool {
+    (!vm.runtime.runningFromDmg && (!vm.daemonOnline || !vm.masterEnabled)) || vm.popoverSelection != "all"
+  }
+
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       ProviderSwitcherBar(vm: vm, selection: $vm.popoverSelection)
 
       CodexBarStyleCardView(vm: vm, selection: vm.popoverSelection, card: activeCard)
 
-      // Quick Client / Status Context Strip
-      quickContextSection
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+      if showsContextStrip {
+        quickContextSection
+          .padding(.horizontal, 10)
+          .padding(.vertical, 5)
+      } else {
+        Spacer().frame(height: 5)
+      }
 
-      Divider().padding(.horizontal, 10)
+      Divider().padding(.horizontal, 8)
 
-      // Expandable Display & Autostart Settings + Main Navigation Actions
       VStack(spacing: 1) {
         PopoverActionRow(
           title: "显示样式与驻留",
-          trailingSymbol: showDisplayPrefs ? "chevron.down" : "chevron.right",
+          trailingSymbol: "chevron.right",
           badgeText: vm.menuBarDisplayMode.title
         ) {
-          showDisplayPrefs.toggle()
-        }
-
-        if showDisplayPrefs {
-          VStack(alignment: .leading, spacing: 7) {
-            HStack {
-              Text("菜单栏文本")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-              Spacer()
-              Picker("", selection: Binding(
-                get: { vm.menuBarDisplayMode },
-                set: { vm.setMenuBarDisplayMode($0) }
-              )) {
-                ForEach(MenuBarDisplayMode.allCases, id: \.self) { m in
-                  Text(m.title).tag(m)
-                }
-              }
-              .labelsHidden()
-              .frame(width: 145)
-              .controlSize(.small)
-            }
-
-            Toggle("隐藏程序坞 (Dock) 图标", isOn: Binding(
-              get: { vm.hideDockIcon },
-              set: { vm.setHideDockIcon($0) }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .font(.system(size: 11.5))
-
-            if !vm.runtime.runningFromDmg {
-              Toggle("开机自动启动菜单栏", isOn: Binding(
-                get: { vm.launchAtLogin },
-                set: { vm.setLaunchAtLogin($0) }
-              ))
-              .toggleStyle(.switch)
-              .controlSize(.mini)
-              .font(.system(size: 11.5))
-              .disabled(vm.busy)
-            }
-
-            if vm.daemonOnline && !vm.runtime.runningFromDmg {
-              Button(vm.masterEnabled ? "暂停全部监控显示" : "恢复全部监控显示") {
-                vm.setMasterEnabled(!vm.masterEnabled)
-              }
-              .buttonStyle(.bordered)
-              .controlSize(.mini)
-            }
-          }
-          .padding(9)
-          .background(Color.primary.opacity(0.04))
-          .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-          .padding(.horizontal, 6)
-          .padding(.vertical, 4)
+          DisplayPrefsMenuController.shared.present(vm: vm)
         }
 
         PopoverActionRow(title: "用量仪表盘…") {
@@ -3415,9 +3492,9 @@ struct MenuBarPopoverView: View {
         .keyboardShortcut(",", modifiers: .command)
       }
       .padding(.horizontal, 6)
-      .padding(.vertical, 4)
+      .padding(.vertical, 3)
 
-      Divider().padding(.horizontal, 10)
+      Divider().padding(.horizontal, 8)
 
       VStack(spacing: 1) {
         PopoverActionRow(title: "刷新", shortcut: "⌘ R") {
@@ -3437,10 +3514,10 @@ struct MenuBarPopoverView: View {
         .keyboardShortcut("q", modifiers: .command)
       }
       .padding(.horizontal, 6)
-      .padding(.top, 4)
-      .padding(.bottom, 7)
+      .padding(.top, 3)
+      .padding(.bottom, 6)
     }
-    .frame(width: 356)
+    .frame(width: 310)
   }
 
   @ViewBuilder
@@ -3449,7 +3526,7 @@ struct MenuBarPopoverView: View {
     if !vm.runtime.runningFromDmg && (!vm.daemonOnline || !vm.masterEnabled) {
       HStack {
         Text(vm.daemonOnline ? "全局监控已暂停" : "后台采集服务未运行")
-          .font(.system(size: 11.5))
+          .font(.system(size: 11))
           .foregroundColor(.secondary)
         Spacer()
         Button(vm.daemonOnline ? "恢复显示" : "开启后台") {
@@ -3459,35 +3536,8 @@ struct MenuBarPopoverView: View {
         .tint(CodexBarPalette.accentBlue)
         .controlSize(.mini)
       }
-      .padding(.horizontal, 4)
-    } else if key == "all" {
-      HStack(spacing: 5) {
-        ForEach(vm.orderedKeys, id: \.self) { k in
-          let entry = vm.apps[k]
-          let installed = entry?.installed ?? false
-          let enabled = vm.isToolEnabled(k)
-          let active = installed && vm.isActiveOverall && enabled
-          Button {
-            vm.popoverSelection = k
-          } label: {
-            HStack(spacing: 4) {
-              Circle()
-                .fill(active ? vm.toolAccentColor(for: k) : Color.gray.opacity(0.4))
-                .frame(width: 5.5, height: 5.5)
-              Text(vm.toolShortTitle(for: k))
-                .font(.system(size: 10.5, weight: .medium))
-                .lineLimit(1)
-            }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3.5)
-            .frame(maxWidth: .infinity)
-            .background(Color.primary.opacity(0.05))
-            .clipShape(Capsule())
-          }
-          .buttonStyle(.plain)
-        }
-      }
-    } else {
+      .padding(.horizontal, 2)
+    } else if key != "all" {
       let entry = vm.apps[key]
       let installed = entry?.installed ?? false
       let enabled = vm.isToolEnabled(key)
@@ -3499,7 +3549,7 @@ struct MenuBarPopoverView: View {
             set: { vm.setToolEnabled(key, enabled: $0) }
           )) {
             Text("监控 \(vm.toolShortTitle(for: key))")
-              .font(.system(size: 11.5))
+              .font(.system(size: 11))
           }
           .toggleStyle(.switch)
           .controlSize(.mini)
@@ -3522,13 +3572,13 @@ struct MenuBarPopoverView: View {
             .controlSize(.mini)
           }
         } else {
-          Text("未检测到 \(vm.displayTitle(for: key)) 安装")
-            .font(.system(size: 11.5))
+          Text("未检测到 \(vm.toolShortTitle(for: key)) 安装")
+            .font(.system(size: 11))
             .foregroundColor(.secondary)
           Spacer()
         }
       }
-      .padding(.horizontal, 4)
+      .padding(.horizontal, 2)
     }
   }
 }

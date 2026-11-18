@@ -1780,6 +1780,18 @@ test('computeQuotaWindow calculates pace/reserve and getUsageSummary binds quota
       outputTokens: 1_500,
       tps: 180,
     });
+    store.upsertTurn({
+      turnUid: 'cursor:q2:t1',
+      tool: 'cursor',
+      sessionId: 'q2',
+      turnId: 't1',
+      model: 'gpt-6-astra',
+      completedAtMs: nowMs - 2000,
+      totalInputTokens: 20_000,
+      cacheReadTokens: 0,
+      outputTokens: 300,
+      tps: 42.5,
+    });
     const summary = store.getUsageSummary({
       days: 7,
       nowMs,
@@ -1802,7 +1814,12 @@ test('computeQuotaWindow calculates pace/reserve and getUsageSummary binds quota
     assert.equal(summary.cards.codex.planTitle, 'Plus');
     assert.equal(summary.cards.codex.quotaWindows.length, 1);
     assert.equal(summary.cards.codex.resetCreditsText, '3 次可用');
+    assert.equal(summary.cards.codex.latestTpsText, '180 tok/s');
+    assert.equal(summary.cards.codex.latestCacheText, '缓存 90%');
     assert.equal(summary.cards.codex.latestTurnSubline, '最近速率 180 tok/s · 缓存 90%');
+    assert.equal(summary.cards.cursor.latestTpsText, '42.5 tok/s');
+    assert.equal(summary.cards.cursor.latestCacheText, null);
+    assert.equal(summary.cards.cursor.latestTurnSubline, '最近速率 42.5 tok/s');
     assert.equal(summary.cards.all.accountEmail, '1 个已登录账号');
     assert.equal(summary.cards.cursor.quotaWindows.length, 0);
   } finally {
