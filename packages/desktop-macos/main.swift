@@ -479,7 +479,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.17"
+  @Published var version: String = "0.2.18"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -3731,14 +3731,20 @@ private final class CostHistoryFlyoutController: NSObject {
     let panelWidth: CGFloat = 286
     let panelHeight = min(max(fitSize.height, 200), 620)
 
-    let popFrame = popWindow.frame
+    let visiblePopRect: NSRect = {
+      if let cv = pop.contentViewController?.view, cv.window === popWindow {
+        return popWindow.convertToScreen(cv.convert(cv.bounds, to: nil))
+      }
+      return popWindow.frame
+    }()
     let screenFrame = (popWindow.screen ?? NSScreen.main)?.visibleFrame
       ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
 
-    let x: CGFloat = (popFrame.minX - panelWidth - 8 >= screenFrame.minX)
-      ? (popFrame.minX - panelWidth - 8)
-      : min(screenFrame.maxX - panelWidth - 8, popFrame.maxX + 8)
-    let rawY = popFrame.maxY - panelHeight
+    let gap: CGFloat = 4
+    let x: CGFloat = (visiblePopRect.minX - panelWidth - gap >= screenFrame.minX)
+      ? (visiblePopRect.minX - panelWidth - gap)
+      : min(screenFrame.maxX - panelWidth - 6, visiblePopRect.maxX + gap)
+    let rawY = visiblePopRect.maxY - panelHeight
     let y = min(screenFrame.maxY - panelHeight - 6, max(screenFrame.minY + 8, rawY))
 
     p.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
@@ -3751,6 +3757,19 @@ private final class CostHistoryFlyoutController: NSObject {
       attachedParentWindow = popWindow
     }
     p.orderFront(nil)
+  }
+
+  func refreshPanelHeightPreservingTop() {
+    guard let p = panel, p.isVisible, let hosting = hostingView else { return }
+    hosting.layoutSubtreeIfNeeded()
+    let fitSize = hosting.fittingSize
+    let panelHeight = min(max(fitSize.height, 180), 640)
+    var frame = p.frame
+    if abs(frame.height - panelHeight) < 1 { return }
+    let topY = frame.maxY
+    frame.size.height = panelHeight
+    frame.origin.y = max((p.screen ?? NSScreen.main)?.visibleFrame.minY ?? 8, topY - panelHeight)
+    p.setFrame(frame, display: true)
   }
 }
 
@@ -3793,7 +3812,6 @@ private struct CostHistoryDetailFlyoutView: View {
     let selectedPt: CardDailyPoint? = points.first(where: { $0.date == hoveredDate })
       ?? points.last(where: { $0.totalTokens > 0 || ($0.costUsd ?? 0) > 0 })
       ?? points.last
-    let maxDayModelsCount = points.map { min(4, ($0.models ?? []).count) }.max() ?? 0
     let projects = Array((card.projects ?? []).prefix(5))
 
     VStack(alignment: .leading, spacing: 10) {
@@ -3884,27 +3902,24 @@ private struct CostHistoryDetailFlyoutView: View {
             .foregroundColor(.secondary)
             .lineLimit(1)
 
-          VStack(alignment: .leading, spacing: 6) {
-            ForEach(dayModels) { m in
-              HStack(alignment: .center, spacing: 8) {
-                Rectangle()
-                  .fill(CodexBarPalette.tealBar)
-                  .frame(width: 2, height: 26)
-                VStack(alignment: .leading, spacing: 1) {
-                  Text(m.model)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                  Text("\(MeterFormat.usd(m.costUsd)) · \(MeterFormat.tokens(m.totalTokens))")
-                    .font(.system(size: 10.5))
-                    .monospacedDigit()
-                    .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-                }
+          ForEach(dayModels) { m in
+            HStack(alignment: .center, spacing: 8) {
+              Rectangle()
+                .fill(CodexBarPalette.tealBar)
+                .frame(width: 2, height: 26)
+              VStack(alignment: .leading, spacing: 1) {
+                Text(m.model)
+                  .font(.system(size: 11))
+                  .foregroundColor(.secondary)
+                  .lineLimit(1)
+                  .truncationMode(.middle)
+                Text("\(MeterFormat.usd(m.costUsd)) · \(MeterFormat.tokens(m.totalTokens))")
+                  .font(.system(size: 10.5))
+                  .monospacedDigit()
+                  .foregroundColor(Color(nsColor: .tertiaryLabelColor))
               }
             }
           }
-          .frame(minHeight: maxDayModelsCount > 0 ? CGFloat(maxDayModelsCount * 32 - 6) : 0, alignment: .topLeading)
         }
       }
 
@@ -3954,6 +3969,11 @@ private struct CostHistoryDetailFlyoutView: View {
     .frame(width: 286, alignment: .leading)
     .contentShape(Rectangle())
     .onHover { onHoverChanged($0) }
+    .onChange(of: selectedPt?.date) { _ in
+      DispatchQueue.main.async {
+        CostHistoryFlyoutController.shared.refreshPanelHeightPreservingTop()
+      }
+    }
   }
 
   private func flyoutBar(
