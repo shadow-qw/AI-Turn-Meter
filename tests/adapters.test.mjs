@@ -48,7 +48,7 @@ import {
   patchCursorHooks,
 } from '../packages/daemon/src/installer.mjs';
 import { estimateTurnCost, resolveModelPricing } from '../packages/daemon/src/pricing.mjs';
-import { computeQuotaWindow } from '../packages/daemon/src/quota.mjs';
+import { computeQuotaWindow, parseCursorQuotaSummary } from '../packages/daemon/src/quota.mjs';
 
 test('formatting helpers match specification', () => {
   assert.equal(formatTokens(341), '341');
@@ -2045,5 +2045,92 @@ test('Codex adapter filters third-party proxy models, recovers superseded turns,
     s2.close();
   } finally {
     rmSync(dbDir, { recursive: true, force: true });
+  }
+});
+
+test('parseCursorQuotaSummary splits Cursor dual-pool model quotas cleanly and server persists config next to store.dbPath', async () => {
+  const nowMs = Date.parse('2026-11-18T08:00:00.000Z');
+  const startIso = '2026-11-01T00:00:00.000Z';
+  const endIso = '2026-12-01T00:00:00.000Z';
+
+  // Dual-pool Enterprise payload with used=$20/$20 API cap + 33% Auto + 100% API + $106.73/$333 onDemand
+  const dual = parseCursorQuotaSummary(
+    {
+      billingCycleStart: startIso,
+      billingCycleEnd: endIso,
+      membershipType: 'enterprise',
+      individualUsage: {
+        plan: {
+          enabled: true,
+          used: 2000,
+          limit: 2000,
+          autoPercentUsed: 33,
+          apiPercentUsed: 100,
+          totalPercentUsed: 43.5,
+        },
+        onDemand: {
+          enabled: true,
+          used: 10673,
+          limit: 33300,
+          remaining: 22627,
+        },
+      },
+    },
+    { nowMs, accountEmail: 'dev@example.com', planTitle: 'Enterprise · Corp' }
+  );
+
+  assert.equal(dual.quotaWindows.length, 2);
+  assert.equal(dual.quotaWindows[0].id, 'cursor-auto');
+  assert.equal(dual.quotaWindows[0].title, 'Cursor 模型');
+  assert.equal(dual.quotaWindows[0].remainingPct, 67);
+  assert.doesNotMatch(dual.quotaWindows[0].subtitle || '', /\$20\.00/);
+  assert.equal(dual.quotaWindows[1].id, 'cursor-api');
+  assert.equal(dual.quotaWindows[1].title, '其他模型');
+  assert.equal(dual.quotaWindows[1].remainingPct, 0);
+  assert.equal(dual.quotaWindows[1].pacePct, null);
+  assert.equal(dual.quotaWindows[1].subtitle, '已用尽 · 等待重置');
+  assert.equal(dual.resetCreditsText, '$106.73 / $333.00');
+
+  // Enterprise without individual plan block falls back cleanly to verified teamBudget
+  const teamOnly = parseCursorQuotaSummary(
+    {
+      billingCycleStart: startIso,
+      billingCycleEnd: endIso,
+      membershipType: 'enterprise',
+      limitType: 'team',
+      individualUsage: {},
+    },
+    { nowMs, teamBudget: { usedUSD: 73.84, limitUSD: 100 } }
+  );
+  assert.equal(teamOnly.quotaWindows.length, 1);
+  assert.equal(teamOnly.quotaWindows[0].title, '套餐额度');
+  assert.equal(teamOnly.quotaWindows[0].remainingPct, 26.2);
+  assert.match(teamOnly.quotaWindows[0].subtitle || '', /已用 \$73\.84 \/ \$100/);
+
+  // createMeterServer without explicit dbPath/stateDir persists config.json alongside AI_TURN_METER_DB
+  const stateTmp = mkdtempSync(join(tmpdir(), 'atm-cfg-'));
+  const prevEnvDb = process.env.AI_TURN_METER_DB;
+  process.env.AI_TURN_METER_DB = join(stateTmp, 'meter.db');
+  const meter = createMeterServer({
+    port: 0,
+    enableWatchers: false,
+    enableCdp: false,
+    enableQuotaProbe: false,
+  });
+  const addr = await meter.start();
+  try {
+    const res = await fetch(`http://127.0.0.1:${addr.port}/v1/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cursorCookie: 'WorkosCursorSessionToken=user_1::tok' }),
+    });
+    assert.equal(res.status, 200);
+    const saved = JSON.parse(readFileSync(join(stateTmp, 'config.json'), 'utf8'));
+    assert.equal(saved.cursorCookie, 'WorkosCursorSessionToken=user_1::tok');
+  } finally {
+    await meter.stop();
+    if (prevEnvDb === undefined) delete process.env.AI_TURN_METER_DB;
+    else process.env.AI_TURN_METER_DB = prevEnvDb;
+    rmSync(stateTmp, { recursive: true, force: true });
   }
 });

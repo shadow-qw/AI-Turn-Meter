@@ -66,7 +66,9 @@ export function createMeterServer({
   enableQuotaProbe = enableWatchers,
 } = {}) {
   const store = new TurnStore(dbPath);
-  const hookStateDir = stateDir || (dbPath && dbPath !== ':memory:' ? dirname(dbPath) : undefined);
+  const effectiveDbPath = dbPath !== undefined ? dbPath : store.dbPath;
+  const hookStateDir =
+    stateDir || (effectiveDbPath && effectiveDbPath !== ':memory:' ? dirname(effectiveDbPath) : undefined);
   const configPath = hookStateDir ? join(hookStateDir, 'config.json') : null;
   let config = loadMeterConfig(configPath);
   /** @type {Set<http.ServerResponse>} */

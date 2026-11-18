@@ -160,6 +160,7 @@ export class TurnStore {
    * @param {{ customPricingPath?: string | null }} [opts]
    */
   constructor(dbPath = defaultDbPath(), { customPricingPath } = {}) {
+    this.dbPath = dbPath;
     if (dbPath !== ':memory:') {
       mkdirSync(dirname(dbPath), { recursive: true });
     }

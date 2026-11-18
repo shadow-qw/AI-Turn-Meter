@@ -70,8 +70,9 @@ export function computeQuotaWindow({
   ) {
     const elapsedSec = windowSeconds - timeLeftSec;
     const expectedUsed = Math.min(100, Math.max(0, (elapsedSec / windowSeconds) * 100));
-    pacePct = Number((100 - expectedUsed).toFixed(1));
-    const deltaPct = rem - pacePct; // positive = in reserve, negative = deficit
+    const expectedRem = Number((100 - expectedUsed).toFixed(1));
+    pacePct = rem > 0.05 ? expectedRem : null;
+    const deltaPct = rem - expectedRem; // positive = in reserve, negative = deficit
 
     if (elapsedSec > 60) {
       if (rem <= 0.05) {
@@ -553,6 +554,170 @@ async function cursorApiJson(url, cookieHeader, { method = 'GET', body = null } 
   }
 }
 
+export function parseCursorQuotaSummary(
+  summary,
+  {
+    nowMs = Date.now(),
+    accountEmail = null,
+    planTitle = null,
+    teamBudget = null,
+    reqUsage = null,
+  } = {}
+) {
+  if (!summary || typeof summary !== 'object') {
+    return { accountEmail, planTitle, quotaWindows: [], resetCreditsText: null };
+  }
+
+  const resolvedEmail = accountEmail || summary.email || null;
+  const startMs = summary.billingCycleStart ? Date.parse(summary.billingCycleStart) : NaN;
+  const endMs = summary.billingCycleEnd ? Date.parse(summary.billingCycleEnd) : NaN;
+  const cycleSecs =
+    Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
+      ? (endMs - startMs) / 1000
+      : 30 * 86400;
+  const resetAtMs = Number.isFinite(endMs) ? endMs : null;
+
+  const plan = summary.individualUsage?.plan;
+  const overall = summary.individualUsage?.overall;
+  const pooled = summary.teamUsage?.pooled;
+
+  const hasAutoPct = typeof plan?.autoPercentUsed === 'number' && Number.isFinite(plan.autoPercentUsed);
+  const hasApiPct = typeof plan?.apiPercentUsed === 'number' && Number.isFinite(plan.apiPercentUsed);
+  const hasTotalPct = typeof plan?.totalPercentUsed === 'number' && Number.isFinite(plan.totalPercentUsed);
+  const hasPlanCents = typeof plan?.limit === 'number' && plan.limit > 0 && typeof plan?.used === 'number';
+
+  const quotaWindows = [];
+
+  if (hasAutoPct || hasApiPct) {
+    // Cursor's dual-pool plans track Auto/Composer ("Cursor Models") and third-party API ("Other Models")
+    // separately; surfacing both pools matches Cursor's dashboard and avoids mixing the $20 API pool cap into total%.
+    if (hasAutoPct) {
+      const autoWin = computeQuotaWindow({
+        id: 'cursor-auto',
+        title: 'Cursor 模型',
+        usedPct: plan.autoPercentUsed,
+        windowSeconds: cycleSecs,
+        resetAtMs,
+        nowMs,
+      });
+      if (autoWin) quotaWindows.push(autoWin);
+    }
+    if (hasApiPct) {
+      const apiWin = computeQuotaWindow({
+        id: 'cursor-api',
+        title: '其他模型',
+        usedPct: plan.apiPercentUsed,
+        windowSeconds: cycleSecs,
+        resetAtMs,
+        nowMs,
+      });
+      if (apiWin) quotaWindows.push(apiWin);
+    }
+  } else {
+    let usedUSD = null;
+    let limitUSD = null;
+    let usedPct = null;
+    let includeBudgetNote = false;
+
+    if (hasTotalPct || hasPlanCents) {
+      if (hasTotalPct) {
+        usedPct = plan.totalPercentUsed;
+      } else {
+        usedPct = (plan.used / plan.limit) * 100;
+      }
+      if (hasPlanCents) {
+        usedUSD = plan.used / 100;
+        limitUSD = plan.limit / 100;
+        const pctFromCents = (usedUSD / limitUSD) * 100;
+        // Only attach "$used / $limit" when consistent with usedPct so API caps never contradict percentage bars.
+        includeBudgetNote = !hasTotalPct || Math.abs(pctFromCents - usedPct) < 5;
+      }
+    } else if (
+      teamBudget &&
+      Number.isFinite(teamBudget.limitUSD) &&
+      teamBudget.limitUSD > 0 &&
+      Number.isFinite(teamBudget.usedUSD) &&
+      teamBudget.usedUSD >= 0
+    ) {
+      usedUSD = teamBudget.usedUSD;
+      limitUSD = teamBudget.limitUSD;
+      usedPct = (usedUSD / limitUSD) * 100;
+      includeBudgetNote = true;
+    } else if (overall && typeof overall.limit === 'number' && overall.limit > 0 && typeof overall.used === 'number') {
+      usedUSD = overall.used / 100;
+      limitUSD = overall.limit / 100;
+      usedPct = (overall.used / overall.limit) * 100;
+      includeBudgetNote = true;
+    } else if (pooled && typeof pooled.limit === 'number' && pooled.limit > 0 && typeof pooled.used === 'number') {
+      usedUSD = pooled.used / 100;
+      limitUSD = pooled.limit / 100;
+      usedPct = (pooled.used / pooled.limit) * 100;
+      includeBudgetNote = true;
+    }
+
+    if (usedPct !== null) {
+      const budgetNote =
+        includeBudgetNote && usedUSD !== null && limitUSD !== null && limitUSD > 0
+          ? `已用 $${usedUSD.toFixed(2)} / $${Math.round(limitUSD)}`
+          : null;
+      const win = computeQuotaWindow({
+        id: 'cursor-plan',
+        title: '套餐额度',
+        usedPct,
+        windowSeconds: cycleSecs,
+        resetAtMs,
+        nowMs,
+        extraNote: budgetNote,
+      });
+      if (win) quotaWindows.push(win);
+    } else if (reqUsage) {
+      const maxReq = Number(reqUsage?.['gpt-4']?.maxRequestUsage);
+      const usedReq = Number(reqUsage?.['gpt-4']?.numRequestsTotal ?? reqUsage?.['gpt-4']?.numRequests);
+      if (Number.isFinite(maxReq) && maxReq > 0 && Number.isFinite(usedReq) && usedReq >= 0) {
+        const win = computeQuotaWindow({
+          id: 'cursor-requests',
+          title: '快速请求',
+          usedPct: (usedReq / maxReq) * 100,
+          windowSeconds: cycleSecs,
+          resetAtMs,
+          nowMs,
+          extraNote: `${Math.round(usedReq)} / ${Math.round(maxReq)} 次`,
+        });
+        if (win) quotaWindows.push(win);
+      }
+    }
+  }
+
+  const indOnDemand = summary.individualUsage?.onDemand;
+  const teamOnDemand = summary.teamUsage?.onDemand;
+  const onDemand =
+    indOnDemand && (typeof indOnDemand.used === 'number' || typeof indOnDemand.limit === 'number')
+      ? indOnDemand
+      : teamOnDemand;
+  const onDemandUsed = onDemand?.used;
+  const onDemandLimit = onDemand?.limit;
+  let resetCreditsText = null;
+  if (
+    typeof onDemandUsed === 'number' &&
+    onDemandUsed >= 0 &&
+    onDemand?.enabled !== false &&
+    (onDemandUsed > 0 || (typeof onDemandLimit === 'number' && onDemandLimit > 0))
+  ) {
+    const usdStr = `$${(onDemandUsed / 100).toFixed(2)}`;
+    resetCreditsText =
+      typeof onDemandLimit === 'number' && onDemandLimit > 0
+        ? `${usdStr} / $${(onDemandLimit / 100).toFixed(2)}`
+        : `${usdStr} / 无上限`;
+  }
+
+  return {
+    accountEmail: resolvedEmail,
+    planTitle: planTitle || (summary.membershipType ? String(summary.membershipType) : null),
+    quotaWindows,
+    resetCreditsText,
+  };
+}
+
 export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true, cursorCookie = null } = {}) {
   const empty = { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null };
   let accountEmail = null;
@@ -627,25 +792,28 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
   }
 
   if (!accountEmail && summary.email) accountEmail = summary.email;
-  const startMs = summary.billingCycleStart ? Date.parse(summary.billingCycleStart) : NaN;
-  const endMs = summary.billingCycleEnd ? Date.parse(summary.billingCycleEnd) : NaN;
-  const cycleSecs =
-    Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
-      ? (endMs - startMs) / 1000
-      : 30 * 86400;
-  const resetAtMs = Number.isFinite(endMs) ? endMs : null;
-
-  let usedUSD = null;
-  let limitUSD = null;
-  let usedPct = null;
-
   const plan = summary.individualUsage?.plan;
-  const overall = summary.individualUsage?.overall;
-  const pooled = summary.teamUsage?.pooled;
+  const hasPlanData = Boolean(
+    plan &&
+      (typeof plan.autoPercentUsed === 'number' ||
+        typeof plan.apiPercentUsed === 'number' ||
+        typeof plan.totalPercentUsed === 'number' ||
+        (typeof plan.limit === 'number' && plan.limit > 0))
+  );
 
-  // Check verified team/enterprise personal spend budget if available
-  if ((summary.membershipType === 'enterprise' || summary.membershipType === 'team' || summary.isTeam) && accountEmail) {
-    const teamsRes = await cursorApiJson('https://cursor.com/api/dashboard/teams', cookieHeader);
+  let teamBudget = null;
+  if (
+    !hasPlanData &&
+    (summary.membershipType === 'enterprise' ||
+      summary.membershipType === 'team' ||
+      summary.isTeam ||
+      summary.limitType === 'team') &&
+    accountEmail
+  ) {
+    const teamsRes = await cursorApiJson('https://cursor.com/api/dashboard/teams', cookieHeader, {
+      method: 'POST',
+      body: {},
+    });
     const teams = Array.isArray(teamsRes?.teams) ? teamsRes.teams : [];
     const targetTeamId =
       teams.find((t) => t.id === teamId)?.id ??
@@ -670,96 +838,33 @@ export async function fetchCursorQuota(nowMs = Date.now(), { allowNetwork = true
         const effLimit = Number(me.effectivePerUserLimitDollars ?? me.monthlyLimitDollars);
         const spendCents = Number(me.overallSpendCents);
         if (Number.isFinite(effLimit) && effLimit > 0 && Number.isFinite(spendCents) && spendCents >= 0) {
-          usedUSD = spendCents / 100;
-          limitUSD = effLimit;
-          usedPct = (usedUSD / limitUSD) * 100;
+          teamBudget = { usedUSD: spendCents / 100, limitUSD: effLimit };
         }
       }
     }
   }
 
-  if (usedPct === null && plan) {
-    if (typeof plan.totalPercentUsed === 'number' && Number.isFinite(plan.totalPercentUsed)) {
-      usedPct = plan.totalPercentUsed;
-    } else if (typeof plan.apiPercentUsed === 'number' && typeof plan.autoPercentUsed === 'number') {
-      usedPct = (plan.apiPercentUsed + plan.autoPercentUsed) / 2;
-    } else if (typeof plan.limit === 'number' && plan.limit > 0 && typeof plan.used === 'number') {
-      usedUSD = plan.used / 100;
-      limitUSD = plan.limit / 100;
-      usedPct = (plan.used / plan.limit) * 100;
-    }
-    if (usedUSD === null && typeof plan.used === 'number' && typeof plan.limit === 'number' && plan.limit > 0) {
-      usedUSD = plan.used / 100;
-      limitUSD = plan.limit / 100;
-    }
-  }
-
-  if (usedPct === null && overall && typeof overall.limit === 'number' && overall.limit > 0 && typeof overall.used === 'number') {
-    usedUSD = overall.used / 100;
-    limitUSD = overall.limit / 100;
-    usedPct = (overall.used / overall.limit) * 100;
-  }
-
-  if (usedPct === null && pooled && typeof pooled.limit === 'number' && pooled.limit > 0 && typeof pooled.used === 'number') {
-    usedUSD = pooled.used / 100;
-    limitUSD = pooled.limit / 100;
-    usedPct = (pooled.used / pooled.limit) * 100;
-  }
-
-  const quotaWindows = [];
-  if (usedPct !== null) {
-    const budgetNote =
-      usedUSD !== null && limitUSD !== null && limitUSD > 0
-        ? `已用 $${usedUSD.toFixed(2)} / $${Math.round(limitUSD)}`
-        : null;
-    const win = computeQuotaWindow({
-      id: 'cursor-plan',
-      title: '套餐额度',
-      usedPct,
-      windowSeconds: cycleSecs,
-      resetAtMs,
-      nowMs,
-      extraNote: budgetNote,
-    });
-    if (win) quotaWindows.push(win);
-  } else if (userId) {
-    const reqUsage = await cursorApiJson(
+  let reqUsage = null;
+  const hasAnyFallback = Boolean(
+    hasPlanData ||
+      teamBudget ||
+      (summary.individualUsage?.overall && summary.individualUsage.overall.limit > 0) ||
+      (summary.teamUsage?.pooled && summary.teamUsage.pooled.limit > 0)
+  );
+  if (!hasAnyFallback && userId) {
+    reqUsage = await cursorApiJson(
       `https://cursor.com/api/usage?user=${encodeURIComponent(userId)}`,
       cookieHeader
     );
-    const maxReq = Number(reqUsage?.['gpt-4']?.maxRequestUsage);
-    const usedReq = Number(reqUsage?.['gpt-4']?.numRequestsTotal ?? reqUsage?.['gpt-4']?.numRequests);
-    if (Number.isFinite(maxReq) && maxReq > 0 && Number.isFinite(usedReq) && usedReq >= 0) {
-      const win = computeQuotaWindow({
-        id: 'cursor-requests',
-        title: '快速请求',
-        usedPct: (usedReq / maxReq) * 100,
-        windowSeconds: cycleSecs,
-        resetAtMs,
-        nowMs,
-        extraNote: `${Math.round(usedReq)} / ${Math.round(maxReq)} 次`,
-      });
-      if (win) quotaWindows.push(win);
-    }
   }
 
-  const onDemandUsed = summary.individualUsage?.onDemand?.used ?? summary.teamUsage?.onDemand?.used;
-  const onDemandLimit = summary.individualUsage?.onDemand?.limit ?? summary.teamUsage?.onDemand?.limit;
-  let resetCreditsText = null;
-  if (typeof onDemandUsed === 'number' && onDemandUsed > 0) {
-    const usdStr = `$${(onDemandUsed / 100).toFixed(2)}`;
-    resetCreditsText =
-      typeof onDemandLimit === 'number' && onDemandLimit > 0
-        ? `按量超额已用 ${usdStr} / $${(onDemandLimit / 100).toFixed(0)}`
-        : `按量超额已用 ${usdStr}`;
-  }
-
-  return {
+  return parseCursorQuotaSummary(summary, {
+    nowMs,
     accountEmail,
-    planTitle: planTitle || (summary.membershipType ? String(summary.membershipType) : null),
-    quotaWindows,
-    resetCreditsText,
-  };
+    planTitle,
+    teamBudget,
+    reqUsage,
+  });
 }
 
 export function fetchCodeBuddyQuota() {
@@ -819,10 +924,18 @@ function assembleAllQuotas(raw, enabledTools = null) {
   }
   if (isEnabled('cursor') && cursor.quotaWindows.length > 0) {
     const curWin = cursor.quotaWindows[0];
+    const curSecond = cursor.quotaWindows[1];
+    const curSub = [
+      curWin.subtitle,
+      curSecond ? `${curSecond.title} ${Math.round(curSecond.remainingPct)}%` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
     overviewWindows.push({
       ...curWin,
       id: 'overview-cursor',
-      title: 'Cursor',
+      title: curSecond ? 'Cursor 模型' : 'Cursor',
+      subtitle: curSub || null,
     });
   }
   if (isEnabled('antigravity') && antigravity.quotaWindows.length > 0) {

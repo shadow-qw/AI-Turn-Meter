@@ -479,7 +479,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.15"
+  @Published var version: String = "0.2.16"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -563,6 +563,7 @@ final class MeterViewModel: ObservableObject {
 
   private var pollTimer: Timer?
   private var didBootstrap = false
+  private var didTryRestoreWebCookie = false
   private var hasStarted = false
   private var lastUsageRefreshAt: Date = .distantPast
 
@@ -833,7 +834,13 @@ final class MeterViewModel: ObservableObject {
     if let it = cfg.inlineTools {
       for (k, v) in it { self.inlineToolToggles[k] = v }
     }
-    if let hasCookie = cfg.hasCursorCookie { self.hasCursorCookie = hasCookie }
+    if let hasCookie = cfg.hasCursorCookie {
+      self.hasCursorCookie = hasCookie
+      if !hasCookie && !didTryRestoreWebCookie && !busy && !runtime.runningFromDmg {
+        didTryRestoreWebCookie = true
+        restoreCursorWebCookieIfPresent()
+      }
+    }
   }
 
   private func applyDaemonState(_ parsed: DaemonStateResponse) {
@@ -1065,7 +1072,16 @@ final class MeterViewModel: ObservableObject {
   func saveCursorCookie(_ raw: String?) {
     guard !busy, !runtime.runningFromDmg else { return }
     let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    didTryRestoreWebCookie = true
     hasCursorCookie = !trimmed.isEmpty
+    if trimmed.isEmpty {
+      let cookieStore = WKWebsiteDataStore.default().httpCookieStore
+      cookieStore.getAllCookies { cookies in
+        for c in cookies where c.domain.lowercased().contains("cursor.com") && c.name == "WorkosCursorSessionToken" {
+          cookieStore.delete(c, completionHandler: nil)
+        }
+      }
+    }
     postConfig(
       ["cursorCookie": trimmed],
       quietBanner: false,
@@ -1073,6 +1089,22 @@ final class MeterViewModel: ObservableObject {
     )
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
       self?.fetchUsageSummary(silent: false, forceRefresh: true)
+    }
+  }
+
+  private func restoreCursorWebCookieIfPresent() {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
+      let cursorCookies = cookies.filter { $0.domain.lowercased().contains("cursor.com") && !$0.value.isEmpty }
+      guard cursorCookies.contains(where: { $0.name == "WorkosCursorSessionToken" }) else { return }
+      let header = cursorCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+      DispatchQueue.main.async {
+        guard let self = self, !self.hasCursorCookie else { return }
+        self.hasCursorCookie = true
+        self.postConfig(["cursorCookie": header], quietBanner: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+          self?.fetchUsageSummary(silent: true, forceRefresh: true)
+        }
+      }
     }
   }
 
@@ -2060,7 +2092,7 @@ private struct ProviderSettingsDetailView: View {
               }
               if let resetCredits = card?.resetCreditsText, !resetCredits.isEmpty {
                 Divider().padding(.leading, 14)
-                settingsKVRow(title: "附加额度", value: resetCredits)
+                settingsKVRow(title: key == "cursor" ? "按需超额用量" : "附加额度", value: resetCredits)
               }
               Divider().padding(.leading, 14)
             } else if key == "cursor" {
@@ -2097,7 +2129,7 @@ private struct ProviderSettingsDetailView: View {
               .padding(.vertical, 10)
               if let resetCredits = card?.resetCreditsText, !resetCredits.isEmpty {
                 Divider().padding(.leading, 14)
-                settingsKVRow(title: "按量支出", value: resetCredits)
+                settingsKVRow(title: "按需超额用量", value: resetCredits)
               }
               Divider().padding(.leading, 14)
             }
@@ -4036,14 +4068,37 @@ private struct CodexBarStyleCardView: View {
       }
 
       if let resetCredits = card.resetCreditsText, !resetCredits.isEmpty {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("限额重置额度")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(primaryText)
-          Text(resetCredits)
-            .font(.system(size: 10.5))
-            .foregroundColor(secondaryText)
-            .lineLimit(1)
+        if selection == "cursor" {
+          VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+              Text("按需超额用量")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(primaryText)
+              Spacer(minLength: 4)
+              Text(resetCredits)
+                .font(.system(size: 11.5, weight: .medium))
+                .monospacedDigit()
+                .foregroundColor(primaryText)
+                .lineLimit(1)
+            }
+            if let cycleReset = card.quotaWindows?.first?.resetText, !cycleReset.isEmpty {
+              Text(cycleReset)
+                .font(.system(size: 10))
+                .monospacedDigit()
+                .foregroundColor(secondaryText)
+                .lineLimit(1)
+            }
+          }
+        } else {
+          VStack(alignment: .leading, spacing: 2) {
+            Text("限额重置额度")
+              .font(.system(size: 11, weight: .semibold))
+              .foregroundColor(primaryText)
+            Text(resetCredits)
+              .font(.system(size: 10.5))
+              .foregroundColor(secondaryText)
+              .lineLimit(1)
+          }
         }
       }
 
