@@ -410,7 +410,7 @@ final class MeterViewModel: ObservableObject {
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
   }
 
-  @Published var version: String = "0.2.6"
+  @Published var version: String = "0.2.7"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -1285,6 +1285,7 @@ private enum CodexBarPalette {
 
 struct ContentView: View {
   @ObservedObject var vm: MeterViewModel
+  @State private var hoveredTab: MainTab? = nil
 
   private var installedCount: Int {
     vm.orderedKeys.filter { vm.apps[$0]?.installed ?? false }.count
@@ -1353,6 +1354,7 @@ struct ContentView: View {
         HStack(spacing: 3) {
           ForEach(MainTab.allCases, id: \.self) { tab in
             let selected = vm.activeTab == tab
+            let hovered = hoveredTab == tab
             Button {
               vm.activeTab = tab
             } label: {
@@ -1364,18 +1366,21 @@ struct ContentView: View {
               }
               .padding(.horizontal, 10)
               .padding(.vertical, 5.5)
-              .foregroundColor(selected ? .white : .primary.opacity(0.82))
+              .foregroundColor(hovered ? .white : (selected ? .primary : .primary.opacity(0.75)))
               .background(
-                Group {
-                  if selected {
-                    Capsule().fill(CodexBarPalette.accentBlue)
-                  } else {
-                    Capsule().fill(Color.clear)
-                  }
-                }
+                Capsule()
+                  .fill(hovered ? CodexBarPalette.accentBlue : (selected ? Color(nsColor: .controlBackgroundColor) : Color.clear))
+              )
+              .overlay(
+                Capsule()
+                  .stroke(selected && !hovered ? Color.primary.opacity(0.10) : Color.clear, lineWidth: 1)
               )
             }
             .buttonStyle(.plain)
+            .onHover { inside in
+              if inside { hoveredTab = tab }
+              else if hoveredTab == tab { hoveredTab = nil }
+            }
           }
         }
         .padding(3)
@@ -1916,6 +1921,10 @@ struct ControlPanelTabView: View {
 struct UsageSummaryTabView: View {
   @ObservedObject var vm: MeterViewModel
   @State private var hoveredDay: UsageDailyPoint? = nil
+  @State private var heroHovered = false
+  @State private var hoveredPeriod: Int? = nil
+  @State private var hoveredToolChip: String? = nil
+  @State private var hoveredGroupMode: String? = nil
 
   private let dayOptions: [(Int, String)] = [
     (1, "今日"),
@@ -1939,17 +1948,22 @@ struct UsageSummaryTabView: View {
         HStack(spacing: 3) {
           ForEach(dayOptions, id: \.0) { opt in
             let active = vm.usageDays == opt.0
+            let hovered = hoveredPeriod == opt.0
             Button(opt.1) {
               vm.usageDays = opt.0
               vm.fetchUsageSummary()
             }
             .buttonStyle(.plain)
             .font(.system(size: 11, weight: active ? .semibold : .medium))
-            .foregroundColor(active ? .white : .secondary)
+            .foregroundColor(hovered ? .white : (active ? .primary : .secondary))
             .padding(.horizontal, 9)
             .padding(.vertical, 4.5)
-            .background(active ? CodexBarPalette.accentBlue : Color.clear)
+            .background(hovered ? CodexBarPalette.accentBlue : (active ? Color.primary.opacity(0.10) : Color.clear))
             .clipShape(Capsule())
+            .onHover { inside in
+              if inside { hoveredPeriod = opt.0 }
+              else if hoveredPeriod == opt.0 { hoveredPeriod = nil }
+            }
           }
         }
         .padding(3)
@@ -1975,31 +1989,31 @@ struct UsageSummaryTabView: View {
       if let data = vm.usageData {
         ScrollView {
           VStack(spacing: 11) {
-            // CodexBar-style Deep Blue Hero Card
+            // CodexBar-style Hero Card (neutral by default, blue gradient on hover)
             VStack(alignment: .leading, spacing: 14) {
               HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
                   HStack(spacing: 6) {
                     Text(selectedToolLabel)
                       .font(.system(size: 14, weight: .bold))
-                      .foregroundColor(.white)
+                      .foregroundColor(heroHovered ? .white : .primary)
                     Text("·")
-                      .foregroundColor(.white.opacity(0.55))
+                      .foregroundColor(heroHovered ? .white.opacity(0.55) : .secondary.opacity(0.6))
                     Text(selectedPeriodTitle)
                       .font(.system(size: 12.5, weight: .medium))
-                      .foregroundColor(.white.opacity(0.86))
+                      .foregroundColor(heroHovered ? .white.opacity(0.86) : .secondary)
                   }
                   Text("按模型官方 API 单价估算 · 本地离线统计，非订阅账单")
                     .font(.system(size: 10.5))
-                    .foregroundColor(.white.opacity(0.72))
+                    .foregroundColor(heroHovered ? .white.opacity(0.72) : .secondary)
                 }
                 Spacer()
                 Text(vm.relativeUpdateLabel())
                   .font(.system(size: 10.5, weight: .medium))
-                  .foregroundColor(.white.opacity(0.9))
+                  .foregroundColor(heroHovered ? .white.opacity(0.9) : .secondary)
                   .padding(.horizontal, 8)
                   .padding(.vertical, 3)
-                  .background(Color.white.opacity(0.16))
+                  .background(heroHovered ? Color.white.opacity(0.16) : Color.primary.opacity(0.06))
                   .clipShape(Capsule())
               }
 
@@ -2007,11 +2021,11 @@ struct UsageSummaryTabView: View {
                 VStack(alignment: .leading, spacing: 5) {
                   Text("API 等效估算费用")
                     .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.78))
+                    .foregroundColor(heroHovered ? .white.opacity(0.78) : .secondary)
                   Text(MeterFormat.usd(data.totals.estimatedCostUsd))
                     .font(.system(size: 30, weight: .bold, design: .rounded))
                     .monospacedDigit()
-                    .foregroundColor(.white)
+                    .foregroundColor(heroHovered ? .white : .primary)
                     .minimumScaleFactor(0.7)
                     .lineLimit(1)
 
@@ -2019,15 +2033,15 @@ struct UsageSummaryTabView: View {
                     if let saved = data.totals.cacheSavingsUsd, saved > 0 {
                       Text("缓存节省 \(MeterFormat.usd(saved))")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.white.opacity(0.92))
+                        .foregroundColor(heroHovered ? .white.opacity(0.92) : .secondary)
                     } else if data.totals.unpricedTurnCount > 0 {
                       Text("含 \(data.totals.unpricedTurnCount) 轮未定价模型")
                         .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.8))
+                        .foregroundColor(heroHovered ? .white.opacity(0.8) : .secondary)
                     } else {
                       Text("共 \(data.totals.turnCount) 轮对话")
                         .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.85))
+                        .foregroundColor(heroHovered ? .white.opacity(0.85) : .secondary)
                     }
                   }
                 }
@@ -2065,13 +2079,24 @@ struct UsageSummaryTabView: View {
             }
             .padding(14)
             .background(
-              LinearGradient(
-                colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-              )
+              Group {
+                if heroHovered {
+                  LinearGradient(
+                    colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                  )
+                } else {
+                  Color(nsColor: .controlBackgroundColor)
+                }
+              }
             )
             .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .overlay(
+              RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(heroHovered ? Color.clear : Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .onHover { heroHovered = $0 }
 
             // Daily Trend Bars (Hover Interactive)
             if !data.daily.isEmpty {
@@ -2221,6 +2246,7 @@ struct UsageSummaryTabView: View {
 
   private func filterChip(key: String, label: String) -> some View {
     let active = vm.usageToolFilter == key
+    let hovered = hoveredToolChip == key
     let color = vm.toolAccentColor(for: key)
     return Button {
       vm.usageToolFilter = key
@@ -2228,54 +2254,63 @@ struct UsageSummaryTabView: View {
     } label: {
       HStack(spacing: 4) {
         if key != "all" {
-          Circle().fill(active ? Color.white : color).frame(width: 6, height: 6)
+          Circle().fill(hovered ? Color.white : color).frame(width: 6, height: 6)
         }
         Text(label)
           .font(.system(size: 11, weight: active ? .semibold : .medium))
       }
-      .foregroundColor(active ? .white : .primary.opacity(0.82))
+      .foregroundColor(hovered ? .white : (active ? .primary : .primary.opacity(0.82)))
       .padding(.horizontal, 9)
       .padding(.vertical, 4.5)
-      .background(active ? color : Color.primary.opacity(0.06))
+      .background(hovered ? color : (active ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05)))
       .clipShape(Capsule())
     }
     .buttonStyle(.plain)
+    .onHover { inside in
+      if inside { hoveredToolChip = key }
+      else if hoveredToolChip == key { hoveredToolChip = nil }
+    }
   }
 
   private func groupModeButton(id: String, label: String) -> some View {
     let active = vm.usageGroupMode == id
+    let hovered = hoveredGroupMode == id
     return Button(label) {
       vm.usageGroupMode = id
     }
     .buttonStyle(.plain)
     .font(.system(size: 11, weight: active ? .semibold : .medium))
-    .foregroundColor(active ? .white : .secondary)
+    .foregroundColor(hovered ? .white : (active ? .primary : .secondary))
     .padding(.horizontal, 10)
     .padding(.vertical, 4)
-    .background(active ? CodexBarPalette.accentBlue : Color.clear)
+    .background(hovered ? CodexBarPalette.accentBlue : (active ? Color.primary.opacity(0.10) : Color.clear))
     .clipShape(Capsule())
+    .onHover { inside in
+      if inside { hoveredGroupMode = id }
+      else if hoveredGroupMode == id { hoveredGroupMode = nil }
+    }
   }
 
   private func heroTile(title: String, value: String, sub: String) -> some View {
     VStack(alignment: .leading, spacing: 2.5) {
       Text(title)
         .font(.system(size: 10))
-        .foregroundColor(.white.opacity(0.75))
+        .foregroundColor(heroHovered ? .white.opacity(0.75) : .secondary)
       Text(value)
         .font(.system(size: 14, weight: .bold))
         .monospacedDigit()
-        .foregroundColor(.white)
+        .foregroundColor(heroHovered ? .white : .primary)
         .lineLimit(1)
         .minimumScaleFactor(0.8)
       Text(sub)
         .font(.system(size: 9.5))
-        .foregroundColor(.white.opacity(0.72))
+        .foregroundColor(heroHovered ? .white.opacity(0.72) : .secondary)
         .lineLimit(1)
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .padding(.horizontal, 10)
     .padding(.vertical, 7)
-    .background(Color.white.opacity(0.14))
+    .background(heroHovered ? Color.white.opacity(0.14) : Color.primary.opacity(0.045))
     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
   }
 
@@ -2349,6 +2384,7 @@ struct UsageSummaryTabView: View {
 
 struct RecentTurnsTabView: View {
   @ObservedObject var vm: MeterViewModel
+  @State private var hoveredTurnChip: String? = nil
 
   private var filteredTurns: [TurnSummary] {
     let q = vm.recentTurnsSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -2429,6 +2465,7 @@ struct RecentTurnsTabView: View {
 
   private func turnToolChip(key: String, label: String) -> some View {
     let active = vm.recentTurnsFilterTool == key
+    let hovered = hoveredTurnChip == key
     let color = vm.toolAccentColor(for: key)
     return Button {
       vm.recentTurnsFilterTool = key
@@ -2436,18 +2473,22 @@ struct RecentTurnsTabView: View {
     } label: {
       HStack(spacing: 4) {
         if key != "all" {
-          Circle().fill(active ? Color.white : color).frame(width: 6, height: 6)
+          Circle().fill(hovered ? Color.white : color).frame(width: 6, height: 6)
         }
         Text(label)
           .font(.system(size: 11, weight: active ? .semibold : .medium))
       }
-      .foregroundColor(active ? .white : .primary.opacity(0.82))
+      .foregroundColor(hovered ? .white : (active ? .primary : .primary.opacity(0.82)))
       .padding(.horizontal, 9)
       .padding(.vertical, 4.5)
-      .background(active ? color : Color.primary.opacity(0.06))
+      .background(hovered ? color : (active ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05)))
       .clipShape(Capsule())
     }
     .buttonStyle(.plain)
+    .onHover { inside in
+      if inside { hoveredTurnChip = key }
+      else if hoveredTurnChip == key { hoveredTurnChip = nil }
+    }
   }
 
   private func turnCard(_ t: TurnSummary) -> some View {
@@ -2689,6 +2730,7 @@ struct RemoteSshSheetView: View {
 private struct ProviderSwitcherBar: View {
   @ObservedObject var vm: MeterViewModel
   @Binding var selection: String
+  @State private var hoveredKey: String? = nil
 
   private let switcherKeys = ["all", "codex", "cursor", "antigravity", "codebuddy"]
 
@@ -2696,6 +2738,7 @@ private struct ProviderSwitcherBar: View {
     HStack(spacing: 4) {
       ForEach(switcherKeys, id: \.self) { key in
         let isSelected = selection == key
+        let isHovered = hoveredKey == key
         let isAll = key == "all"
         let entry = vm.apps[key]
         let installed = isAll || (entry?.installed ?? false)
@@ -2705,6 +2748,11 @@ private struct ProviderSwitcherBar: View {
           if active { return vm.toolAccentColor(for: key) }
           if installed { return Color.gray.opacity(0.35) }
           return .clear
+        }()
+        let bottomIndicator: Color = {
+          if isHovered { return .clear }
+          if isSelected { return indicatorColor != .clear ? indicatorColor : CodexBarPalette.accentBlue }
+          return indicatorColor
         }()
 
         Button {
@@ -2719,24 +2767,33 @@ private struct ProviderSwitcherBar: View {
               .lineLimit(1)
               .minimumScaleFactor(0.78)
           }
-          .foregroundColor(isSelected ? .white : (installed ? .primary.opacity(0.82) : .secondary.opacity(0.55)))
+          .foregroundColor(
+            isHovered
+              ? .white
+              : (isSelected ? .primary : (installed ? .primary.opacity(0.82) : .secondary.opacity(0.55)))
+          )
           .frame(maxWidth: .infinity)
           .padding(.vertical, 6)
           .padding(.horizontal, 2)
           .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-              .fill(isSelected ? CodexBarPalette.accentBlue : Color.clear)
+              .fill(isHovered ? CodexBarPalette.accentBlue : (isSelected ? Color.primary.opacity(0.08) : Color.clear))
           )
           .overlay(alignment: .bottom) {
-            if !isSelected && indicatorColor != .clear {
+            if bottomIndicator != .clear {
               Capsule()
-                .fill(indicatorColor)
+                .fill(bottomIndicator)
                 .frame(width: 24, height: 2.5)
                 .offset(y: 1)
             }
           }
+          .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { inside in
+          if inside { hoveredKey = key }
+          else if hoveredKey == key { hoveredKey = nil }
+        }
       }
     }
     .padding(.horizontal, 10)
@@ -2747,6 +2804,7 @@ private struct ProviderSwitcherBar: View {
 
 private struct MiniUsageBarsView: View {
   let points: [CardDailyPoint]
+  let cardHovered: Bool
   @State private var hovered: CardDailyPoint? = nil
 
   private var useCostScale: Bool {
@@ -2778,18 +2836,18 @@ private struct MiniUsageBarsView: View {
           Text("\(pt.label) · \(MeterFormat.usd(pt.costUsd)) · \(MeterFormat.tokens(pt.totalTokens))")
             .font(.system(size: 10, weight: .semibold))
             .monospacedDigit()
-            .foregroundColor(.white)
+            .foregroundColor(cardHovered ? .white : .primary)
             .lineLimit(1)
         } else {
           Text("近 30 天趋势")
             .font(.system(size: 10, weight: .medium))
-            .foregroundColor(.white.opacity(0.72))
+            .foregroundColor(cardHovered ? .white.opacity(0.78) : .secondary)
         }
         Spacer()
         Text(peakLabel)
           .font(.system(size: 10.5, weight: .semibold))
           .monospacedDigit()
-          .foregroundColor(.white.opacity(0.88))
+          .foregroundColor(cardHovered ? .white.opacity(0.88) : .primary.opacity(0.82))
       }
 
       HStack(alignment: .bottom, spacing: 2.5) {
@@ -2801,8 +2859,12 @@ private struct MiniUsageBarsView: View {
           RoundedRectangle(cornerRadius: 2, style: .continuous)
             .fill(
               val > 0
-                ? Color.white.opacity(isHovered ? 1.0 : 0.82)
-                : Color.white.opacity(isHovered ? 0.55 : 0.25)
+                ? (cardHovered
+                    ? Color.white.opacity(isHovered ? 1.0 : 0.82)
+                    : CodexBarPalette.accentBlue.opacity(isHovered ? 1.0 : 0.78))
+                : (cardHovered
+                    ? Color.white.opacity(isHovered ? 0.55 : 0.25)
+                    : Color.primary.opacity(isHovered ? 0.35 : 0.15))
             )
             .frame(maxWidth: .infinity)
             .frame(height: val > 0 ? max(5, ratio * 34) : 2.5)
@@ -2822,11 +2884,20 @@ private struct CodexBarStyleCardView: View {
   @ObservedObject var vm: MeterViewModel
   let selection: String
   let card: CodexBarCardSnapshot
+  @State private var isCardHovered: Bool = false
 
   private var isAll: Bool { selection == "all" }
 
   private var headerTitle: String {
     isAll ? "全部客户端" : vm.displayTitle(for: selection)
+  }
+
+  private var primaryText: Color {
+    isCardHovered ? .white : .primary
+  }
+
+  private var secondaryText: Color {
+    isCardHovered ? .white.opacity(0.78) : .secondary
   }
 
   private var statusLabel: String {
@@ -2870,10 +2941,10 @@ private struct CodexBarStyleCardView: View {
         VStack(alignment: .leading, spacing: 2) {
           Text(headerTitle)
             .font(.system(size: 16, weight: .bold))
-            .foregroundColor(.white)
+            .foregroundColor(primaryText)
           Text(vm.relativeUpdateLabel())
             .font(.system(size: 10.5))
-            .foregroundColor(.white.opacity(0.78))
+            .foregroundColor(secondaryText)
         }
 
         Spacer()
@@ -2881,14 +2952,14 @@ private struct CodexBarStyleCardView: View {
         VStack(alignment: .trailing, spacing: 2) {
           Text(statusLabel)
             .font(.system(size: 11.5, weight: .semibold))
-            .foregroundColor(.white)
+            .foregroundColor(primaryText)
           Text(
             latestTurn?.model != nil && latestTurn?.model != "unknown"
               ? latestTurn!.model!
               : "本地 Token 统计"
           )
           .font(.system(size: 10))
-          .foregroundColor(.white.opacity(0.76))
+          .foregroundColor(secondaryText)
           .lineLimit(1)
         }
       }
@@ -2921,14 +2992,14 @@ private struct CodexBarStyleCardView: View {
       )
 
       Rectangle()
-        .fill(Color.white.opacity(0.2))
+        .fill(isCardHovered ? Color.white.opacity(0.2) : Color.primary.opacity(0.09))
         .frame(height: 1)
 
       // Cost & Usage 3x2 Dual-Column Grid
       VStack(alignment: .leading, spacing: 8) {
         Text("费用与用量")
           .font(.system(size: 12.5, weight: .bold))
-          .foregroundColor(.white)
+          .foregroundColor(primaryText)
 
         metricGridRow(
           leftLabel: "今日",
@@ -2952,7 +3023,7 @@ private struct CodexBarStyleCardView: View {
 
       // 30-day Mini Usage Chart
       if !card.daily30.isEmpty {
-        MiniUsageBarsView(points: card.daily30)
+        MiniUsageBarsView(points: card.daily30, cardHovered: isCardHovered)
       }
 
       // Recent Rolling 7-day Windows
@@ -2960,23 +3031,23 @@ private struct CodexBarStyleCardView: View {
         VStack(alignment: .leading, spacing: 6) {
           Text("最近窗口")
             .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(.white.opacity(0.92))
+            .foregroundColor(isCardHovered ? .white.opacity(0.92) : .primary.opacity(0.9))
 
           ForEach(visibleWindows) { win in
             HStack(alignment: .top) {
               VStack(alignment: .leading, spacing: 1) {
                 Text(win.title)
                   .font(.system(size: 11.5, weight: .semibold))
-                  .foregroundColor(.white)
+                  .foregroundColor(primaryText)
                 Text("估算：\(win.rangeText)")
                   .font(.system(size: 9.5))
-                  .foregroundColor(.white.opacity(0.72))
+                  .foregroundColor(secondaryText)
               }
               Spacer()
               Text("\(MeterFormat.usd(win.costUsd)) · \(MeterFormat.tokens(win.totalTokens))")
                 .font(.system(size: 11.5, weight: .semibold))
                 .monospacedDigit()
-                .foregroundColor(.white)
+                .foregroundColor(primaryText)
             }
           }
         }
@@ -2987,60 +3058,74 @@ private struct CodexBarStyleCardView: View {
         if let topModel = card.topModel {
           Text("最常用模型：\(topModel)")
             .font(.system(size: 10.5, weight: .medium))
-            .foregroundColor(.white.opacity(0.9))
+            .foregroundColor(isCardHovered ? .white.opacity(0.9) : .primary.opacity(0.85))
             .lineLimit(1)
         }
         Text("根据 Token 用量估算 · 不是订阅账单")
           .font(.system(size: 9.5))
-          .foregroundColor(.white.opacity(0.7))
+          .foregroundColor(secondaryText)
       }
     }
     .padding(13)
     .background(
-      LinearGradient(
-        colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-      )
+      Group {
+        if isCardHovered {
+          LinearGradient(
+            colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        } else {
+          Color(nsColor: .controlBackgroundColor)
+        }
+      }
     )
     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 12, style: .continuous)
+        .stroke(isCardHovered ? Color.clear : Color.primary.opacity(0.08), lineWidth: 1)
+    )
+    .onHover { isCardHovered = $0 }
     .padding(.horizontal, 10)
   }
 
   private func progressBlock(title: String, pct: Double?, rightText: String, subtitle: String) -> some View {
     let clamped = min(1.0, max(0.0, (pct ?? 0) / 100.0))
     let headline = pct != nil ? "\(title) \(MeterFormat.pct(pct))" : title
+    let trackColor = isCardHovered ? Color.white.opacity(0.22) : Color.primary.opacity(0.10)
+    let fillColor = isCardHovered ? Color.white.opacity(0.95) : CodexBarPalette.accentBlue
+    let tickColor = isCardHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.16)
 
     return VStack(alignment: .leading, spacing: 4) {
       HStack {
         Text(headline)
           .font(.system(size: 12, weight: .bold))
-          .foregroundColor(.white)
+          .foregroundColor(primaryText)
         Spacer()
         Text(rightText)
           .font(.system(size: 10.5, weight: .medium))
           .monospacedDigit()
-          .foregroundColor(.white.opacity(0.88))
+          .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
           .lineLimit(1)
       }
 
       GeometryReader { geo in
         ZStack(alignment: .leading) {
           Capsule()
-            .fill(Color.white.opacity(0.22))
+            .fill(trackColor)
           if clamped > 0 {
             Capsule()
-              .fill(Color.white.opacity(0.95))
+              .fill(fillColor)
               .frame(width: max(5, geo.size.width * CGFloat(clamped)))
           }
           // Subtle 25/50/75 tick marks
           HStack {
             Spacer()
-            Rectangle().fill(Color.white.opacity(0.28)).frame(width: 1, height: 7)
+            Rectangle().fill(tickColor).frame(width: 1, height: 7)
             Spacer()
-            Rectangle().fill(Color.white.opacity(0.28)).frame(width: 1, height: 7)
+            Rectangle().fill(tickColor).frame(width: 1, height: 7)
             Spacer()
-            Rectangle().fill(Color.white.opacity(0.28)).frame(width: 1, height: 7)
+            Rectangle().fill(tickColor).frame(width: 1, height: 7)
             Spacer()
           }
         }
@@ -3049,7 +3134,7 @@ private struct CodexBarStyleCardView: View {
 
       Text(subtitle)
         .font(.system(size: 10))
-        .foregroundColor(.white.opacity(0.8))
+        .foregroundColor(secondaryText)
         .lineLimit(1)
     }
   }
@@ -3064,23 +3149,23 @@ private struct CodexBarStyleCardView: View {
       VStack(alignment: .leading, spacing: 1.5) {
         Text(leftLabel)
           .font(.system(size: 10.5, weight: .medium))
-          .foregroundColor(.white.opacity(0.84))
+          .foregroundColor(secondaryText)
         Text(leftVal)
           .font(.system(size: 15, weight: .bold))
           .monospacedDigit()
-          .foregroundColor(.white)
+          .foregroundColor(primaryText)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
 
       VStack(alignment: .leading, spacing: 1.5) {
         Text(rightLabel)
           .font(.system(size: 10.5, weight: .medium))
-          .foregroundColor(.white.opacity(0.84))
+          .foregroundColor(secondaryText)
           .lineLimit(1)
         Text(rightVal)
           .font(.system(size: 15, weight: .bold))
           .monospacedDigit()
-          .foregroundColor(.white)
+          .foregroundColor(primaryText)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -3101,22 +3186,22 @@ private struct PopoverActionRow: View {
       HStack(spacing: 8) {
         Text(title)
           .font(.system(size: 12.5))
-          .foregroundColor(.primary)
+          .foregroundColor(hovering ? .white : .primary)
         Spacer()
         if let badge = badgeText, !badge.isEmpty {
           Text(badge)
             .font(.system(size: 10.5))
-            .foregroundColor(.secondary)
+            .foregroundColor(hovering ? .white.opacity(0.9) : .secondary)
         }
         if let trailing = trailingSymbol {
           Image(systemName: trailing)
             .font(.system(size: 10.5, weight: .semibold))
-            .foregroundColor(.secondary)
+            .foregroundColor(hovering ? .white : .secondary)
         }
         if let shortcut = shortcut {
           Text(shortcut)
             .font(.system(size: 11))
-            .foregroundColor(.secondary)
+            .foregroundColor(hovering ? .white.opacity(0.9) : .secondary)
         }
       }
       .padding(.horizontal, 10)
@@ -3124,7 +3209,7 @@ private struct PopoverActionRow: View {
       .frame(maxWidth: .infinity, alignment: .leading)
       .background(
         RoundedRectangle(cornerRadius: 6, style: .continuous)
-          .fill(hovering ? Color.primary.opacity(0.08) : Color.clear)
+          .fill(hovering ? CodexBarPalette.accentBlue : Color.clear)
       )
       .contentShape(Rectangle())
     }
