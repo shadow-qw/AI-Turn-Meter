@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
+import { zstdDecompressSync } from 'node:zlib';
 
 const execFileAsync = promisify(execFile);
 
@@ -149,35 +150,46 @@ function findNewestCodexRateLimits(codexHome) {
   try {
     const sessionsRoot = join(codexHome, 'sessions');
     if (!existsSync(sessionsRoot)) return null;
-    let bestPath = null;
-    let bestMtime = 0;
+    const candidates = [];
 
     function walk(dir, depth) {
       if (depth > 4) return;
       for (const ent of readdirSync(dir, { withFileTypes: true })) {
         const p = join(dir, ent.name);
         if (ent.isDirectory()) walk(p, depth + 1);
-        else if (ent.name.endsWith('.jsonl')) {
+        else if (ent.name.endsWith('.jsonl') || ent.name.endsWith('.jsonl.zst')) {
           try {
             const st = statSync(p);
-            if (st.mtimeMs > bestMtime) {
-              bestMtime = st.mtimeMs;
-              bestPath = p;
-            }
+            candidates.push({ p, mtimeMs: st.mtimeMs });
           } catch {}
         }
       }
     }
 
     walk(sessionsRoot, 0);
-    if (!bestPath) return null;
-    const raw = readFileSync(bestPath, 'utf8');
-    const lines = raw.trim().split('\n');
-    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 80); i -= 1) {
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const { p } of candidates.slice(0, 10)) {
+      let raw;
       try {
-        const obj = JSON.parse(lines[i]);
-        if (obj?.payload?.rate_limits) return obj.payload.rate_limits;
-      } catch {}
+        raw = p.endsWith('.jsonl.zst')
+          ? zstdDecompressSync(readFileSync(p)).toString('utf8')
+          : readFileSync(p, 'utf8');
+      } catch {
+        continue;
+      }
+      const lines = raw.trim().split('\n');
+      for (let i = lines.length - 1; i >= Math.max(0, lines.length - 400); i -= 1) {
+        try {
+          const obj = JSON.parse(lines[i]);
+          const rl = obj?.payload?.rate_limits;
+          if (
+            rl &&
+            (typeof rl.primary?.used_percent === 'number' || typeof rl.secondary?.used_percent === 'number')
+          ) {
+            return rl;
+          }
+        } catch {}
+      }
     }
   } catch {}
   return null;
@@ -188,15 +200,22 @@ export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true 
   try {
     const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
     const authPath = join(codexHome, 'auth.json');
-    if (!existsSync(authPath)) return empty;
+    let accessToken = null;
+    let accountId = null;
+    let accountEmail = null;
+    let planTitle = null;
 
-    const auth = JSON.parse(readFileSync(authPath, 'utf8'));
-    const accessToken = auth?.tokens?.access_token;
-    const accountId = auth?.tokens?.account_id;
-    const idClaims = decodeJwtPayload(auth?.tokens?.id_token);
+    if (existsSync(authPath)) {
+      try {
+        const auth = JSON.parse(readFileSync(authPath, 'utf8'));
+        accessToken = auth?.tokens?.access_token || null;
+        accountId = auth?.tokens?.account_id || null;
+        const idClaims = decodeJwtPayload(auth?.tokens?.id_token);
+        accountEmail = idClaims?.email || null;
+        planTitle = formatCodexPlan(idClaims?.['https://api.openai.com/auth']?.chatgpt_plan_type);
+      } catch {}
+    }
 
-    let accountEmail = idClaims?.email || null;
-    let planTitle = formatCodexPlan(idClaims?.['https://api.openai.com/auth']?.chatgpt_plan_type);
     let rateLimit = null;
     let resetCreditsText = null;
 
@@ -208,7 +227,7 @@ export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true 
             ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}),
             Accept: 'application/json',
           },
-          signal: AbortSignal.timeout(2500),
+          signal: AbortSignal.timeout(4000),
         });
         if (res.ok) {
           const data = await res.json();

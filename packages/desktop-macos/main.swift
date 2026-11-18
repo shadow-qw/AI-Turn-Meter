@@ -279,6 +279,18 @@ enum MenuBarDisplayMode: String, CaseIterable {
   }
 }
 
+enum MenuBarIconStyle: String, CaseIterable {
+  case dualBar = "dualBar"
+  case gauge = "gauge"
+
+  var title: String {
+    switch self {
+    case .dualBar: return "双条配额（默认）"
+    case .gauge: return "仪表盘"
+    }
+  }
+}
+
 enum MeterFormat {
   static func tokens(_ n: Int?) -> String {
     guard let n = n, n >= 0 else { return "N/A" }
@@ -295,7 +307,8 @@ enum MeterFormat {
   }
 
   static func usd(_ val: Double?) -> String {
-    guard let val = val, val.isFinite, val > 0 else { return "$0.00" }
+    guard let val = val, val.isFinite else { return "--" }
+    if val <= 0 { return "$0.00" }
     if val < 0.01 { return String(format: "$%.4f", val) }
     return String(format: "$%.2f", val)
   }
@@ -474,12 +487,14 @@ final class MeterViewModel: ObservableObject {
   private enum PrefKey {
     static let showMenuBarExtra = "aiTurnMeter.showMenuBarExtra"
     static let showMenuBarSummary = "aiTurnMeter.showMenuBarSummary"
-    static let menuBarDisplayMode = "aiTurnMeter.menuBarDisplayMode"
+    static let menuBarDisplayMode = "atm.menuBarDisplayMode.v3"
+    static let menuBarIconStyle = "atm.menuBarIconStyle.v1"
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.19"
+  @Published var version: String = "0.2.20"
+  @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -511,7 +526,14 @@ final class MeterViewModel: ObservableObject {
        let mode = MenuBarDisplayMode(rawValue: raw) {
       return mode
     }
-    return UserDefaults.standard.bool(forKey: PrefKey.showMenuBarSummary) ? .tps : .iconOnly
+    return .iconOnly
+  }()
+  @Published var menuBarIconStyle: MenuBarIconStyle = {
+    if let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarIconStyle),
+       let style = MenuBarIconStyle(rawValue: raw) {
+      return style
+    }
+    return .dualBar
   }()
   @Published var hideDockIcon: Bool = UserDefaults.standard.bool(forKey: PrefKey.hideDockIcon)
   @Published var showRecentWindowsInMenu: Bool = UserDefaults.standard.bool(forKey: PrefKey.showRecentWindowsInMenu)
@@ -604,6 +626,12 @@ final class MeterViewModel: ObservableObject {
     menuBarDisplayMode = mode
     UserDefaults.standard.set(mode.rawValue, forKey: PrefKey.menuBarDisplayMode)
     UserDefaults.standard.set(mode != .iconOnly, forKey: PrefKey.showMenuBarSummary)
+    onPreferencesChanged?()
+  }
+
+  func setMenuBarIconStyle(_ style: MenuBarIconStyle) {
+    menuBarIconStyle = style
+    UserDefaults.standard.set(style.rawValue, forKey: PrefKey.menuBarIconStyle)
     onPreferencesChanged?()
   }
 
@@ -958,6 +986,7 @@ final class MeterViewModel: ObservableObject {
 
   private func applyDoctor(_ doc: DoctorResponse) {
     if let v = doc.version { self.version = v }
+    self.daemonVersion = doc.daemon.version
     self.updateFeedUrl = doc.updateFeedUrl
     self.daemonOnline = doc.daemon.ok
     self.daemonPort = doc.daemon.port
@@ -992,17 +1021,23 @@ final class MeterViewModel: ObservableObject {
         if shouldAutoBootstrap, !rt.runningFromDmg, let doc = doc {
           let targetVersion = doc.version ?? self.version
           let isBundledApp = Bundle.main.bundlePath.hasSuffix(".app")
+          let daemonVersionMismatch = doc.daemon.ok && doc.daemon.version != targetVersion
           let needsAppUpgrade =
-            isBundledApp &&
-            (doc.launchAgent.pointsToCurrentRoot == false ||
-              (doc.daemon.version != nil && doc.daemon.version != targetVersion))
+            (isBundledApp && doc.launchAgent.pointsToCurrentRoot == false) ||
+            daemonVersionMismatch
 
           if !doc.launchAgent.plistExists {
-            self.runAction(args: ["install"], successText: "已完成首次安装并开启")
+            self.runAction(args: ["install"], successText: "已完成首次安装并开启") { [weak self] in
+              self?.fetchUsageSummary(silent: true)
+            }
           } else if needsAppUpgrade {
-            self.runAction(args: ["install"], successText: "已自动更新到 v\(targetVersion)")
+            self.runAction(args: ["install"], successText: "已自动更新到 v\(targetVersion)") { [weak self] in
+              self?.fetchUsageSummary(silent: true)
+            }
           } else if !doc.daemon.ok && self.masterEnabled {
-            self.runAction(args: ["start-daemon"], successText: "已开启后台统计")
+            self.runAction(args: ["start-daemon"], successText: "已开启后台统计") { [weak self] in
+              self?.fetchUsageSummary(silent: true)
+            }
           }
         }
       }
@@ -2349,6 +2384,20 @@ private struct MenuBarSettingsPaneView: View {
           }
 
           if vm.showMenuBarExtra {
+            Divider().padding(.leading, 14)
+            settingsControlRow(title: "菜单栏图标") {
+              Picker("", selection: Binding(
+                get: { vm.menuBarIconStyle },
+                set: { vm.setMenuBarIconStyle($0) }
+              )) {
+                ForEach(MenuBarIconStyle.allCases, id: \.self) { s in
+                  Text(s.title).tag(s)
+                }
+              }
+              .labelsHidden()
+              .frame(width: 160)
+              .controlSize(.small)
+            }
             Divider().padding(.leading, 14)
             settingsControlRow(title: "菜单栏文本") {
               Picker("", selection: Binding(
@@ -4158,7 +4207,11 @@ private struct CodexBarStyleCardView: View {
                       ? (vm.hasCursorCookie
                           ? "未读取到套餐限额 · 请重新登录"
                           : "需在「设置 → Cursor」登录同步额度")
-                      : "企业/团队按量模式 · 无固定个人会话限额")
+                      : (selection == "codex"
+                          ? (card.accountEmail != nil
+                              ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
+                              : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
+                          : "企业/团队按量模式 · 无固定个人会话限额"))
                   : "未检测到该客户端安装")
           )
           .font(.system(size: 10.5))
@@ -4595,11 +4648,21 @@ struct MenuBarPopoverView: View {
 
 @MainActor
 final class StatusBarController: NSObject, NSPopoverDelegate {
+  private struct IconCacheKey: Equatable {
+    let style: MenuBarIconStyle
+    let active: Bool
+    let stale: Bool
+    let primaryTenths: Int?
+    let secondaryTenths: Int?
+  }
+
   private let vm: MeterViewModel
   private let onOpenMainTab: (MainTab?) -> Void
   private let onCheckUpdates: () -> Void
   private var statusItem: NSStatusItem?
-  private lazy var templateIcon: NSImage = Self.makeTemplateIcon()
+  private lazy var gaugeTemplateIcon: NSImage = Self.makeGaugeTemplateIcon()
+  private var cachedIconKey: IconCacheKey?
+  private var cachedIconImage: NSImage?
   private lazy var popover: NSPopover = {
     let pop = NSPopover()
     pop.behavior = .transient
@@ -4680,7 +4743,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
 
   func updateButtonAppearance() {
     guard let btn = statusItem?.button else { return }
-    btn.image = templateIcon
+    btn.image = resolvedMenuBarIcon()
     btn.appearsDisabled = !vm.isActiveOverall
 
     let summary = compactMenuBarTitle()
@@ -4693,6 +4756,55 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       btn.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
     }
     btn.toolTip = buildTooltip()
+  }
+
+  private func resolvedIconQuotaPair() -> (primary: Double?, secondary: Double?, stale: Bool) {
+    guard vm.isActiveOverall else {
+      return (nil, nil, true)
+    }
+    let candidateKeys: [String]
+    if vm.popoverSelection != "all", vm.isToolEnabled(vm.popoverSelection) {
+      candidateKeys = [vm.popoverSelection] + ["codex", "cursor", "antigravity", "codebuddy"].filter { $0 != vm.popoverSelection }
+    } else {
+      candidateKeys = ["codex", "cursor", "antigravity", "codebuddy"]
+    }
+    for key in candidateKeys {
+      guard vm.isToolEnabled(key) else { continue }
+      if let entry = vm.apps[key], !entry.installed { continue }
+      if let windows = vm.usageData?.cards?[key]?.quotaWindows, !windows.isEmpty {
+        let primary = windows[0].remainingPct
+        let secondary = windows.count > 1 ? windows[1].remainingPct : nil
+        return (primary, secondary, !vm.daemonOnline)
+      }
+    }
+    return (nil, nil, !vm.daemonOnline)
+  }
+
+  private func resolvedMenuBarIcon() -> NSImage {
+    if vm.menuBarIconStyle == .gauge {
+      return gaugeTemplateIcon
+    }
+    let (primary, secondary, stale) = resolvedIconQuotaPair()
+    let pTenths = primary.map { Int((min(100.0, max(0.0, $0)) * 10.0).rounded()) }
+    let sTenths = secondary.map { Int((min(100.0, max(0.0, $0)) * 10.0).rounded()) }
+    let key = IconCacheKey(
+      style: vm.menuBarIconStyle,
+      active: vm.isActiveOverall,
+      stale: stale,
+      primaryTenths: pTenths,
+      secondaryTenths: sTenths
+    )
+    if cachedIconKey == key, let img = cachedIconImage {
+      return img
+    }
+    let img = Self.makeDualBarTemplateIcon(
+      primaryPct: primary,
+      secondaryPct: secondary,
+      stale: stale || !vm.isActiveOverall
+    )
+    cachedIconKey = key
+    cachedIconImage = img
+    return img
   }
 
   private func latestActiveTurn() -> (key: String, turn: TurnSummary)? {
@@ -4720,6 +4832,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       var parts: [String] = []
       if vm.isToolEnabled("codex"), let codexPct = vm.usageData?.cards?["codex"]?.quotaWindows?.first?.remainingPct {
         parts.append("Codex \(Int(codexPct.rounded()))%")
+      }
+      if vm.isToolEnabled("cursor"), let cursorPct = vm.usageData?.cards?["cursor"]?.quotaWindows?.first?.remainingPct {
+        parts.append("Cursor \(Int(cursorPct.rounded()))%")
       }
       if vm.isToolEnabled("antigravity"), let agyPct = vm.usageData?.cards?["antigravity"]?.quotaWindows?.first?.remainingPct {
         parts.append("AGY \(Int(agyPct.rounded()))%")
@@ -4762,7 +4877,76 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     return lines.joined(separator: "\n")
   }
 
-  private static func makeTemplateIcon() -> NSImage {
+  private static func makeDualBarTemplateIcon(
+    primaryPct: Double?,
+    secondaryPct: Double?,
+    stale: Bool
+  ) -> NSImage {
+    let size = NSSize(width: 18, height: 18)
+    let img = NSImage(size: size, flipped: false) { _ in
+      let topRect = NSRect(x: 1.5, y: 9.5, width: 15.0, height: 6.0)
+      let bottomRect = NSRect(x: 1.5, y: 2.5, width: 15.0, height: 4.0)
+
+      Self.drawQuotaBar(
+        rect: topRect,
+        remainingPct: primaryPct,
+        stale: stale,
+        dimmed: false
+      )
+      Self.drawQuotaBar(
+        rect: bottomRect,
+        remainingPct: secondaryPct,
+        stale: stale,
+        dimmed: primaryPct != nil && secondaryPct == nil
+      )
+      return true
+    }
+    img.isTemplate = true
+    return img
+  }
+
+  private static func drawQuotaBar(
+    rect: NSRect,
+    remainingPct: Double?,
+    stale: Bool,
+    dimmed: Bool
+  ) {
+    let radius = rect.height * 0.5
+    let trackPath = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+
+    let fillTrackAlpha: CGFloat = dimmed ? 0.14 : (stale ? 0.18 : 0.28)
+    let strokeTrackAlpha: CGFloat = dimmed ? 0.26 : (stale ? 0.28 : 0.44)
+
+    NSColor.black.withAlphaComponent(fillTrackAlpha).setFill()
+    trackPath.fill()
+
+    let strokeRect = rect.insetBy(dx: 0.5, dy: 0.5)
+    let strokePath = NSBezierPath(
+      roundedRect: strokeRect,
+      xRadius: strokeRect.height * 0.5,
+      yRadius: strokeRect.height * 0.5
+    )
+    strokePath.lineWidth = 1.0
+    NSColor.black.withAlphaComponent(strokeTrackAlpha).setStroke()
+    strokePath.stroke()
+
+    guard let pct = remainingPct else { return }
+    let clamped = min(100.0, max(0.0, pct)) / 100.0
+    guard clamped > 0.0 else { return }
+
+    var fillW = rect.width * CGFloat(clamped)
+    fillW = (fillW * 2.0).rounded() / 2.0
+    if fillW < 1.5 { fillW = 1.5 }
+
+    let fillAlpha: CGFloat = dimmed ? 0.45 : (stale ? 0.55 : 1.0)
+    NSGraphicsContext.saveGraphicsState()
+    trackPath.addClip()
+    NSColor.black.withAlphaComponent(fillAlpha).setFill()
+    NSBezierPath(rect: NSRect(x: rect.minX, y: rect.minY, width: fillW, height: rect.height)).fill()
+    NSGraphicsContext.restoreGraphicsState()
+  }
+
+  private static func makeGaugeTemplateIcon() -> NSImage {
     let size = NSSize(width: 18, height: 18)
     let img = NSImage(size: size, flipped: false) { _ in
       let cx: CGFloat = 9.0

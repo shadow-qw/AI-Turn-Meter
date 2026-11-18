@@ -107,6 +107,8 @@ const MODEL_PRICING_PER_M = {
   'gpt-5.4-mini': { input: 0.75, cacheRead: 0.075, output: 4.5 },
   'gpt-5.4-nano': { input: 0.2, cacheRead: 0.02, output: 1.25 },
   'gpt-5.3-codex': { input: 1.75, cacheRead: 0.175, output: 14.0 },
+  'gpt-5.3': { input: 1.75, cacheRead: 0.175, output: 14.0 },
+  'gpt-5.4-codex': { input: 2.5, cacheRead: 0.25, output: 15.0 },
   'gpt-5.3-codex-spark': { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
   'gpt-5.2': { input: 1.75, cacheRead: 0.175, output: 14.0 },
   'gpt-5.2-codex': { input: 1.75, cacheRead: 0.175, output: 14.0 },
@@ -118,6 +120,20 @@ const MODEL_PRICING_PER_M = {
   'gpt-5-codex': { input: 1.25, cacheRead: 0.125, output: 10.0 },
   'gpt-5-mini': { input: 0.25, cacheRead: 0.025, output: 2.0 },
   'gpt-5-nano': { input: 0.05, cacheRead: 0.005, output: 0.4 },
+  'gpt-6-mini': { input: 0.25, cacheRead: 0.025, cacheWrite: 0.3, output: 2.0 },
+  'gpt-6.1-mini': { input: 0.25, cacheRead: 0.025, cacheWrite: 0.3, output: 2.0 },
+  'gpt-6.2-mini': { input: 0.25, cacheRead: 0.025, cacheWrite: 0.3, output: 2.0 },
+  'gpt-6-nano': { input: 0.05, cacheRead: 0.005, cacheWrite: 0.0625, output: 0.4 },
+  'gpt-4.1': { input: 2.0, cacheRead: 0.5, output: 8.0 },
+  'gpt-4.1-mini': { input: 0.4, cacheRead: 0.1, output: 1.6 },
+  'gpt-4.1-nano': { input: 0.1, cacheRead: 0.025, output: 0.4 },
+  'gpt-4o': { input: 2.5, cacheRead: 1.25, output: 10.0 },
+  'gpt-4o-mini': { input: 0.15, cacheRead: 0.075, output: 0.6 },
+  o3: { input: 2.0, cacheRead: 0.5, output: 8.0 },
+  'o3-pro': { input: 20.0, cacheRead: 5.0, output: 80.0 },
+  'o3-mini': { input: 1.1, cacheRead: 0.55, output: 4.4 },
+  'o4-mini': { input: 1.1, cacheRead: 0.275, output: 4.4 },
+  'codex-mini-latest': { input: 1.5, cacheRead: 0.375, output: 6.0 },
   'codex-auto-review': { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
 
   // Google / Antigravity
@@ -275,8 +291,8 @@ function normalizeModelCandidates(rawModel) {
     // Normalize claude-opus-5-5 -> claude-opus-5.5
     const dotted = noEffort.replace(/(\d+)-(\d+)(?=-|$)/g, '$1.$2');
     candidates.add(dotted);
-    // Map newer gpt-6.<minor>-<tier> (e.g. gpt-6.2-astra) to known 6.1 / 6 tier rates
-    const gpt6Match = dotted.match(/^gpt-6\.\d+-([a-z]+)$/);
+    // Map newer gpt-6.<minor>-<tier> (e.g. gpt-6.2-astra, gpt-6.3-mini) to known rates
+    const gpt6Match = dotted.match(/^gpt-6(?:\.\d+)?-([a-z]+)$/);
     if (gpt6Match) {
       candidates.add(`gpt-6.1-${gpt6Match[1]}`);
       candidates.add(`gpt-6-${gpt6Match[1]}`);

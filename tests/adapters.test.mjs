@@ -49,7 +49,7 @@ import {
   patchCursorHooks,
 } from '../packages/daemon/src/installer.mjs';
 import { estimateTurnCost, resolveModelPricing } from '../packages/daemon/src/pricing.mjs';
-import { computeQuotaWindow, parseCursorQuotaSummary } from '../packages/daemon/src/quota.mjs';
+import { computeQuotaWindow, fetchCodexQuota, parseCursorQuotaSummary } from '../packages/daemon/src/quota.mjs';
 
 test('formatting helpers match specification', () => {
   assert.equal(formatTokens(341), '341');
@@ -2262,5 +2262,70 @@ test('CodexAdapter decompresses historical .jsonl.zst archives and syncCursorHis
     assert.equal(histCost?.estimatedCostUsd, 0.42);
   } finally {
     store.close();
+  }
+});
+
+test('pricing resolves OpenAI o-series, gpt-4.1, gpt-5.x, and gpt-6.x variants', () => {
+  for (const model of ['o3', 'o3-pro', 'o4-mini', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-5.4-codex', 'gpt-6.2-mini', 'gpt-6-astra']) {
+    const resolved = resolveModelPricing(model);
+    assert.ok(resolved, `expected pricing entry for ${model}`);
+    const cost = estimateTurnCost({
+      model,
+      totalInputTokens: 1_000_000,
+      uncachedInputTokens: 200_000,
+      cacheReadTokens: 800_000,
+      outputTokens: 50_000,
+    });
+    assert.ok(typeof cost.costUsd === 'number' && cost.costUsd > 0, `expected positive costUsd for ${model}`);
+  }
+});
+
+test('fetchCodexQuota falls back to compressed .jsonl.zst rate_limits without auth.json', async () => {
+  const prevCodexHome = process.env.CODEX_HOME;
+  const codexHome = mkdtempSync(join(tmpdir(), 'atm-codex-quota-'));
+  try {
+    const sessionsDir = join(codexHome, 'sessions', '2026', '11', '18');
+    mkdirSync(sessionsDir, { recursive: true });
+    const nowMs = Date.UTC(2026, 10, 18, 9, 0, 0);
+    const jsonl = [
+      JSON.stringify({
+        timestamp: new Date(nowMs - 60_000).toISOString(),
+        type: 'session_meta',
+        payload: { id: 'sess-zst', cwd: '/tmp/proj' },
+      }),
+      JSON.stringify({
+        timestamp: new Date(nowMs - 5_000).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          rate_limits: {
+            primary: {
+              used_percent: 36,
+              window_minutes: 300,
+              resets_at: Math.floor((nowMs + 2 * 3600 * 1000) / 1000),
+            },
+            secondary: {
+              used_percent: 12,
+              window_minutes: 10080,
+              resets_at: Math.floor((nowMs + 5 * 86400 * 1000) / 1000),
+            },
+          },
+        },
+      }),
+    ].join('\n') + '\n';
+    writeFileSync(join(sessionsDir, 'rollout-1794990000.jsonl.zst'), zstdCompressSync(Buffer.from(jsonl, 'utf8')));
+
+    process.env.CODEX_HOME = codexHome;
+    const quota = await fetchCodexQuota(nowMs, { allowNetwork: false });
+    assert.equal(quota.quotaWindows.length, 2);
+    assert.equal(Math.round(quota.quotaWindows[0].remainingPct), 64);
+    assert.equal(Math.round(quota.quotaWindows[1].remainingPct), 88);
+  } finally {
+    if (prevCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = prevCodexHome;
+    }
+    rmSync(codexHome, { recursive: true, force: true });
   }
 });

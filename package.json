@@ -1,6 +1,6 @@
 {
   "name": "ai-turn-meter",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "private": true,
   "type": "module",
   "description": "Single unified daemon & inline display monitor for Antigravity, Codex Desktop, Cursor, and CodeBuddy CN on macOS.",

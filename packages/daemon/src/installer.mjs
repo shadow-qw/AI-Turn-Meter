@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   copyFileSync,
@@ -312,6 +312,73 @@ export function buildLaunchAgentPlist({
 `;
 }
 
+function syncSleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms));
+}
+
+function findDaemonPidsOnPort(port = DEFAULT_DAEMON_PORT) {
+  try {
+    const res = spawnSync('/usr/sbin/lsof', ['-nP', '-t', `-iTCP:${port}`, '-sTCP:LISTEN'], {
+      encoding: 'utf8',
+    });
+    if (res.status !== 0 || !res.stdout) return [];
+    const pids = [];
+    for (const raw of res.stdout.split(/\r?\n/)) {
+      const pid = Number(raw.trim());
+      if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+      try {
+        const cmdOut = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'command='], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        if (cmdOut.includes('daemon.mjs') || cmdOut.includes('ai-turn-meter')) {
+          pids.push(pid);
+        }
+      } catch {}
+    }
+    return pids;
+  } catch {
+    return [];
+  }
+}
+
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function stopExistingDaemonBeforeBootstrap(port = DEFAULT_DAEMON_PORT, log = () => {}) {
+  const deadline = Date.now() + 2500;
+  let pids = findDaemonPidsOnPort(port);
+  while (pids.length > 0 && Date.now() < deadline) {
+    syncSleepMs(120);
+    pids = findDaemonPidsOnPort(port);
+  }
+  if (pids.length === 0) return;
+
+  for (const pid of pids) {
+    log(`Stop stale daemon pid ${pid} on port ${port}`);
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {}
+  }
+  const termDeadline = Date.now() + 1500;
+  while (Date.now() < termDeadline) {
+    if (findDaemonPidsOnPort(port).length === 0 && !pids.some(isPidAlive)) return;
+    syncSleepMs(100);
+  }
+  for (const pid of findDaemonPidsOnPort(port)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {}
+  }
+  syncSleepMs(150);
+}
+
 export function installLaunchAgent({
   dryRun = false,
   nodeBin = resolveNodeBin(),
@@ -332,6 +399,7 @@ export function installLaunchAgent({
     try {
       execFileSync('launchctl', ['bootout', `gui/${uid}`, plistPath], { stdio: 'ignore' });
     } catch {}
+    stopExistingDaemonBeforeBootstrap(DEFAULT_DAEMON_PORT, log);
     execFileSync('launchctl', ['bootstrap', `gui/${uid}`, plistPath], { stdio: 'inherit' });
   }
   return plistPath;
