@@ -457,7 +457,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "aiTurnMeter.showRecentWindowsInMenu"
   }
 
-  @Published var version: String = "0.2.11"
+  @Published var version: String = "0.2.12"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -1445,6 +1445,18 @@ struct ContentView: View {
     }.count
   }
 
+  private var latestOverallTurn: TurnSummary? {
+    var best: TurnSummary? = nil
+    for key in vm.orderedKeys {
+      guard vm.isToolEnabled(key),
+            let turn = vm.apps[key]?.latestTurn else { continue }
+      if best == nil || (turn.completedAtMs ?? 0) > (best?.completedAtMs ?? 0) {
+        best = turn
+      }
+    }
+    return best
+  }
+
   var body: some View {
     VStack(spacing: 0) {
       if vm.runtime.runningFromDmg {
@@ -1485,8 +1497,77 @@ struct ContentView: View {
       }
 
       HStack(spacing: 0) {
-        // Left System-Settings-style Sidebar (CodexBar style)
+        // Left Sidebar with AI Turn Meter Branded Live Telemetry Header
         VStack(alignment: .leading, spacing: 0) {
+          VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 9) {
+              ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                  .fill(LinearGradient(
+                    colors: [CodexBarPalette.cardTop, CodexBarPalette.cardBottom],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                  ))
+                  .frame(width: 28, height: 28)
+                Image(systemName: "gauge.with.dots.needle.67percent")
+                  .font(.system(size: 13.5, weight: .semibold))
+                  .foregroundColor(.white)
+              }
+
+              VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                  Text("AI Turn Meter")
+                    .font(.system(size: 12.5, weight: .semibold))
+                  Circle()
+                    .fill(vm.isActiveOverall ? Color(red: 0.20, green: 0.72, blue: 0.42) : (vm.daemonOnline ? .orange : .gray))
+                    .frame(width: 6, height: 6)
+                }
+                Text("v\(vm.version) · \(vm.isActiveOverall ? "实时采集" : (vm.daemonOnline ? "已暂停" : "后台未启"))")
+                  .font(.system(size: 10))
+                  .foregroundColor(.secondary)
+              }
+            }
+
+            Button {
+              vm.openSettingsPane(.usage)
+            } label: {
+              HStack(spacing: 5) {
+                Image(systemName: "bolt.fill")
+                  .font(.system(size: 9.5, weight: .semibold))
+                  .foregroundColor(CodexBarPalette.accentBlue)
+                Text(latestOverallTurn?.tps.map { MeterFormat.tps($0) } ?? "-- tok/s")
+                  .font(.system(size: 11, weight: .semibold))
+                  .monospacedDigit()
+                  .foregroundColor(.primary)
+                Spacer()
+                if let saved = vm.todaySummary?.cacheSavingsUsd, saved > 0 {
+                  Text("省 \(MeterFormat.usd(saved))")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundColor(Color(red: 0.16, green: 0.62, blue: 0.36))
+                } else if let rate = vm.todaySummary?.cacheRatePct {
+                  Text("缓存 \(MeterFormat.pct(rate))")
+                    .font(.system(size: 10.5))
+                    .monospacedDigit()
+                    .foregroundColor(.secondary)
+                }
+              }
+              .padding(.horizontal, 8)
+              .padding(.vertical, 5)
+              .background(CodexBarPalette.accentBlue.opacity(0.08))
+              .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+              .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                  .stroke(CodexBarPalette.accentBlue.opacity(0.16), lineWidth: 1)
+              )
+            }
+            .buttonStyle(.plain)
+            .help("查看全量 TPS、缓存与费用仪表盘")
+          }
+          .padding(.horizontal, 12)
+          .padding(.top, 12)
+          .padding(.bottom, 8)
+
           HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
               .font(.system(size: 11.5))
@@ -1506,7 +1587,7 @@ struct ContentView: View {
             }
           }
           .padding(.horizontal, 9)
-          .padding(.vertical, 6)
+          .padding(.vertical, 5.5)
           .background(Color(nsColor: .controlBackgroundColor))
           .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
           .overlay(
@@ -1514,7 +1595,6 @@ struct ContentView: View {
               .stroke(Color.primary.opacity(0.08), lineWidth: 1)
           )
           .padding(.horizontal, 12)
-          .padding(.top, 12)
           .padding(.bottom, 10)
 
           ScrollView {
@@ -1568,12 +1648,18 @@ struct ContentView: View {
                     isSelected: vm.settingsPane == .provider(key)
                   ) {
                     ToolGlyph.iconView(for: key, size: 15)
-                      .foregroundColor(installed ? .primary : .secondary.opacity(0.6))
+                      .foregroundColor(installed ? vm.toolAccentColor(for: key) : .secondary.opacity(0.6))
                       .frame(width: 20)
                     Text(vm.toolShortTitle(for: key))
                       .font(.system(size: 12.5, weight: vm.settingsPane == .provider(key) ? .semibold : .regular))
                       .foregroundColor(installed ? .primary : .secondary)
                     Spacer()
+                    if let tps = entry?.latestTurn?.tps, tps > 0, installed && enabled && vm.isActiveOverall {
+                      Text(MeterFormat.tps(tps))
+                        .font(.system(size: 10))
+                        .monospacedDigit()
+                        .foregroundColor(.secondary)
+                    }
                     Circle()
                       .fill(dotColor)
                       .frame(width: 6.5, height: 6.5)
@@ -1764,120 +1850,242 @@ private struct ProviderSettingsDetailView: View {
     let enabled = vm.isToolEnabled(key)
     let active = installed && vm.isActiveOverall && enabled
     let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
+    let accent = vm.toolAccentColor(for: key)
     let card = vm.usageData?.cards?[key]
+    let latestTurn = entry?.latestTurn
     let windows = card?.quotaWindows ?? []
 
-    let statusText: String = {
+    let latestTpsDisplay: String = {
+      if let tps = latestTurn?.tps, tps > 0 { return MeterFormat.tps(tps) }
+      if let raw = card?.latestTpsText, !raw.isEmpty {
+        return raw.hasPrefix("均 ") ? String(raw.dropFirst(2)) : raw
+      }
+      return "--"
+    }()
+
+    let statusBadgeText: String = {
       if !installed { return "未安装" }
-      if !vm.daemonOnline { return "后台服务未启动" }
-      if !vm.masterEnabled { return "全局已暂停" }
+      if !vm.daemonOnline { return "后台未启动" }
+      if !vm.masterEnabled { return "全局暂停" }
       if !enabled { return "已关闭" }
-      if let port = entry?.cdpPort { return "正常运行 (CDP:\(port))" }
-      return "正常运行"
+      if let port = entry?.cdpPort { return "消息旁已连接 · CDP:\(port)" }
+      return "状态栏监控中"
+    }()
+
+    let statusBadgeColor: Color = {
+      if !installed || !enabled || !vm.daemonOnline || !vm.masterEnabled { return .secondary }
+      if entry?.cdpPort != nil { return Color(red: 0.16, green: 0.65, blue: 0.38) }
+      return .orange
     }()
 
     ScrollView {
-      VStack(alignment: .leading, spacing: 18) {
-        // Provider Summary Card matching 图5
+      VStack(alignment: .leading, spacing: 16) {
+        // 1. Distinctive Hero Banner Card (accent-tinted badge, connection status & quick actions)
         SettingsGroupCard {
-          HStack(spacing: 12) {
-            ToolGlyph.iconView(for: key, size: 26)
-              .foregroundColor(installed ? .primary : .secondary)
-              .frame(width: 30, height: 30)
-
-            VStack(alignment: .leading, spacing: 2) {
-              Text(vm.displayTitle(for: key))
-                .font(.system(size: 15, weight: .semibold))
-              Text("app · \(vm.relativeUpdateLabel())")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-            }
-
-            Spacer()
-
-            Button {
-              vm.refreshDoctorAndBootstrap()
-              vm.fetchUsageSummary()
-            } label: {
-              Image(systemName: "arrow.clockwise")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.secondary)
-            }
-            .buttonStyle(.borderless)
-            .help("刷新此提供商状态与额度")
-
-            Toggle("", isOn: Binding(
-              get: { installed && enabled && vm.isActiveOverall },
-              set: { vm.setToolEnabled(key, enabled: $0) }
-            ))
-            .toggleStyle(.switch)
-            .labelsHidden()
-            .controlSize(.regular)
-            .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
-          }
-          .padding(.horizontal, 14)
-          .padding(.vertical, 12)
-
-          Divider().padding(.leading, 14)
-          settingsKVRow(title: "来源", value: entry?.cdpPort != nil ? "app · CDP 实时探针" : "app")
-          Divider().padding(.leading, 14)
-          settingsKVRow(title: "已更新", value: vm.relativeUpdateLabel())
-          Divider().padding(.leading, 14)
-
-          HStack(spacing: 8) {
-            Text("状态")
-              .font(.system(size: 12.5))
-            Spacer()
-            if needsInline && !vm.runtime.runningFromDmg {
-              Button(vm.inlineBtnLabel(for: key)) {
-                vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
+          VStack(spacing: 0) {
+            HStack(spacing: 12) {
+              ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                  .fill(installed ? accent.opacity(0.15) : Color.primary.opacity(0.06))
+                  .frame(width: 40, height: 40)
+                ToolGlyph.iconView(for: key, size: 22)
+                  .foregroundColor(installed ? accent : .secondary)
               }
-              .buttonStyle(.borderedProminent)
-              .tint(CodexBarPalette.accentBlue)
-              .controlSize(.small)
-              .disabled(vm.busy)
-            }
-            Text(statusText)
-              .font(.system(size: 12.5))
-              .foregroundColor(active ? .secondary : .orange)
-          }
-          .padding(.horizontal, 14)
-          .padding(.vertical, 10)
 
-          Divider().padding(.leading, 14)
-          settingsKVRow(title: "账户", value: card?.accountEmail ?? "本地工作区会话")
-          Divider().padding(.leading, 14)
-          settingsKVRow(title: "套餐", value: card?.planTitle ?? "按量 / 本地监控")
+              VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                  Text(vm.displayTitle(for: key))
+                    .font(.system(size: 16, weight: .bold))
+                  Text(statusBadgeText)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundColor(statusBadgeColor)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(statusBadgeColor.opacity(0.12))
+                    .clipShape(Capsule())
+                }
 
-          if installed {
-            Divider().padding(.leading, 14)
-            HStack(spacing: 10) {
-              Text("快捷操作")
-                .font(.system(size: 12.5))
-              Spacer()
-              Button("历史轮次…") {
-                vm.recentTurnsFilterTool = key
-                vm.openSettingsPane(.turns)
+                HStack(spacing: 6) {
+                  if let email = card?.accountEmail {
+                    Text(email)
+                      .font(.system(size: 11))
+                      .foregroundColor(.secondary)
+                      .lineLimit(1)
+                    Text("·").foregroundColor(.secondary.opacity(0.6))
+                  }
+                  if let plan = card?.planTitle {
+                    Text(plan)
+                      .font(.system(size: 11))
+                      .foregroundColor(.secondary)
+                    Text("·").foregroundColor(.secondary.opacity(0.6))
+                  }
+                  Text(vm.relativeUpdateLabel())
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                }
               }
-              .buttonStyle(.bordered)
-              .controlSize(.small)
 
-              if let appPath = entry?.appPath {
-                Button("打开应用") {
-                  NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
+              Spacer(minLength: 8)
+
+              Button {
+                vm.refreshDoctorAndBootstrap()
+                vm.fetchUsageSummary()
+              } label: {
+                Image(systemName: "arrow.clockwise")
+                  .font(.system(size: 12, weight: .medium))
+                  .foregroundColor(.secondary)
+              }
+              .buttonStyle(.borderless)
+              .help("刷新状态、TPS 与额度")
+
+              Toggle("", isOn: Binding(
+                get: { installed && enabled && vm.isActiveOverall },
+                set: { vm.setToolEnabled(key, enabled: $0) }
+              ))
+              .toggleStyle(.switch)
+              .labelsHidden()
+              .controlSize(.regular)
+              .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
+            }
+            .padding(14)
+            .background(
+              LinearGradient(
+                colors: [accent.opacity(0.09), accent.opacity(0.01)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+              )
+            )
+
+            if installed {
+              Divider()
+              HStack(spacing: 8) {
+                if needsInline && !vm.runtime.runningFromDmg {
+                  Button(vm.inlineBtnLabel(for: key)) {
+                    vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
+                  }
+                  .buttonStyle(.borderedProminent)
+                  .tint(accent)
+                  .controlSize(.small)
+                  .disabled(vm.busy)
+                }
+                if let ver = vm.vsixVersions[key] {
+                  Text("VSIX v\(ver)")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2.5)
+                    .background(Color.primary.opacity(0.05))
+                    .clipShape(Capsule())
+                }
+                Spacer()
+                Button("历史轮次…") {
+                  vm.recentTurnsFilterTool = key
+                  vm.openSettingsPane(.turns)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+
+                if let appPath = entry?.appPath {
+                  Button("打开应用") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
+                  }
+                  .buttonStyle(.bordered)
+                  .controlSize(.small)
+                }
               }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 9)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
           }
         }
 
-        // 用量 Section matching 图5
+        // 2. Signature AI Turn Meter Section: Live TPS Telemetry & Inline Pill Preview
         VStack(alignment: .leading, spacing: 8) {
-          Text("用量")
+          Text("实时速率与消息旁胶囊")
+            .font(.system(size: 13.5, weight: .semibold))
+            .padding(.horizontal, 2)
+
+          SettingsGroupCard {
+            HStack(spacing: 0) {
+              telemetryTile(
+                title: "最近一轮速率",
+                value: latestTpsDisplay,
+                detail: latestTurn?.model.flatMap { $0 == "unknown" ? nil : $0 } ?? "等待对话",
+                valueColor: accent
+              )
+              Divider().frame(height: 44)
+              telemetryTile(
+                title: "今日均速",
+                value: MeterFormat.tps(card?.today.avgTps),
+                detail: "\(card?.today.callCount ?? 0) 次模型调用"
+              )
+              Divider().frame(height: 44)
+              telemetryTile(
+                title: "今日缓存命中",
+                value: MeterFormat.pct(card?.today.cacheRatePct),
+                detail: "\(card?.today.turnCount ?? 0) 轮对话"
+              )
+              Divider().frame(height: 44)
+              telemetryTile(
+                title: "缓存节省费用",
+                value: MeterFormat.usd(card?.today.cacheSavingsUsd),
+                detail: "今日估算 \(MeterFormat.usd(card?.today.costUsd))",
+                valueColor: Color(red: 0.16, green: 0.62, blue: 0.36)
+              )
+            }
+            .padding(.vertical, 12)
+
+            Divider().padding(.leading, 14)
+
+            VStack(alignment: .leading, spacing: 7) {
+              HStack {
+                Text("消息旁胶囊实况")
+                  .font(.system(size: 11.5, weight: .semibold))
+                  .foregroundColor(.secondary)
+                Spacer()
+                if let ts = latestTurn?.completedAtMs, ts > 0 {
+                  Text(MeterFormat.timeText(ts))
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                }
+              }
+
+              HStack(spacing: 6) {
+                Image(systemName: "bolt.fill")
+                  .font(.system(size: 10.5, weight: .semibold))
+                  .foregroundColor(accent)
+                Text(latestTurn?.inlineText ?? card?.latestTurnSubline ?? "发送一轮对话后，将在此实时预览胶囊数值")
+                  .font(.system(size: 11.5, weight: .medium))
+                  .monospacedDigit()
+                  .foregroundColor(active ? .primary : .secondary)
+                  .lineLimit(1)
+                Spacer(minLength: 0)
+              }
+              .padding(.horizontal, 10)
+              .padding(.vertical, 7)
+              .background(accent.opacity(0.08))
+              .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+              .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                  .stroke(accent.opacity(0.22), lineWidth: 1)
+              )
+
+              if let preview = latestTurn?.replyPreview, !preview.isEmpty {
+                Text("最近回复: \(preview)")
+                  .font(.system(size: 10.5))
+                  .foregroundColor(.secondary)
+                  .lineLimit(1)
+                  .truncationMode(.tail)
+              }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+          }
+        }
+
+        // 3. Quota & Usage Section
+        VStack(alignment: .leading, spacing: 8) {
+          Text("套餐额度与费用")
             .font(.system(size: 13.5, weight: .semibold))
             .padding(.horizontal, 2)
 
@@ -1889,26 +2097,49 @@ private struct ProviderSettingsDetailView: View {
                 }
                 providerQuotaRow(win: win)
               }
-            } else {
-              settingsKVRow(
-                title: "今日估算用量",
-                value: "\(MeterFormat.usd(card?.today.costUsd)) · \(MeterFormat.tokens(card?.today.totalTokens ?? 0))"
-              )
               Divider().padding(.leading, 14)
-              settingsKVRow(
-                title: "近 30 天估算用量",
-                value: "\(MeterFormat.usd(card?.days30.costUsd)) · \(MeterFormat.tokens(card?.days30.totalTokens ?? 0))"
-              )
-              if let latestSub = card?.latestTurnSubline {
-                Divider().padding(.leading, 14)
-                settingsKVRow(title: "最近一轮", value: latestSub)
-              }
             }
+            settingsKVRow(
+              title: "今日估算用量",
+              value: "\(MeterFormat.usd(card?.today.costUsd)) · \(MeterFormat.tokens(card?.today.totalTokens ?? 0))"
+            )
+            Divider().padding(.leading, 14)
+            settingsKVRow(
+              title: "近 30 天估算用量",
+              value: "\(MeterFormat.usd(card?.days30.costUsd)) · \(MeterFormat.tokens(card?.days30.totalTokens ?? 0))"
+            )
           }
         }
       }
       .padding(20)
     }
+  }
+
+  private func telemetryTile(
+    title: String,
+    value: String,
+    detail: String,
+    valueColor: Color = .primary
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Text(title)
+        .font(.system(size: 10.5))
+        .foregroundColor(.secondary)
+        .lineLimit(1)
+      Text(value)
+        .font(.system(size: 15, weight: .bold))
+        .monospacedDigit()
+        .foregroundColor(valueColor)
+        .lineLimit(1)
+        .minimumScaleFactor(0.8)
+      Text(detail)
+        .font(.system(size: 10))
+        .foregroundColor(.secondary)
+        .lineLimit(1)
+        .truncationMode(.middle)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(.horizontal, 12)
   }
 
   private func providerQuotaRow(win: CardQuotaWindow) -> some View {
@@ -2127,6 +2358,31 @@ private struct MenuBarSettingsPaneView: View {
                 .frame(width: 165)
                 .controlSize(.small)
               }
+
+              Divider().padding(.leading, 14)
+              VStack(alignment: .leading, spacing: 8) {
+                Text("快速切换状态栏常驻数值")
+                  .font(.system(size: 11))
+                  .foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                  ForEach([MenuBarDisplayMode.tps, .quotaRemaining, .todayCost, .iconOnly], id: \.self) { preset in
+                    let isSelected = vm.menuBarDisplayMode == preset
+                    Button(preset == .tps ? "实时速度 (TPS)" : preset.title) {
+                      vm.setMenuBarDisplayMode(preset)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                    .foregroundColor(isSelected ? .white : .primary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4.5)
+                    .background(
+                      Capsule().fill(isSelected ? CodexBarPalette.accentBlue : Color.primary.opacity(0.07))
+                    )
+                  }
+                }
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 10)
             }
           }
         }
@@ -3530,8 +3786,19 @@ private struct CostHistoryDetailFlyoutView: View {
         }
       }
 
-      // 30-day total estimate + disclaimer
+      // Live TPS & Cache Telemetry line + 30-day total estimate
       VStack(alignment: .leading, spacing: 2) {
+        if card.latestTpsText != nil || (card.today.avgTps ?? 0) > 0 || card.today.cacheRatePct != nil {
+          let tpsDisplay = card.latestTpsText.map { $0.hasPrefix("均 ") ? String($0.dropFirst(2)) : $0 }
+            ?? MeterFormat.tps(card.today.avgTps)
+          let cachePart = card.today.cacheRatePct.map { " · 缓存 \(MeterFormat.pct($0))" } ?? ""
+          let savedPart = ((card.today.cacheSavingsUsd ?? 0) > 0) ? " · 已省 \(MeterFormat.usd(card.today.cacheSavingsUsd))" : ""
+          Text("实时速率: \(tpsDisplay)\(cachePart)\(savedPart)")
+            .font(.system(size: 11, weight: .medium))
+            .monospacedDigit()
+            .foregroundColor(.primary.opacity(0.85))
+            .lineLimit(1)
+        }
         Text("估算总计 (近 30 天): \(MeterFormat.usd(card.days30.costUsd))")
           .font(.system(size: 11.5))
           .monospacedDigit()
@@ -3781,6 +4048,53 @@ private struct CodexBarStyleCardView: View {
         )
       }
 
+      // Live TPS & Cache Telemetry Strip (AI Turn Meter signature)
+      if card.latestTpsText != nil || (card.today.avgTps ?? 0) > 0 || card.today.cacheRatePct != nil {
+        HStack(spacing: 6) {
+          HStack(spacing: 4) {
+            Image(systemName: "bolt.fill")
+              .font(.system(size: 9.5, weight: .semibold))
+              .foregroundColor(isCardHovered ? .white : CodexBarPalette.accentBlue)
+            Text(
+              resolvedTpsBadge.map { $0.hasPrefix("均 ") ? String($0.dropFirst(2)) : $0 }
+                ?? MeterFormat.tps(card.today.avgTps)
+            )
+            .font(.system(size: 10.5, weight: .semibold))
+            .monospacedDigit()
+            .foregroundColor(primaryText)
+            if (card.today.avgTps ?? 0) > 0 && resolvedTpsBadge != nil {
+              Text("均 \(MeterFormat.tps(card.today.avgTps).replacingOccurrences(of: " tok/s", with: ""))")
+                .font(.system(size: 9.5))
+                .monospacedDigit()
+                .foregroundColor(secondaryText)
+            }
+          }
+
+          Spacer(minLength: 4)
+
+          HStack(spacing: 5) {
+            if let cacheRate = card.today.cacheRatePct {
+              Text("缓存 \(MeterFormat.pct(cacheRate))")
+                .font(.system(size: 10, weight: .medium))
+                .monospacedDigit()
+                .foregroundColor(secondaryText)
+            }
+            if let saved = card.today.cacheSavingsUsd, saved > 0 {
+              Text("省 \(MeterFormat.usd(saved))")
+                .font(.system(size: 10, weight: .semibold))
+                .monospacedDigit()
+                .foregroundColor(isCardHovered ? .white.opacity(0.95) : Color(red: 0.16, green: 0.62, blue: 0.36))
+            }
+          }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+          RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(isCardHovered ? Color.white.opacity(0.14) : CodexBarPalette.tealBar.opacity(0.10))
+        )
+      }
+
       // 30-day Mini Usage Chart
       if !card.daily30.isEmpty {
         MiniUsageBarsView(points: card.daily30, cardHovered: isCardHovered)
@@ -3824,17 +4138,6 @@ private struct CodexBarStyleCardView: View {
             .foregroundColor(secondaryText)
             .lineLimit(1)
             .truncationMode(.middle)
-        }
-        let speedParts: [String] = [
-          resolvedTpsBadge.map { $0.hasPrefix("均 ") ? "今日均速: \(String($0.dropFirst(2)))" : "最近速率: \($0)" },
-          card.latestCacheText,
-        ].compactMap { $0 }
-        if !speedParts.isEmpty {
-          Text(speedParts.joined(separator: " · "))
-            .font(.system(size: 10.5))
-            .monospacedDigit()
-            .foregroundColor(secondaryText)
-            .lineLimit(1)
         }
         Text("根据 Token 用量估算 · 不是订阅账单")
           .font(.system(size: 10))
