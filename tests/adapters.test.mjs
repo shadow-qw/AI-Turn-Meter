@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { zstdCompressSync } from 'node:zlib';
 
 import {
   formatCacheRate,
@@ -14,7 +15,7 @@ import {
   normalizeTurn,
 } from '../packages/daemon/src/format.mjs';
 import { TurnStore } from '../packages/daemon/src/store.mjs';
-import { isCodexOpenAiModel, parseCodexSessionContent } from '../packages/daemon/src/adapters/codex.mjs';
+import { CodexAdapter, isCodexOpenAiModel, parseCodexSessionContent } from '../packages/daemon/src/adapters/codex.mjs';
 import {
   AntigravityAdapter,
   buildAntigravitySpeedIndex,
@@ -25,7 +26,7 @@ import {
   parseCodeBuddyIdeSessionDir,
   workspaceMd5,
 } from '../packages/daemon/src/adapters/codebuddy.mjs';
-import { processCursorHookPayload, drainCursorSpool } from '../packages/daemon/src/adapters/cursor.mjs';
+import { processCursorHookPayload, drainCursorSpool, syncCursorHistoryEvents } from '../packages/daemon/src/adapters/cursor.mjs';
 import {
   CdpInlineInjector,
   buildInjectedRuntimeSource,
@@ -2132,5 +2133,134 @@ test('parseCursorQuotaSummary splits Cursor dual-pool model quotas cleanly and s
     if (prevEnvDb === undefined) delete process.env.AI_TURN_METER_DB;
     else process.env.AI_TURN_METER_DB = prevEnvDb;
     rmSync(stateTmp, { recursive: true, force: true });
+  }
+});
+
+test('CodexAdapter decompresses historical .jsonl.zst archives and syncCursorHistoryEvents deduplicates against local hooks', async () => {
+  const codexRoot = mkdtempSync(join(tmpdir(), 'atm-zst-'));
+  try {
+    const sessDir = join(codexRoot, 'sessions', '2026', '08');
+    const archDir = join(codexRoot, 'archived_sessions');
+    mkdirSync(sessDir, { recursive: true });
+    mkdirSync(archDir, { recursive: true });
+
+    const sampleJsonl = [
+      JSON.stringify({ timestamp: '2026-08-15T10:00:00.000Z', type: 'session_meta', payload: { id: 'sess-zst-1', cwd: '/tmp/app' } }),
+      JSON.stringify({ timestamp: '2026-08-15T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't-z1', model: 'gpt-6-astra' } }),
+      JSON.stringify({
+        timestamp: '2026-08-15T10:00:10.000Z',
+        type: 'token_usage_record',
+        payload: {
+          turn_id: 't-z1',
+          response_id: 'r-z1',
+          usage: { input_tokens: 200_000, cached_input_tokens: 150_000, output_tokens: 1200 },
+        },
+      }),
+      JSON.stringify({ timestamp: '2026-08-15T10:00:12.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't-z1', duration_ms: 8000 } }),
+    ].join('\n');
+
+    writeFileSync(join(archDir, 'rollout-2026-08-15-sess-zst-1.jsonl.zst'), zstdCompressSync(Buffer.from(sampleJsonl, 'utf8')));
+
+    const store = new TurnStore(':memory:');
+    try {
+      const adapter = new CodexAdapter({
+        store,
+        sessionsDir: join(codexRoot, 'sessions'),
+        archivedDir: archDir,
+      });
+      const first = adapter.scan({ maxRecentFiles: Infinity });
+      assert.equal(first.length, 1);
+      assert.equal(first[0].model, 'gpt-6-astra');
+      assert.equal(first[0].totalInputTokens, 200_000);
+
+      // Second adapter instance skips unchanged cached file via ingested_files
+      const adapter2 = new CodexAdapter({
+        store,
+        sessionsDir: join(codexRoot, 'sessions'),
+        archivedDir: archDir,
+      });
+      assert.equal(adapter2.scan({ maxRecentFiles: Infinity }).length, 0);
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(codexRoot, { recursive: true, force: true });
+  }
+
+  // Cursor cloud event backfill + explicitCostUsd + hook overlap dedup + TPS/IDE priority
+  const store = new TurnStore(':memory:');
+  try {
+    const hookTimeMs = Date.UTC(2026, 10, 18, 8, 0, 0);
+    store.upsertTurn({
+      turnUid: 'cursor:conv-hook:gen-1',
+      tool: 'cursor',
+      host: 'cursor-ide',
+      sessionId: 'conv-hook',
+      turnId: 'gen-1',
+      model: 'gemini-4-carbon',
+      workspacePath: '/data/workspace',
+      startedAtMs: hookTimeMs - 10_000,
+      completedAtMs: hookTimeMs,
+      totalInputTokens: 1_000_000,
+      cacheReadTokens: 800_000,
+      outputTokens: 5_000,
+      durationMs: 100_000,
+      tps: 50.0,
+      tpsMethod: 'e2e_turn',
+    });
+
+    const pages = {
+      1: {
+        usageEventsDisplay: [
+          // Overlaps local hook turn -> must be skipped
+          {
+            usageEventId: 'ev-dup',
+            conversationId: 'conv-hook',
+            timestamp: String(hookTimeMs - 9_000),
+            model: 'gemini-4-carbon-high',
+            tokenUsage: { inputTokens: 200_000, cacheReadTokens: 800_000, outputTokens: 5_200, totalCents: 180 },
+          },
+          // Distinct newer cloud event without TPS -> must import cleanly with explicitCostUsd & NOT clobber TPS
+          {
+            usageEventId: 'ev-grok',
+            conversationId: 'conv-bg',
+            timestamp: String(hookTimeMs + 60_000),
+            model: 'grok-bot-default',
+            tokenUsage: { inputTokens: 10_000, cacheWriteTokens: 40_000, cacheReadTokens: 50_000, outputTokens: 500, totalCents: 42 },
+          },
+        ],
+      },
+      2: {
+        usageEventsDisplay: [
+          // Pre-hook historical event (Nov 1)
+          {
+            usageEventId: 'ev-hist',
+            conversationId: 'conv-old',
+            timestamp: String(Date.UTC(2026, 10, 1, 10, 0, 0)),
+            model: 'gemini-4-carbon-high',
+            tokenUsage: { inputTokens: 500_000, cacheReadTokens: 1_500_000, outputTokens: 2_000, totalCents: 130 },
+          },
+        ],
+      },
+    };
+
+    const res = await syncCursorHistoryEvents(store, {
+      pageSize: 2,
+      nowMs: hookTimeMs + 120_000,
+      fetchPageFn: async (p) => pages[p] || { usageEventsDisplay: [] },
+    });
+    assert.equal(res.synced, 2);
+    assert.equal(res.completed, true);
+    assert.equal(store.getMeta('cursor_history_backfilled_v1'), '1');
+
+    const usageAll = store.getUsageSummary({ days: 0, nowMs: hookTimeMs + 120_000 });
+    assert.equal(usageAll.cards.cursor.today.turnCount, 2); // hook + ev-grok (ev-dup skipped!)
+    assert.equal(usageAll.cards.cursor.days30.turnCount, 3); // + ev-hist
+    assert.equal(usageAll.cards.cursor.latestTpsText, '50 tok/s'); // cloud event without TPS preserves hook TPS
+    assert.equal(store.getMatchForIde({ tool: 'cursor' })?.turnUid, 'cursor:conv-hook:gen-1');
+    const histCost = usageAll.byModel.find((m) => m.model === 'grok-bot-default');
+    assert.equal(histCost?.estimatedCostUsd, 0.42);
+  } finally {
+    store.close();
   }
 });

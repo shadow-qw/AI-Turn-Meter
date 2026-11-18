@@ -5,7 +5,7 @@ import { URL } from 'node:url';
 import { CodexAdapter } from './adapters/codex.mjs';
 import { AntigravityAdapter } from './adapters/antigravity.mjs';
 import { CodeBuddyAdapter } from './adapters/codebuddy.mjs';
-import { drainCursorSpool, processCursorHookPayload } from './adapters/cursor.mjs';
+import { drainCursorSpool, processCursorHookPayload, syncCursorHistoryEvents } from './adapters/cursor.mjs';
 import { CdpInlineInjector } from './cdp-injector.mjs';
 import { getPackageMeta } from './installer.mjs';
 import { getAllQuotas } from './quota.mjs';
@@ -109,15 +109,41 @@ export function createMeterServer({
     if (!records || records.length === 0) return;
     const state = { ...store.getState(20, config.tools), config: publicConfig(config) };
     broadcast('state', state);
-    for (const r of records) {
-      broadcast('turn', r);
+    if (records.length <= 15) {
+      for (const r of records) {
+        broadcast('turn', r);
+      }
     }
     if (cdpInjector) {
-      const changedTools = [...new Set(records.map((r) => r.tool))].filter((t) => isInlineEnabled(t));
+      const liveRecords = records.filter((r) => r.host !== 'cursor-cloud');
+      const changedTools = [...new Set(liveRecords.map((r) => r.tool))].filter((t) => isInlineEnabled(t));
       if (changedTools.length > 0) {
         cdpInjector.pushAll({ force: true, tools: changedTools }).catch(() => {});
       }
     }
+  }
+
+  let cursorSyncInflight = null;
+  let lastCursorSyncAtMs = 0;
+
+  function triggerCursorHistorySync({ force = false } = {}) {
+    if (!enableQuotaProbe || config.tools.cursor === false) return null;
+    if (cursorSyncInflight) return cursorSyncInflight;
+    const now = Date.now();
+    const backfilled = store.getMeta?.('cursor_history_backfilled_v1') === '1';
+    if (!force && backfilled && now - lastCursorSyncAtMs < 60_000) {
+      return null;
+    }
+    lastCursorSyncAtMs = now;
+    cursorSyncInflight = syncCursorHistoryEvents(store, {
+      cursorCookie: config.cursorCookie,
+      onBatch: (records) => onTurnsChanged(records),
+    })
+      .catch(() => ({ synced: 0, completed: false }))
+      .finally(() => {
+        cursorSyncInflight = null;
+      });
+    return cursorSyncInflight;
   }
 
   const codexAdapter = new CodexAdapter({ store, onTurns: onTurnsChanged });
@@ -183,6 +209,9 @@ export function createMeterServer({
             : 7;
       const tool = url.searchParams.get('tool') || null;
       const forceRefresh = url.searchParams.get('refresh') === '1';
+      if (forceRefresh) {
+        triggerCursorHistorySync({ force: false });
+      }
       const sendUsage = async () => {
         const quotasByTool = enableQuotaProbe
           ? await getAllQuotas(Date.now(), {
@@ -303,6 +332,9 @@ export function createMeterServer({
             }
             if (refreshQuota && enableQuotaProbe) {
               getAllQuotas(Date.now(), { forceRefresh: true, cursorCookie: config.cursorCookie }).catch(() => {});
+              triggerCursorHistorySync({ force: true });
+            } else if (payload?.tools?.cursor === true) {
+              triggerCursorHistorySync({ force: false });
             }
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, config: pubCfg }));
@@ -340,6 +372,8 @@ export function createMeterServer({
   });
 
   let spoolTimer = null;
+  let cursorHistoryTimer = null;
+  let cursorInitialSyncTimer = null;
 
   async function start() {
     await new Promise((resolve) => {
@@ -362,6 +396,15 @@ export function createMeterServer({
     cdpInjector?.start();
     if (enableQuotaProbe) {
       getAllQuotas().catch(() => {});
+      cursorInitialSyncTimer = setTimeout(() => {
+        cursorInitialSyncTimer = null;
+        triggerCursorHistorySync({ force: true });
+      }, 400);
+      cursorInitialSyncTimer.unref?.();
+      cursorHistoryTimer = setInterval(() => {
+        triggerCursorHistorySync({ force: false });
+      }, 300_000);
+      cursorHistoryTimer.unref?.();
     }
 
     return server.address();
@@ -379,6 +422,8 @@ export function createMeterServer({
       ]);
     }
     if (spoolTimer) clearInterval(spoolTimer);
+    if (cursorHistoryTimer) clearInterval(cursorHistoryTimer);
+    if (cursorInitialSyncTimer) clearTimeout(cursorInitialSyncTimer);
     for (const res of sseClients) res.end();
     sseClients.clear();
     await new Promise((resolve) => server.close(resolve));

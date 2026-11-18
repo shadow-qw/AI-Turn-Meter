@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync, watch } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { zstdDecompressSync } from 'node:zlib';
 
 const CODEX_OPENAI_MODEL_RE = /^(?:openai\/)?(?:gpt-|o1|o3|o4|codex-|chatgpt-)/i;
 
@@ -456,7 +457,7 @@ function collectJsonlFiles(dir, out = [], maxFiles = Infinity) {
     const full = join(dir, ent.name);
     if (ent.isDirectory()) {
       collectJsonlFiles(full, out, maxFiles);
-    } else if (ent.isFile() && ent.name.endsWith('.jsonl')) {
+    } else if (ent.isFile() && (ent.name.endsWith('.jsonl') || ent.name.endsWith('.jsonl.zst'))) {
       out.push(full);
     }
   }
@@ -482,46 +483,60 @@ export class CodexAdapter {
     this.fileMtimes = new Map();
     this.watchers = [];
     this.timer = null;
+    this.backfillTimer = null;
   }
 
   scan({ maxRecentFiles = 30 } = {}) {
-    const collectLimit = Math.max(maxRecentFiles * 2, 60);
+    const collectLimit = Number.isFinite(maxRecentFiles) ? Math.max(maxRecentFiles * 3, 90) : Infinity;
     const rawPaths = [];
     collectJsonlFiles(this.sessionsDir, rawPaths, collectLimit);
     if (this.archivedDir) {
-      collectJsonlFiles(this.archivedDir, rawPaths, collectLimit * 2);
+      collectJsonlFiles(this.archivedDir, rawPaths, collectLimit);
     }
 
     const nowMs = Date.now();
-    const files = rawPaths
+    let files = rawPaths
       .map((fp) => {
         try {
-          return { fp, mtimeMs: statSync(fp).mtimeMs };
+          const st = statSync(fp);
+          return { fp, mtimeMs: st.mtimeMs, sizeBytes: st.size };
         } catch {
           return null;
         }
       })
       .filter(Boolean)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, maxRecentFiles)
-      .reverse();
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    if (Number.isFinite(maxRecentFiles)) {
+      files = files.slice(0, maxRecentFiles);
+    }
+    files.reverse();
 
     const changed = [];
-    for (const { fp, mtimeMs } of files) {
+    for (const { fp, mtimeMs, sizeBytes } of files) {
       if (this.fileMtimes.get(fp) === mtimeMs) continue;
+      const cached = this.store.getIngestedFile?.(fp);
+      if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+        this.fileMtimes.set(fp, mtimeMs);
+        continue;
+      }
       this.fileMtimes.set(fp, mtimeMs);
       let content;
       try {
-        content = readFileSync(fp, 'utf8');
+        if (fp.endsWith('.jsonl.zst')) {
+          content = zstdDecompressSync(readFileSync(fp)).toString('utf8');
+        } else {
+          content = readFileSync(fp, 'utf8');
+        }
       } catch {
         continue;
       }
-      const flushOpenTurns = nowMs - mtimeMs > 120_000;
+      const flushOpenTurns = fp.endsWith('.jsonl.zst') || nowMs - mtimeMs > 120_000;
       const turns = parseCodexSessionContent(content, fp, { flushOpenTurns, onlyOpenAiModels: true });
       for (const t of turns) {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
       }
+      this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
     }
     if (changed.length > 0 && this.onTurns) {
       this.onTurns(changed);
@@ -530,7 +545,12 @@ export class CodexAdapter {
   }
 
   start() {
-    this.scan({ maxRecentFiles: 150 });
+    this.scan({ maxRecentFiles: 24 });
+    this.backfillTimer = setTimeout(() => {
+      this.backfillTimer = null;
+      this.scan({ maxRecentFiles: Infinity });
+    }, 150);
+    this.backfillTimer.unref?.();
     for (const dir of [this.sessionsDir, this.archivedDir].filter(Boolean)) {
       try {
         const w = watch(dir, { recursive: true }, () => {
@@ -557,6 +577,7 @@ export class CodexAdapter {
     for (const w of this.watchers) w.close();
     this.watchers = [];
     if (this.timer) clearInterval(this.timer);
+    if (this.backfillTimer) clearTimeout(this.backfillTimer);
     if (this.pending) clearTimeout(this.pending);
   }
 }

@@ -528,7 +528,11 @@ function resolveCursorJwtCookie(rawToken) {
   };
 }
 
-async function cursorApiJson(url, cookieHeader, { method = 'GET', body = null } = {}) {
+export async function cursorApiJson(
+  url,
+  cookieHeader,
+  { method = 'GET', body = null, timeoutMs = 8000 } = {}
+) {
   try {
     const headers = {
       Cookie: cookieHeader,
@@ -545,13 +549,32 @@ async function cursorApiJson(url, cookieHeader, { method = 'GET', body = null } 
       method,
       headers,
       body: body !== null ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(6000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return null;
     return await res.json();
   } catch {
     return null;
   }
+}
+
+export function resolveCursorCookieHeader(cursorCookie = null) {
+  let cookieHeader = normalizeCursorCookieInput(cursorCookie);
+  if (cookieHeader) return cookieHeader;
+  try {
+    const dbPath = join(homedir(), 'Library/Application Support/Cursor/User/globalStorage/state.vscdb');
+    if (existsSync(dbPath)) {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const token = db.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get('cursorAuth/accessToken')?.value;
+        const jwtRes = resolveCursorJwtCookie(token);
+        if (jwtRes) return jwtRes.cookieHeader;
+      } finally {
+        db.close();
+      }
+    }
+  } catch {}
+  return readCodexBarCursorSessionCookie();
 }
 
 export function parseCursorQuotaSummary(

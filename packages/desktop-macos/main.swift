@@ -479,7 +479,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.16"
+  @Published var version: String = "0.2.17"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -2594,7 +2594,7 @@ struct UsageSummaryTabView: View {
                   }
 
                   VStack(spacing: 0) {
-                    HStack(alignment: .bottom, spacing: 2) {
+                    HStack(alignment: .bottom, spacing: 0) {
                       ForEach(visibleDays) { pt in
                         let val = dayMetricValue(pt)
                         let frac = val > 0 ? CGFloat(val / maxVal) : 0
@@ -2605,7 +2605,7 @@ struct UsageSummaryTabView: View {
                           .fill(
                             val > 0
                               ? (isHov ? CodexBarPalette.accentBlue : CodexBarPalette.tealBar)
-                              : Color.primary.opacity(0.08)
+                              : Color.primary.opacity(isHov ? 0.24 : 0.08)
                           )
                           .frame(maxWidth: .infinity)
                           .frame(height: val > 0 ? max(4, frac * 68) : 2)
@@ -2616,14 +2616,29 @@ struct UsageSummaryTabView: View {
                                 .frame(height: 3)
                             }
                           }
-                          .contentShape(Rectangle())
-                          .onHover { inside in
-                            if inside { hoveredDay = pt }
-                            else if hoveredDay?.id == pt.id { hoveredDay = nil }
-                          }
+                          .padding(.horizontal, 1.0)
+                          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                       }
                     }
                     .frame(height: 70, alignment: .bottom)
+                    .overlay {
+                      GeometryReader { geo in
+                        Color.clear
+                          .contentShape(Rectangle())
+                          .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let loc):
+                              guard !visibleDays.isEmpty else { return }
+                              let w = max(1, geo.size.width)
+                              let idx = min(visibleDays.count - 1, max(0, Int((loc.x / w) * CGFloat(visibleDays.count))))
+                              let target = visibleDays[idx]
+                              if hoveredDay?.id != target.id { hoveredDay = target }
+                            case .ended:
+                              hoveredDay = nil
+                            }
+                          }
+                      }
+                    }
 
                     Rectangle()
                       .fill(Color.primary.opacity(0.10))
@@ -3524,7 +3539,7 @@ private struct MiniUsageBarsView: View {
       .frame(height: 13)
 
       VStack(spacing: 0) {
-        HStack(alignment: .bottom, spacing: 2) {
+        HStack(alignment: .bottom, spacing: 0) {
           ForEach(points) { pt in
             let val = metricValue(pt)
             let ratio = val > 0 ? CGFloat(val / maxVal) : 0
@@ -3542,14 +3557,29 @@ private struct MiniUsageBarsView: View {
               )
               .frame(maxWidth: .infinity)
               .frame(height: val > 0 ? max(4, ratio * 24) : 2.0)
-              .contentShape(Rectangle())
-              .onHover { inside in
-                if inside { hovered = pt }
-                else if hovered?.id == pt.id { hovered = nil }
-              }
+              .padding(.horizontal, 1.0)
+              .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
           }
         }
         .frame(height: 26, alignment: .bottom)
+        .overlay {
+          GeometryReader { geo in
+            Color.clear
+              .contentShape(Rectangle())
+              .onContinuousHover { phase in
+                switch phase {
+                case .active(let loc):
+                  guard !points.isEmpty else { return }
+                  let w = max(1, geo.size.width)
+                  let idx = min(points.count - 1, max(0, Int((loc.x / w) * CGFloat(points.count))))
+                  let target = points[idx]
+                  if hovered?.id != target.id { hovered = target }
+                case .ended:
+                  hovered = nil
+                }
+              }
+          }
+        }
 
         Rectangle()
           .fill(cardHovered ? Color.white.opacity(0.28) : Color.primary.opacity(0.12))
@@ -3670,6 +3700,7 @@ private final class CostHistoryFlyoutController: NSObject {
     p.level = .popUpMenu
     p.hasShadow = true
     p.hidesOnDeactivate = true
+    p.acceptsMouseMovedEvents = true
     p.collectionBehavior = [.transient, .ignoresCycle]
     p.contentView = vfx
 
@@ -3762,10 +3793,11 @@ private struct CostHistoryDetailFlyoutView: View {
     let selectedPt: CardDailyPoint? = points.first(where: { $0.date == hoveredDate })
       ?? points.last(where: { $0.totalTokens > 0 || ($0.costUsd ?? 0) > 0 })
       ?? points.last
+    let maxDayModelsCount = points.map { min(4, ($0.models ?? []).count) }.max() ?? 0
     let projects = Array((card.projects ?? []).prefix(5))
 
     VStack(alignment: .leading, spacing: 10) {
-      // 30-day vertical bar chart with Y-axis + yellow peak cap (图3)
+      // 30-day vertical bar chart with Y-axis + yellow peak cap + continuous bar scrubbing
       if !points.isEmpty {
         VStack(alignment: .leading, spacing: 4) {
           HStack(alignment: .bottom, spacing: 6) {
@@ -3781,7 +3813,7 @@ private struct CostHistoryDetailFlyoutView: View {
             .foregroundColor(Color(nsColor: .tertiaryLabelColor))
             .frame(width: 36, height: 102, alignment: .leading)
 
-            HStack(alignment: .bottom, spacing: 2.5) {
+            HStack(alignment: .bottom, spacing: 0) {
               ForEach(points, id: \.id) { pt in
                 flyoutBar(
                   pt: pt,
@@ -3792,14 +3824,39 @@ private struct CostHistoryDetailFlyoutView: View {
                 )
               }
             }
+            .frame(height: 102, alignment: .bottom)
+            .overlay {
+              GeometryReader { geo in
+                Color.clear
+                  .contentShape(Rectangle())
+                  .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let loc):
+                      guard !points.isEmpty else { return }
+                      let w = max(1, geo.size.width)
+                      let idx = min(points.count - 1, max(0, Int((loc.x / w) * CGFloat(points.count))))
+                      let d = points[idx].date
+                      if hoveredDate != d { hoveredDate = d }
+                    case .ended:
+                      hoveredDate = nil
+                    }
+                  }
+              }
+            }
           }
 
-          if let firstLabel = points.first?.label {
-            Text(firstLabel)
-              .font(.system(size: 10))
-              .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-              .padding(.leading, 42)
+          HStack {
+            if let firstLabel = points.first?.label {
+              Text(firstLabel)
+            }
+            Spacer()
+            if let lastLabel = points.last?.label {
+              Text(lastLabel)
+            }
           }
+          .font(.system(size: 10))
+          .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+          .padding(.leading, 42)
         }
 
         // token | 费用 segmented toggle
@@ -3827,24 +3884,27 @@ private struct CostHistoryDetailFlyoutView: View {
             .foregroundColor(.secondary)
             .lineLimit(1)
 
-          ForEach(dayModels) { m in
-            HStack(alignment: .center, spacing: 8) {
-              Rectangle()
-                .fill(CodexBarPalette.tealBar)
-                .frame(width: 2, height: 26)
-              VStack(alignment: .leading, spacing: 1) {
-                Text(m.model)
-                  .font(.system(size: 11))
-                  .foregroundColor(.secondary)
-                  .lineLimit(1)
-                  .truncationMode(.middle)
-                Text("\(MeterFormat.usd(m.costUsd)) · \(MeterFormat.tokens(m.totalTokens))")
-                  .font(.system(size: 10.5))
-                  .monospacedDigit()
-                  .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+          VStack(alignment: .leading, spacing: 6) {
+            ForEach(dayModels) { m in
+              HStack(alignment: .center, spacing: 8) {
+                Rectangle()
+                  .fill(CodexBarPalette.tealBar)
+                  .frame(width: 2, height: 26)
+                VStack(alignment: .leading, spacing: 1) {
+                  Text(m.model)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                  Text("\(MeterFormat.usd(m.costUsd)) · \(MeterFormat.tokens(m.totalTokens))")
+                    .font(.system(size: 10.5))
+                    .monospacedDigit()
+                    .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+                }
               }
             }
           }
+          .frame(minHeight: maxDayModelsCount > 0 ? CGFloat(maxDayModelsCount * 32 - 6) : 0, alignment: .topLeading)
         }
       }
 
@@ -3925,14 +3985,10 @@ private struct CostHistoryDetailFlyoutView: View {
               .frame(height: 4)
           }
         }
+        .padding(.horizontal, 1.0)
     }
     .frame(maxWidth: .infinity)
     .frame(height: 102, alignment: .bottom)
-    .contentShape(Rectangle())
-    .onHover { inside in
-      if inside { hoveredDate = pt.date }
-      else if hoveredDate == pt.date { hoveredDate = nil }
-    }
   }
 }
 
@@ -4113,13 +4169,13 @@ private struct CodexBarStyleCardView: View {
           rightVal: MeterFormat.usd(card.currentWindow.costUsd)
         )
         metricGridRow(
-          leftLabel: "最近 token 用量",
+          leftLabel: "今日 token 用量",
           leftVal: MeterFormat.tokens(card.today.totalTokens),
           rightLabel: "估算：当前窗口 token 用量",
           rightVal: MeterFormat.tokens(card.currentWindow.totalTokens)
         )
         metricGridRow(
-          leftLabel: "30d",
+          leftLabel: "近 30 天",
           leftVal: MeterFormat.usd(card.days30.costUsd),
           rightLabel: "近 30 天 token 用量",
           rightVal: MeterFormat.tokens(card.days30.totalTokens)

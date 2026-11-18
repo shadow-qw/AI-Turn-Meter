@@ -188,5 +188,6 @@ export function normalizeTurn(raw) {
     tpsMethod,
     tpsMethodLabel: TPS_METHOD_LABELS[tpsMethod] || TPS_METHOD_LABELS.unavailable,
     replyPreview: normalizePreviewText(raw.replyPreview),
+    explicitCostUsd: toNonNegFloat(raw.explicitCostUsd),
   };
 }

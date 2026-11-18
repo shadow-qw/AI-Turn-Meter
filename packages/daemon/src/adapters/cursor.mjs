@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { cursorApiJson, resolveCursorCookieHeader } from '../quota.mjs';
 
 export function defaultStateDir() {
   return process.env.AI_TURN_METER_STATE_DIR || join(homedir(), '.local', 'share', 'ai-turn-meter');
@@ -214,4 +215,174 @@ export function drainCursorSpool(store, stateDir = defaultStateDir()) {
     }
   }
   return records;
+}
+
+export function buildCursorHookOverlapIndex(hookRows = []) {
+  const bySession = new Map();
+  for (const row of hookRows) {
+    if (!row || !row.session_id) continue;
+    let entry = bySession.get(row.session_id);
+    if (!entry) {
+      entry = { workspacePath: null, hooks: [] };
+      bySession.set(row.session_id, entry);
+    }
+    if (!entry.workspacePath && row.workspace_path) {
+      entry.workspacePath = row.workspace_path;
+    }
+    entry.hooks.push({
+      startedAtMs: Number(row.started_at_ms) || null,
+      completedAtMs: Number(row.completed_at_ms) || 0,
+      totalInputTokens: Number(row.total_input_tokens) || 0,
+      outputTokens: Number(row.output_tokens) || 0,
+    });
+  }
+  return bySession;
+}
+
+export function parseCursorApiUsageEvent(ev, overlapIndex = null) {
+  if (!ev || typeof ev !== 'object') return null;
+  const tsMs = Number(ev.timestamp);
+  if (!Number.isFinite(tsMs) || tsMs <= 0) return null;
+
+  const usage = ev.tokenUsage && typeof ev.tokenUsage === 'object' ? ev.tokenUsage : {};
+  const uncachedInputTokens = Math.max(0, Math.round(Number(usage.inputTokens) || 0));
+  const cacheReadTokens = Math.max(0, Math.round(Number(usage.cacheReadTokens) || 0));
+  const cacheWriteTokens = Math.max(0, Math.round(Number(usage.cacheWriteTokens) || 0));
+  const outputTokens = Math.max(0, Math.round(Number(usage.outputTokens) || 0));
+  const totalInputTokens = uncachedInputTokens + cacheReadTokens + cacheWriteTokens;
+
+  const rawCents = Number(usage.totalCents);
+  const explicitCostUsd = Number.isFinite(rawCents) && rawCents >= 0 ? rawCents / 100 : null;
+
+  if (totalInputTokens === 0 && outputTokens === 0 && (explicitCostUsd === null || explicitCostUsd <= 0)) {
+    return null;
+  }
+
+  const convId = typeof ev.conversationId === 'string' && ev.conversationId.trim() ? ev.conversationId.trim() : null;
+  let workspacePath = null;
+
+  if (convId && overlapIndex && overlapIndex.has(convId)) {
+    const entry = overlapIndex.get(convId);
+    workspacePath = entry.workspacePath || null;
+    for (const h of entry.hooks) {
+      const closeInTime = Math.abs(h.completedAtMs - tsMs) <= 6 * 3600_000;
+      if (closeInTime && h.totalInputTokens > 0 && h.totalInputTokens === totalInputTokens) {
+        return null;
+      }
+      if (Math.abs(h.completedAtMs - tsMs) <= 20_000 && h.outputTokens > 0 && h.outputTokens === outputTokens) {
+        return null;
+      }
+    }
+  }
+
+  const d = new Date(tsMs);
+  const dayKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const sessionId = convId || `cursor-cloud-${dayKey}`;
+  const rawEventId =
+    typeof ev.usageEventId === 'string' && ev.usageEventId.trim()
+      ? ev.usageEventId.trim()
+      : `${convId || 'no-conv'}:${tsMs}:${ev.model || 'unknown'}:${totalInputTokens}:${outputTokens}`;
+
+  return {
+    turnUid: `cursor:api:${rawEventId}`,
+    tool: 'cursor',
+    host: 'cursor-cloud',
+    sessionId,
+    turnId: rawEventId,
+    model: typeof ev.model === 'string' && ev.model.trim() ? ev.model.trim() : 'cursor',
+    workspacePath,
+    startedAtMs: Math.round(tsMs),
+    completedAtMs: Math.round(tsMs),
+    callCount: 1,
+    totalInputTokens,
+    uncachedInputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    outputTokens,
+    thinkingTokens: null,
+    durationMs: null,
+    modelActiveMs: null,
+    ttftMs: null,
+    tpsMethod: 'unavailable',
+    explicitCostUsd,
+  };
+}
+
+export async function syncCursorHistoryEvents(
+  store,
+  {
+    cursorCookie = null,
+    nowMs = Date.now(),
+    pageSize = 500,
+    maxPages = 60,
+    onBatch = null,
+    fetchPageFn = null,
+  } = {}
+) {
+  const cookieHeader = fetchPageFn ? cursorCookie : resolveCursorCookieHeader(cursorCookie);
+  if (!cookieHeader && !fetchPageFn) return { synced: 0, completed: false };
+
+  const backfilled = store.getMeta?.('cursor_history_backfilled_v1') === '1';
+  const latestSavedMs = Number(store.getMeta?.('cursor_history_latest_ms')) || 0;
+  const startDateMs = backfilled && latestSavedMs > 0 ? Math.max(0, latestSavedMs - 3600_000) : 0;
+
+  const overlapIndex = buildCursorHookOverlapIndex(store.getCursorLocalHookRows?.() || []);
+  let newestSeenMs = latestSavedMs;
+  let totalChanged = 0;
+  let completed = false;
+
+  const doFetchPage =
+    fetchPageFn ||
+    ((page) =>
+      cursorApiJson('https://cursor.com/api/dashboard/get-filtered-usage-events', cookieHeader, {
+        method: 'POST',
+        timeoutMs: 20_000,
+        body: {
+          page,
+          pageSize,
+          startDate: String(startDateMs),
+          endDate: String(nowMs + 60_000),
+        },
+      }));
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const res = await doFetchPage(page);
+    if (!res || !Array.isArray(res.usageEventsDisplay)) break;
+    const events = res.usageEventsDisplay;
+    if (events.length === 0) {
+      completed = true;
+      break;
+    }
+
+    const batchRecords = [];
+    for (const ev of events) {
+      const ts = Number(ev?.timestamp);
+      if (Number.isFinite(ts) && ts > newestSeenMs) newestSeenMs = ts;
+      const parsed = parseCursorApiUsageEvent(ev, overlapIndex);
+      if (!parsed) continue;
+      const upserted = store.upsertTurn(parsed);
+      if (upserted.changed) {
+        totalChanged += 1;
+        batchRecords.push(upserted.record);
+      }
+    }
+
+    if (batchRecords.length > 0 && onBatch) {
+      onBatch(batchRecords);
+    }
+
+    if (events.length < pageSize) {
+      completed = true;
+      break;
+    }
+  }
+
+  if (newestSeenMs > latestSavedMs) {
+    store.setMeta?.('cursor_history_latest_ms', String(Math.round(newestSeenMs)));
+  }
+  if (completed && !backfilled) {
+    store.setMeta?.('cursor_history_backfilled_v1', '1');
+  }
+
+  return { synced: totalChanged, completed };
 }

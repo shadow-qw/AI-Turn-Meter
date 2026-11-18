@@ -269,8 +269,11 @@ function normalizeModelCandidates(rawModel) {
     // Strip trailing YYYYMMDD snapshots (e.g. claude-opus-4-5-20251101)
     const noDate = spaced.replace(/-\d{8}$/, '');
     candidates.add(noDate);
+    // Strip reasoning-effort suffixes (e.g. gemini-4-carbon-high, grok-4.7-xhigh)
+    const noEffort = noDate.replace(/-(?:xhigh|high|medium|low|fast)$/, '');
+    candidates.add(noEffort);
     // Normalize claude-opus-5-5 -> claude-opus-5.5
-    const dotted = noDate.replace(/(\d+)-(\d+)(?=-|$)/g, '$1.$2');
+    const dotted = noEffort.replace(/(\d+)-(\d+)(?=-|$)/g, '$1.$2');
     candidates.add(dotted);
     // Map newer gpt-6.<minor>-<tier> (e.g. gpt-6.2-astra) to known 6.1 / 6 tier rates
     const gpt6Match = dotted.match(/^gpt-6\.\d+-([a-z]+)$/);
@@ -313,12 +316,16 @@ export function resolveModelPricing(model, customRates = null) {
  * @param {Record<string, any> | null} [customRates]
  */
 export function estimateTurnCost(turn, customRates = null) {
+  const explicitCost =
+    typeof turn?.explicitCostUsd === 'number' && Number.isFinite(turn.explicitCostUsd) && turn.explicitCostUsd >= 0
+      ? Number(turn.explicitCostUsd.toFixed(6))
+      : null;
   const base = resolveModelPricing(turn?.model, customRates);
   if (!base) {
     return {
-      priced: false,
-      costUsd: null,
-      savingsUsd: null,
+      priced: explicitCost !== null,
+      costUsd: explicitCost,
+      savingsUsd: explicitCost !== null ? 0 : null,
       uncachedCostUsd: null,
       cacheReadCostUsd: null,
       cacheWriteCostUsd: null,
@@ -349,7 +356,7 @@ export function estimateTurnCost(turn, customRates = null) {
   const cacheReadCostUsd = (cacheReadTokens / 1_000_000) * cacheReadRate;
   const cacheWriteCostUsd = (cacheWriteTokens / 1_000_000) * cacheWriteRate;
   const outputCostUsd = (outputTokens / 1_000_000) * outputRate;
-  const costUsd = uncachedCostUsd + cacheReadCostUsd + cacheWriteCostUsd + outputCostUsd;
+  const costUsd = explicitCost !== null ? explicitCost : uncachedCostUsd + cacheReadCostUsd + cacheWriteCostUsd + outputCostUsd;
 
   const savingsUsd = Math.max(0, (cacheReadTokens / 1_000_000) * (inputRate - cacheReadRate));
 

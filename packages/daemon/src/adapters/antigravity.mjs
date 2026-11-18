@@ -431,7 +431,7 @@ export class AntigravityAdapter {
         const fp = join(brainDir, ent.name, '.system_generated', 'logs', 'transcript.jsonl');
         try {
           const st = statSync(fp);
-          results.push({ fp, sessionId: ent.name, host, mtimeMs: st.mtimeMs });
+          results.push({ fp, sessionId: ent.name, host, mtimeMs: st.mtimeMs, sizeBytes: st.size });
         } catch {
           // No transcript yet
         }
@@ -449,17 +449,30 @@ export class AntigravityAdapter {
   }
 
   async scan({ maxRecentFiles = 20 } = {}) {
-    const dirtyFiles = this.listTranscriptFiles()
-      .slice(0, maxRecentFiles)
+    let listed = this.listTranscriptFiles();
+    if (Number.isFinite(maxRecentFiles)) {
+      listed = listed.slice(0, maxRecentFiles);
+    }
+    const dirtyFiles = listed
       .reverse()
-      .filter(({ fp, mtimeMs }) => this.fileMtimes.get(fp) !== mtimeMs);
+      .filter(({ fp, mtimeMs, sizeBytes }) => {
+        if (this.fileMtimes.get(fp) === mtimeMs) return false;
+        const cached = this.store.getIngestedFile?.(fp);
+        if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+          this.fileMtimes.set(fp, mtimeMs);
+          return false;
+        }
+        return true;
+      });
     if (dirtyFiles.length === 0) return [];
 
+    const nowMs = Date.now();
     const metaMap = loadConversationMetaMap(this.geminiRoot);
-    const servers = await this.getServers();
+    const hasRecentFile = dirtyFiles.some(({ mtimeMs }) => nowMs - mtimeMs < 15 * 60_000);
+    const servers = hasRecentFile ? await this.getServers() : null;
     const changed = [];
 
-    for (const { fp, sessionId, host, mtimeMs } of dirtyFiles) {
+    for (const { fp, sessionId, host, mtimeMs, sizeBytes } of dirtyFiles) {
       let content;
       try {
         content = readFileSync(fp, 'utf8');
@@ -467,7 +480,7 @@ export class AntigravityAdapter {
         continue;
       }
       let speedIndex = null;
-      if (servers && servers.length > 0) {
+      if (servers && servers.length > 0 && nowMs - mtimeMs < 15 * 60_000) {
         const meta = await fetchGeneratorMetadata(servers, sessionId);
         if (meta) speedIndex = buildAntigravitySpeedIndex(meta);
       }
@@ -486,6 +499,7 @@ export class AntigravityAdapter {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
       }
+      this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
     }
 
     if (changed.length > 0 && this.onTurns) {
@@ -495,7 +509,7 @@ export class AntigravityAdapter {
   }
 
   async start() {
-    await this.scan();
+    await this.scan({ maxRecentFiles: Infinity });
     for (const sub of ['antigravity', 'antigravity-ide', 'antigravity-cli']) {
       const brainDir = join(this.geminiRoot, sub, 'brain');
       if (!existsSync(brainDir)) continue;

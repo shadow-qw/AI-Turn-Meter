@@ -90,6 +90,7 @@ function addTurnToAccumulator(acc, row, customRates) {
       cacheWriteTokens: cacheWrite,
       outputTokens: out,
       callCount: calls,
+      explicitCostUsd: row.explicit_cost_usd,
     },
     customRates
   );
@@ -193,17 +194,34 @@ export class TurnStore {
         ttft_ms INTEGER,
         tps REAL,
         tps_method TEXT NOT NULL,
-        reply_preview TEXT
+        reply_preview TEXT,
+        explicit_cost_usd REAL
       );
 
       CREATE INDEX IF NOT EXISTS idx_turns_completed ON turns(completed_at_ms DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_tool_completed ON turns(tool, completed_at_ms DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(tool, session_id);
       CREATE INDEX IF NOT EXISTS idx_turns_workspace ON turns(workspace_path, completed_at_ms DESC);
+
+      CREATE TABLE IF NOT EXISTS ingested_files (
+        file_path TEXT PRIMARY KEY,
+        mtime_ms REAL NOT NULL,
+        size_bytes INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS sync_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
 
     try {
       this.db.exec('ALTER TABLE turns ADD COLUMN reply_preview TEXT;');
+    } catch {
+      // Column already exists on initialized databases
+    }
+    try {
+      this.db.exec('ALTER TABLE turns ADD COLUMN explicit_cost_usd REAL;');
     } catch {
       // Column already exists on initialized databases
     }
@@ -225,14 +243,14 @@ export class TurnStore {
         call_count, total_input_tokens, uncached_input_tokens,
         cache_read_tokens, cache_write_tokens, output_tokens,
         thinking_tokens, cache_rate_pct, duration_ms, model_active_ms,
-        ttft_ms, tps, tps_method, reply_preview
+        ttft_ms, tps, tps_method, reply_preview, explicit_cost_usd
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?, ?,
-        ?, ?, ?, ?
+        ?, ?, ?, ?, ?
       )
       ON CONFLICT(turn_uid) DO UPDATE SET
         host = excluded.host,
@@ -254,12 +272,26 @@ export class TurnStore {
         ttft_ms = COALESCE(excluded.ttft_ms, turns.ttft_ms),
         tps = COALESCE(excluded.tps, turns.tps),
         tps_method = CASE WHEN excluded.tps IS NOT NULL THEN excluded.tps_method ELSE turns.tps_method END,
-        reply_preview = COALESCE(excluded.reply_preview, turns.reply_preview)
+        reply_preview = COALESCE(excluded.reply_preview, turns.reply_preview),
+        explicit_cost_usd = COALESCE(excluded.explicit_cost_usd, turns.explicit_cost_usd)
     `);
 
     this.getExistingStmt = this.db.prepare(
-      `SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, output_tokens, tps, call_count, model, workspace_path, reply_preview FROM turns WHERE turn_uid = ?`
+      `SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, output_tokens, tps, call_count, model, workspace_path, reply_preview, explicit_cost_usd FROM turns WHERE turn_uid = ?`
     );
+
+    this.getIngestedStmt = this.db.prepare(`SELECT mtime_ms, size_bytes FROM ingested_files WHERE file_path = ?`);
+    this.setIngestedStmt = this.db.prepare(`
+      INSERT INTO ingested_files (file_path, mtime_ms, size_bytes)
+      VALUES (?, ?, ?)
+      ON CONFLICT(file_path) DO UPDATE SET mtime_ms = excluded.mtime_ms, size_bytes = excluded.size_bytes
+    `);
+    this.getMetaStmt = this.db.prepare(`SELECT value FROM sync_meta WHERE key = ?`);
+    this.setMetaStmt = this.db.prepare(`
+      INSERT INTO sync_meta (key, value)
+      VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
 
     this.sessionAggStmt = this.db.prepare(`
       SELECT
@@ -294,7 +326,8 @@ export class TurnStore {
       prev.call_count !== t.callCount ||
       (!prev.reply_preview && Boolean(t.replyPreview)) ||
       (prev.model === 'unknown' && t.model !== 'unknown') ||
-      (!prev.workspace_path && Boolean(t.workspacePath));
+      (!prev.workspace_path && Boolean(t.workspacePath)) ||
+      prev.explicit_cost_usd !== t.explicitCostUsd;
 
     if (changed) {
       this.upsertStmt.run(
@@ -321,7 +354,8 @@ export class TurnStore {
         t.ttftMs,
         t.tps,
         t.tpsMethod,
-        t.replyPreview
+        t.replyPreview,
+        t.explicitCostUsd
       );
     }
 
@@ -392,15 +426,45 @@ export class TurnStore {
       tps: row.tps,
       tpsMethod: row.tps_method,
       replyPreview: row.reply_preview || null,
+      explicitCostUsd: row.explicit_cost_usd ?? null,
     });
     return this.enrichRecord(t);
+  }
+
+  getIngestedFile(filePath) {
+    const r = this.getIngestedStmt.get(filePath);
+    return r ? { mtimeMs: Number(r.mtime_ms), sizeBytes: r.size_bytes ?? null } : null;
+  }
+
+  setIngestedFile(filePath, mtimeMs, sizeBytes = null) {
+    this.setIngestedStmt.run(filePath, mtimeMs, sizeBytes);
+  }
+
+  getMeta(key) {
+    const r = this.getMetaStmt.get(String(key));
+    return r ? String(r.value) : null;
+  }
+
+  setMeta(key, value) {
+    this.setMetaStmt.run(String(key), String(value));
+  }
+
+  getCursorLocalHookRows() {
+    return this.db
+      .prepare(
+        `SELECT session_id, workspace_path, started_at_ms, completed_at_ms, total_input_tokens, output_tokens
+         FROM turns
+         WHERE tool = 'cursor' AND host != 'cursor-cloud'`
+      )
+      .all();
   }
 
   getLatestByTool() {
     const tools = ['codex', 'antigravity', 'cursor', 'codebuddy'];
     const result = {};
     const stmt = this.db.prepare(
-      `SELECT * FROM turns WHERE tool = ? ORDER BY completed_at_ms DESC LIMIT 1`
+      `SELECT * FROM turns WHERE tool = ?
+       ORDER BY (CASE WHEN host = 'cursor-cloud' THEN 0 ELSE 1 END) DESC, completed_at_ms DESC LIMIT 1`
     );
     for (const tool of tools) {
       result[tool] = this.rowToTurn(stmt.get(tool));
@@ -430,7 +494,7 @@ export class TurnStore {
       if (workspacePath) {
         const r = this.db
           .prepare(
-            `SELECT * FROM turns WHERE tool = ? AND workspace_path = ? ORDER BY completed_at_ms DESC LIMIT 1`
+            `SELECT * FROM turns WHERE tool = ? AND workspace_path = ? AND host != 'cursor-cloud' ORDER BY completed_at_ms DESC LIMIT 1`
           )
           .get(tool, workspacePath);
         if (r) return this.rowToTurn(r);
@@ -438,13 +502,13 @@ export class TurnStore {
       if (workspaceHash) {
         const r = this.db
           .prepare(
-            `SELECT * FROM turns WHERE tool = ? AND workspace_hash = ? ORDER BY completed_at_ms DESC LIMIT 1`
+            `SELECT * FROM turns WHERE tool = ? AND workspace_hash = ? AND host != 'cursor-cloud' ORDER BY completed_at_ms DESC LIMIT 1`
           )
           .get(tool, workspaceHash);
         if (r) return this.rowToTurn(r);
       }
       const r = this.db
-        .prepare(`SELECT * FROM turns WHERE tool = ? ORDER BY completed_at_ms DESC LIMIT 1`)
+        .prepare(`SELECT * FROM turns WHERE tool = ? AND host != 'cursor-cloud' ORDER BY completed_at_ms DESC LIMIT 1`)
         .get(tool);
       return r ? this.rowToTurn(r) : null;
     }
@@ -646,10 +710,20 @@ export class TurnStore {
   }
 
   buildLatestTurnMetrics(rows, todayFin) {
-    const latestRow = rows.length > 0 ? rows[rows.length - 1] : null;
+    let latestTpsRow = null;
+    let latestLocalRow = null;
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const r = rows[i];
+      if (!latestLocalRow && r.host !== 'cursor-cloud') latestLocalRow = r;
+      if (!latestTpsRow && typeof r.tps === 'number' && Number.isFinite(r.tps) && r.tps > 0) {
+        latestTpsRow = r;
+      }
+      if (latestLocalRow && latestTpsRow) break;
+    }
+    const latestRow = latestTpsRow || latestLocalRow || (rows.length > 0 ? rows[rows.length - 1] : null);
     let tpsText = null;
-    if (latestRow && typeof latestRow.tps === 'number' && Number.isFinite(latestRow.tps) && latestRow.tps > 0) {
-      tpsText = formatTps(latestRow.tps);
+    if (latestTpsRow && typeof latestTpsRow.tps === 'number' && latestTpsRow.tps > 0) {
+      tpsText = formatTps(latestTpsRow.tps);
     } else if (todayFin && typeof todayFin.avgTps === 'number' && Number.isFinite(todayFin.avgTps) && todayFin.avgTps > 0) {
       tpsText = `均 ${formatTps(todayFin.avgTps)}`;
     }

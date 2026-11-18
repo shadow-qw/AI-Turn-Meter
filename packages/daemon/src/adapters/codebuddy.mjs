@@ -350,6 +350,7 @@ export class CodeBuddyAdapter {
     this.cliMtimes = new Map();
     this.watchers = [];
     this.timer = null;
+    this.backfillTimer = null;
   }
 
   findIdeSessions() {
@@ -392,6 +393,7 @@ export class CodeBuddyAdapter {
               idxFile,
               workspaceHash: p.name,
               mtimeMs: st.mtimeMs,
+              sizeBytes: st.size,
             });
           } catch {
             // No index.json
@@ -424,7 +426,8 @@ export class CodeBuddyAdapter {
         if (!f.isFile() || !f.name.endsWith('.jsonl')) continue;
         const fp = join(pDir, f.name);
         try {
-          found.push({ fp, mtimeMs: statSync(fp).mtimeMs });
+          const st = statSync(fp);
+          found.push({ fp, mtimeMs: st.mtimeMs, sizeBytes: st.size });
         } catch {
           // ignore
         }
@@ -436,19 +439,32 @@ export class CodeBuddyAdapter {
   scan({ maxRecent = 25 } = {}) {
     const changed = [];
 
-    for (const { sessionDir, idxFile, workspaceHash, mtimeMs } of this.findIdeSessions()
-      .slice(0, maxRecent)
-      .reverse()) {
+    let ideSessions = this.findIdeSessions();
+    if (Number.isFinite(maxRecent)) ideSessions = ideSessions.slice(0, maxRecent);
+    for (const { sessionDir, idxFile, workspaceHash, mtimeMs, sizeBytes } of ideSessions.reverse()) {
       if (this.indexMtimes.get(idxFile) === mtimeMs) continue;
+      const cached = this.store.getIngestedFile?.(idxFile);
+      if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+        this.indexMtimes.set(idxFile, mtimeMs);
+        continue;
+      }
       this.indexMtimes.set(idxFile, mtimeMs);
       for (const t of parseCodeBuddyIdeSessionDir(sessionDir, workspaceHash)) {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
       }
+      this.store.setIngestedFile?.(idxFile, mtimeMs, sizeBytes);
     }
 
-    for (const { fp, mtimeMs } of this.findCliFiles().slice(0, maxRecent).reverse()) {
+    let cliFiles = this.findCliFiles();
+    if (Number.isFinite(maxRecent)) cliFiles = cliFiles.slice(0, maxRecent);
+    for (const { fp, mtimeMs, sizeBytes } of cliFiles.reverse()) {
       if (this.cliMtimes.get(fp) === mtimeMs) continue;
+      const cached = this.store.getIngestedFile?.(fp);
+      if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+        this.cliMtimes.set(fp, mtimeMs);
+        continue;
+      }
       this.cliMtimes.set(fp, mtimeMs);
       try {
         const content = readFileSync(fp, 'utf8');
@@ -456,6 +472,7 @@ export class CodeBuddyAdapter {
           const res = this.store.upsertTurn(t);
           if (res.changed) changed.push(res.record);
         }
+        this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
       } catch {
         // ignore
       }
@@ -468,7 +485,12 @@ export class CodeBuddyAdapter {
   }
 
   start() {
-    this.scan();
+    this.scan({ maxRecent: 25 });
+    this.backfillTimer = setTimeout(() => {
+      this.backfillTimer = null;
+      this.scan({ maxRecent: Infinity });
+    }, 250);
+    this.backfillTimer.unref?.();
     for (const dir of [this.extDataDir, this.cliProjectsDir]) {
       if (!existsSync(dir)) continue;
       try {
@@ -494,6 +516,7 @@ export class CodeBuddyAdapter {
     for (const w of this.watchers) w.close();
     this.watchers = [];
     if (this.timer) clearInterval(this.timer);
+    if (this.backfillTimer) clearTimeout(this.backfillTimer);
     if (this.pending) clearTimeout(this.pending);
   }
 }

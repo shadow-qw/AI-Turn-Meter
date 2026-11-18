@@ -2,7 +2,7 @@
   "name": "ai-turn-meter",
   "displayName": "AI Turn Meter",
   "description": "Auto-updating per-turn input/output tokens, cache hit rate, and TPS in the status bar via local AI Turn Meter daemon.",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "publisher": "local-ai-turn-meter",
   "extensionKind": [
     "ui"
