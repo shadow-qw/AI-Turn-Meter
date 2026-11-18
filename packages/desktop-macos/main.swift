@@ -479,7 +479,7 @@ final class MeterViewModel: ObservableObject {
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
   }
 
-  @Published var version: String = "0.2.18"
+  @Published var version: String = "0.2.19"
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
   @Published var daemonPort: Int = 47831
@@ -1394,6 +1394,10 @@ final class MeterViewModel: ObservableObject {
             self.updateStatusText = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
             NSWorkspace.shared.open(dest)
           }
+        } else {
+          DispatchQueue.main.async {
+            self.terminateForUpdateRelaunch()
+          }
         }
         return
       }
@@ -1458,13 +1462,19 @@ final class MeterViewModel: ObservableObject {
 
     let pid = ProcessInfo.processInfo.processIdentifier
     let script = """
-    while kill -0 "$1" 2>/dev/null; do sleep 0.1; done
+    i=0
+    while kill -0 "$1" 2>/dev/null && [ "$i" -lt 150 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    sleep 0.2
     rm -rf "$3" && /usr/bin/ditto "$2" "$3" && (/usr/bin/xattr -dr com.apple.quarantine "$3" >/dev/null 2>&1 || true) && /usr/bin/open -n "$3"
     rm -rf "$4"
     """
     let launcher = Process()
-    launcher.executableURL = URL(fileURLWithPath: "/bin/zsh")
-    launcher.arguments = ["-c", script, "atm-updater", "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path]
+    launcher.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+    launcher.arguments = ["/bin/zsh", "-c", script, "atm-updater", "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path]
+    launcher.standardInput = FileHandle.nullDevice
     launcher.standardOutput = FileHandle.nullDevice
     launcher.standardError = FileHandle.nullDevice
     do {
@@ -1474,10 +1484,28 @@ final class MeterViewModel: ObservableObject {
       return "启动替换脚本失败"
     }
 
-    DispatchQueue.main.async {
+    return nil
+  }
+
+  private func terminateForUpdateRelaunch() {
+    // End document-modal sheets (e.g. .sheet(isPresented: $vm.showUpdateSheet)) first;
+    // AppKit aborts NSApp.terminate(nil) when an attached sheet session is still active.
+    showUpdateSheet = false
+    updateDownloading = false
+    CostHistoryFlyoutController.shared.hideImmediately()
+    for win in NSApp.windows {
+      while let sheet = win.attachedSheet {
+        win.endSheet(sheet)
+      }
+      win.orderOut(nil)
+    }
+    NSApp.stopModal()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
       NSApp.terminate(nil)
     }
-    return nil
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+      exit(0)
+    }
   }
 }
 
