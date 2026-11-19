@@ -440,14 +440,19 @@ async function callModelOnce(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
       'User-Agent': 'codex-cli',
-      'OpenAI-Beta': 'responses=experimental',
       ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}),
     };
     body = {
       model,
-      input: prompt,
-      max_output_tokens: maxTokens,
+      instructions: 'You are a concise assistant. Follow instructions strictly.',
+      input: [
+        {
+          role: 'user',
+          content: [{ type: 'input_text', text: prompt }],
+        },
+      ],
       store: false,
+      stream: true,
     };
   } else {
     url = cleanBase.endsWith('/chat/completions')
@@ -504,6 +509,7 @@ async function callModelOnce(
 
   let text = '';
   let responseModel = json?.model || rawHeaders['openai-model'] || null;
+  let safetyBufferingActive = null;
 
   if (protocol === 'anthropic') {
     if (Array.isArray(json?.content)) {
@@ -513,6 +519,41 @@ async function callModelOnce(
         .join('\n')
         .trim();
     }
+  } else if (!json && /(?:^|\n)data:\s*\{/.test(textBody)) {
+    // Parse SSE stream returned by Codex /v1/responses endpoints
+    const deltas = [];
+    let completedText = '';
+    for (const rawLine of textBody.split(/\r?\n/)) {
+      if (!rawLine.startsWith('data:')) continue;
+      const payloadStr = rawLine.slice(5).trim();
+      if (!payloadStr || payloadStr === '[DONE]') continue;
+      try {
+        const ev = JSON.parse(payloadStr);
+        if (typeof ev?.safety_buffering === 'boolean') {
+          safetyBufferingActive = safetyBufferingActive === true || ev.safety_buffering;
+        }
+        if (ev?.response?.model && !responseModel) {
+          responseModel = ev.response.model;
+        }
+        if (ev?.type === 'response.output_text.delta' && typeof ev.delta === 'string') {
+          deltas.push(ev.delta);
+        } else if (ev?.type === 'response.output_text.done' && typeof ev.text === 'string' && ev.text) {
+          completedText = ev.text;
+        } else if (ev?.type === 'response.completed' && Array.isArray(ev?.response?.output)) {
+          if (ev.response.model) responseModel = ev.response.model;
+          const pieces = [];
+          for (const item of ev.response.output) {
+            if (Array.isArray(item?.content)) {
+              for (const c of item.content) {
+                if (typeof c?.text === 'string') pieces.push(c.text);
+              }
+            }
+          }
+          if (pieces.length > 0) completedText = pieces.join('\n');
+        }
+      } catch {}
+    }
+    text = (completedText || deltas.join('')).trim();
   } else if (wireApi === 'responses' || Array.isArray(json?.output)) {
     if (typeof json?.output_text === 'string') {
       text = json.output_text.trim();
@@ -536,6 +577,7 @@ async function callModelOnce(
     status: res.status,
     latencyMs,
     responseModel,
+    safetyBufferingActive,
     text,
     headers: rawHeaders,
     usage: json?.usage || null,
@@ -546,7 +588,14 @@ async function callModelOnce(
  * Evaluate raw Codex response headers + model slug for silent downgrade / routing anomalies.
  * Pure helper exported for direct unit testing.
  */
-export function evaluateCodexProtocolSignals({ requestedModel, responseModel, headers = {}, status = 200, latencyMs = 0 }) {
+export function evaluateCodexProtocolSignals({
+  requestedModel,
+  responseModel,
+  headers = {},
+  safetyBufferingActive = null,
+  status = 200,
+  latencyMs = 0,
+}) {
   const lower = {};
   for (const [k, v] of Object.entries(headers || {})) {
     lower[k.toLowerCase()] = String(v);
@@ -554,8 +603,10 @@ export function evaluateCodexProtocolSignals({ requestedModel, responseModel, he
 
   const findings = [];
   const turnState = lower['x-codex-turn-state'] || null;
-  const safetyBuffering =
+  const safetyBufferingHeader =
     lower['x-codex-safety-buffering-enabled'] || lower['x-safety-buffering'] || lower['safety-buffering'] || null;
+  const activeLimit = lower['x-codex-active-limit'] || null;
+  const planType = lower['x-codex-plan-type'] || null;
   const actualModel = responseModel || lower['openai-model'] || lower['x-model'] || null;
 
   const normalizeSlug = (s) => String(s || '').trim().toLowerCase();
@@ -572,11 +623,19 @@ export function evaluateCodexProtocolSignals({ requestedModel, responseModel, he
     });
   }
 
-  if (safetyBuffering && /^(true|1|enabled|yes)$/i.test(safetyBuffering.trim())) {
+  // Note: x-codex-safety-buffering-enabled=true is standard on official ChatGPT Plus/Pro endpoints;
+  // only flag as warning if safetyBufferingActive=true was triggered in the stream OR legacy non-enabled header was set.
+  const legacyTriggered =
+    safetyBufferingActive === true ||
+    (safetyBufferingActive === null &&
+      Boolean(lower['x-safety-buffering'] || lower['safety-buffering']) &&
+      /^(true|1|enabled|yes)$/i.test((lower['x-safety-buffering'] || lower['safety-buffering'] || '').trim()));
+
+  if (legacyTriggered) {
     findings.push({
       severity: 'medium',
       code: 'safety_buffering',
-      message: `命中 safety-buffering 路由头 (${safetyBuffering})，存在风控审查或降级缓冲可能`,
+      message: '本次响应触发了安全审查缓冲（safety_buffering=true），可能存在临时降级或限速',
     });
   }
 
@@ -584,7 +643,7 @@ export function evaluateCodexProtocolSignals({ requestedModel, responseModel, he
     findings.push({
       severity: 'info',
       code: 'turn_state_present',
-      message: `检测到 x-codex-turn-state（长度 ${turnState.length} 字节）`,
+      message: `官方路由令牌正常（x-codex-turn-state: ${turnState.length} 字节）`,
     });
   }
 
@@ -593,7 +652,7 @@ export function evaluateCodexProtocolSignals({ requestedModel, responseModel, he
     findings.push({
       severity: 'medium',
       code: 'third_party_relay',
-      message: '检测到第三方中转代理响应头特征，建议继续运行 L1/L2 行为指纹验证',
+      message: '检测到第三方中转代理响应头特征，建议运行智商探针或真伪指纹进一步核验',
     });
   }
 
@@ -606,15 +665,13 @@ export function evaluateCodexProtocolSignals({ requestedModel, responseModel, he
   const interestingHeaders = {};
   const keepKeys = [
     'openai-model',
-    'openai-organization',
-    'openai-processing-ms',
-    'x-request-id',
+    'x-codex-plan-type',
+    'x-codex-active-limit',
     'x-codex-turn-state',
     'x-codex-safety-buffering-enabled',
-    'x-safety-buffering',
-    'safety-buffering',
-    'x-ratelimit-limit-requests',
-    'x-ratelimit-remaining-requests',
+    'x-codex-safety-buffering-faster-model',
+    'x-oai-request-id',
+    'x-request-id',
     'x-oneapi-request-id',
     'x-newapi-request-id',
     'cf-ray',
@@ -632,7 +689,9 @@ export function evaluateCodexProtocolSignals({ requestedModel, responseModel, he
     responseModel: actualModel,
     modelMismatch,
     turnStateLength: turnState ? turnState.length : null,
-    safetyBuffering,
+    safetyBuffering: safetyBufferingActive !== null ? String(safetyBufferingActive) : safetyBufferingHeader,
+    activeLimit,
+    planType,
     verdict,
     findings,
     headers: interestingHeaders,
@@ -681,15 +740,17 @@ export async function probeCodexProtocol({ codexHome, modelOverride = null, fetc
       requestedModel,
       responseModel: res.responseModel,
       headers: res.headers,
+      safetyBufferingActive: res.safetyBufferingActive,
       status: res.status,
       latencyMs: res.latencyMs,
     });
+    const tierBadge = [evalRes.planType, evalRes.activeLimit].filter(Boolean).join('/');
     const summary =
       evalRes.verdict === 'suspected_swap'
         ? `发现模型不一致：请求 ${requestedModel}，实际返回 ${evalRes.responseModel}`
         : evalRes.verdict === 'warning'
           ? evalRes.findings.find((f) => f.severity === 'medium')?.message || '检测到异常路由头'
-          : `协议探查正常（${evalRes.responseModel || requestedModel} · ${res.latencyMs}ms）`;
+          : `Codex 路由正常：实际返回 ${evalRes.responseModel || requestedModel}${tierBadge ? ` (${tierBadge})` : ''} · ${res.latencyMs}ms`;
 
     return {
       ok: true,

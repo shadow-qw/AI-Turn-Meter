@@ -472,6 +472,72 @@ export function createMeterServer({
           if (url.pathname === '/v1/fingerprint/run') {
             const mode = String(payload?.mode || 'passive').trim();
             const handleRun = async () => {
+              if (mode === 'one_click') {
+                const days = Math.max(1, Math.min(90, Number(payload?.days) || 7));
+                const passive = analyzePassiveTelemetry(store, { days });
+                const codexCfg = inspectLocalCodexConfig();
+                let codexProto = null;
+                if (codexCfg.configured) {
+                  codexProto = await probeCodexProtocol();
+                }
+
+                const issues = [];
+                if (codexProto && codexProto.ok) {
+                  if (codexProto.verdict === 'suspected_swap') {
+                    issues.push(`Codex 疑似换模（返回 ${codexProto.responseModel}）`);
+                  } else if (codexProto.verdict === 'warning') {
+                    issues.push(codexProto.summary);
+                  }
+                }
+                if (passive.anomalies.length > 0) {
+                  issues.push(`近 ${days} 天日志发现 ${passive.anomalies.length} 条波动信号`);
+                }
+
+                const verdict =
+                  codexProto?.verdict === 'suspected_swap'
+                    ? 'suspected_swap'
+                    : passive.overallStatus === 'degraded'
+                      ? 'degraded'
+                      : codexProto?.verdict === 'warning' || passive.overallStatus === 'warning'
+                        ? 'warning'
+                        : 'healthy';
+
+                const codexNote = codexProto?.ok
+                  ? `Codex 路由正常（${codexProto.responseModel || codexCfg.model}）`
+                  : codexCfg.configured
+                    ? 'Codex 路由暂不可达'
+                    : null;
+
+                const summary =
+                  issues.length > 0
+                    ? `${issues.join('；')}${codexNote && verdict !== 'suspected_swap' ? `；${codexNote}` : ''}`
+                    : `全部正常（扫描 ${passive.totalTurnsScanned} 轮${codexNote ? ` · ${codexNote}` : ''}）`;
+
+                const saved = store.saveFingerprintRun({
+                  targetType: 'one_click',
+                  targetName: '一键全面体检',
+                  requestedModel: codexCfg.configured ? codexCfg.model : null,
+                  responseModel: codexProto?.responseModel || null,
+                  mode: 'one_click',
+                  verdict,
+                  score:
+                    verdict === 'healthy'
+                      ? 100
+                      : verdict === 'warning'
+                        ? 75
+                        : verdict === 'degraded'
+                          ? 50
+                          : 20,
+                  summary,
+                  details: {
+                    days,
+                    anomalyCount: passive.anomalies.length,
+                    headers: codexProto?.details?.headers || undefined,
+                  },
+                });
+                return { ok: true, mode, passive, codexProto, run: saved };
+              }
+
               if (mode === 'passive') {
                 const days = Math.max(1, Math.min(90, Number(payload?.days) || 7));
                 const passive = analyzePassiveTelemetry(store, { days, tool: payload?.tool || null });

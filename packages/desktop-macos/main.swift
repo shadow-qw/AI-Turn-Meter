@@ -323,6 +323,29 @@ struct ReceiptAvailableDate: Decodable, Identifiable {
   let cacheSavingsUsd: Double?
 }
 
+struct ReceiptAgentModelRow: Decodable, Identifiable {
+  var id: String { model }
+  let model: String
+  let label: String
+  let priced: Bool
+  let turnCount: Int
+  let callCount: Int
+  let totalTokens: Int
+  let estimatedCostUsd: Double?
+}
+
+struct ReceiptAgentGroup: Decodable, Identifiable {
+  var id: String { tool }
+  let tool: String
+  let label: String
+  let priced: Bool
+  let turnCount: Int
+  let callCount: Int
+  let totalTokens: Int
+  let estimatedCostUsd: Double?
+  let models: [ReceiptAgentModelRow]
+}
+
 struct ReceiptDataResponse: Decodable {
   let receiptNo: String
   let scope: String
@@ -334,8 +357,11 @@ struct ReceiptDataResponse: Decodable {
   let toolFilter: String
   let generatedAtMs: Double
   let activeTools: [String]
+  let streakDays: Int?
+  let vsDailyAvgRatio: Double?
   let totals: ReceiptTotals
   let items: [ReceiptItemRow]
+  let agentBreakdown: [ReceiptAgentGroup]?
   let highlights: ReceiptHighlights?
   let availableDates: [ReceiptAvailableDate]
   let barcodeSeed: String
@@ -796,7 +822,7 @@ final class MeterViewModel: ObservableObject {
     static let receiptHideProjects = "atm.receiptHideProjects.v1"
   }
 
-  @Published var version: String = "0.2.23"
+  @Published var version: String = "0.2.24"
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
@@ -3684,21 +3710,18 @@ struct UsageSummaryTabView: View {
 
 // MARK: - Daily Thermal Receipt (Day Card) Views
 
-private struct ReceiptZigzagShape: Shape {
-  var toothWidth: CGFloat = 10
-  var toothHeight: CGFloat = 6
+private struct ReceiptBottomZigzagShape: Shape {
+  var toothWidth: CGFloat = 8
+  var toothHeight: CGFloat = 5
 
   func path(in rect: CGRect) -> Path {
     var path = Path()
-    let count = max(2, Int(floor(rect.width / toothWidth)))
+    let count = max(4, Int(floor(rect.width / toothWidth)))
     let step = rect.width / CGFloat(count)
+    // Flat crisp top edge, finely serrated bottom edge
     path.move(to: CGPoint(x: 0, y: 0))
-    for i in 0...count {
-      let x = CGFloat(i) * step
-      let y: CGFloat = (i % 2 == 0) ? 0 : toothHeight
-      path.addLine(to: CGPoint(x: x, y: y))
-    }
-    path.addLine(to: CGPoint(x: rect.width, y: rect.height))
+    path.addLine(to: CGPoint(x: rect.width, y: 0))
+    path.addLine(to: CGPoint(x: rect.width, y: rect.height - toothHeight))
     for i in stride(from: count, through: 0, by: -1) {
       let x = CGFloat(i) * step
       let y: CGFloat = (i % 2 == 0) ? rect.height : rect.height - toothHeight
@@ -3717,41 +3740,67 @@ private struct ReceiptDashedDivider: View {
         p.move(to: CGPoint(x: 0, y: 0.5))
         p.addLine(to: CGPoint(x: geo.size.width, y: 0.5))
       }
-      .stroke(color, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+      .stroke(color, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
     }
     .frame(height: 1)
   }
 }
 
-private struct ReceiptBarcodeView: View {
-  let seed: String
-  let inkColor: Color
-
-  private var bars: [(CGFloat, CGFloat)] {
-    var h: UInt32 = 2166136261
-    for b in seed.utf8 {
-      h ^= UInt32(b)
-      h = h &* 16777619
-    }
-    var out: [(CGFloat, CGFloat)] = []
-    for _ in 0..<46 {
-      h ^= h << 13
-      h ^= h >> 17
-      h ^= h << 5
-      let w: CGFloat = (h & 3) == 0 ? 3 : ((h & 1) == 0 ? 2 : 1)
-      let g: CGFloat = ((h >> 2) & 3) == 0 ? 2 : 1
-      out.append((w, g))
-    }
-    return out
-  }
+private struct ReceiptMistyBackdropView: View {
+  let isDark: Bool
 
   var body: some View {
-    HStack(alignment: .center, spacing: 0) {
-      ForEach(Array(bars.enumerated()), id: \.offset) { _, bar in
-        Rectangle()
-          .fill(inkColor.opacity(0.86))
-          .frame(width: bar.0, height: 28)
-          .padding(.trailing, bar.1)
+    GeometryReader { geo in
+      let w = geo.size.width
+      let h = geo.size.height
+      ZStack {
+        LinearGradient(
+          colors: isDark
+            ? [
+                Color(red: 0.14, green: 0.17, blue: 0.19),
+                Color(red: 0.09, green: 0.12, blue: 0.14),
+                Color(red: 0.06, green: 0.09, blue: 0.10),
+              ]
+            : [
+                Color(red: 0.80, green: 0.83, blue: 0.81),
+                Color(red: 0.56, green: 0.63, blue: 0.60),
+                Color(red: 0.28, green: 0.36, blue: 0.33),
+                Color(red: 0.20, green: 0.28, blue: 0.26),
+              ],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+
+        // Distant misty mountain ridge
+        Path { p in
+          p.move(to: CGPoint(x: 0, y: h * 0.36))
+          p.addLine(to: CGPoint(x: w * 0.18, y: h * 0.22))
+          p.addLine(to: CGPoint(x: w * 0.42, y: h * 0.33))
+          p.addLine(to: CGPoint(x: w * 0.72, y: h * 0.18))
+          p.addLine(to: CGPoint(x: w, y: h * 0.30))
+          p.addLine(to: CGPoint(x: w, y: h))
+          p.addLine(to: CGPoint(x: 0, y: h))
+          p.closeSubpath()
+        }
+        .fill(isDark ? Color(red: 0.07, green: 0.10, blue: 0.11).opacity(0.65) : Color(red: 0.19, green: 0.27, blue: 0.24).opacity(0.42))
+
+        // Foreground pine bank & lake reflection
+        Path { p in
+          p.move(to: CGPoint(x: 0, y: h * 0.54))
+          p.addQuadCurve(to: CGPoint(x: w, y: h * 0.56), control: CGPoint(x: w * 0.48, y: h * 0.48))
+          p.addLine(to: CGPoint(x: w, y: h))
+          p.addLine(to: CGPoint(x: 0, y: h))
+          p.closeSubpath()
+        }
+        .fill(isDark ? Color(red: 0.05, green: 0.08, blue: 0.09).opacity(0.70) : Color(red: 0.14, green: 0.22, blue: 0.19).opacity(0.50))
+
+        // Soft top mist haze
+        RadialGradient(
+          colors: [Color.white.opacity(isDark ? 0.06 : 0.26), Color.clear],
+          center: .top,
+          startRadius: 10,
+          endRadius: max(w, h) * 0.65
+        )
       }
     }
   }
@@ -3763,319 +3812,302 @@ private struct ThermalReceiptCardView: View {
   let currencyMode: String
   let usdToCny: Double
   let hideProjects: Bool
-  let punchlineIndex: Int
-  var showInteractiveControls: Bool = true
-  var onNextPunchline: (() -> Void)? = nil
 
   private var isDark: Bool { theme == "dark" }
   private var paperColor: Color {
-    isDark ? Color(red: 0.10, green: 0.11, blue: 0.14) : Color(red: 0.99, green: 0.985, blue: 0.965)
+    isDark ? Color(red: 0.10, green: 0.11, blue: 0.13) : Color(red: 0.965, green: 0.957, blue: 0.933)
   }
   private var inkColor: Color {
-    isDark ? Color(red: 0.95, green: 0.96, blue: 0.97) : Color(red: 0.12, green: 0.11, blue: 0.10)
+    isDark ? Color(red: 0.95, green: 0.96, blue: 0.97) : Color(red: 0.09, green: 0.09, blue: 0.09)
   }
   private var mutedColor: Color {
-    isDark ? Color(red: 0.62, green: 0.65, blue: 0.70) : Color(red: 0.43, green: 0.41, blue: 0.37)
+    isDark ? Color(red: 0.58, green: 0.61, blue: 0.66) : Color(red: 0.43, green: 0.42, blue: 0.40)
   }
-  private var accentColor: Color {
-    isDark ? Color(red: 0.22, green: 0.83, blue: 0.60) : Color(red: 0.06, green: 0.47, blue: 0.43)
+  private var subtleColor: Color {
+    isDark ? Color(red: 0.43, green: 0.46, blue: 0.51) : Color(red: 0.60, green: 0.58, blue: 0.55)
   }
   private var dashColor: Color {
-    isDark ? Color.white.opacity(0.16) : Color.black.opacity(0.16)
-  }
-  private var chipBg: Color {
-    isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.045)
+    isDark ? Color.white.opacity(0.14) : Color.black.opacity(0.14)
   }
 
-  private func fmtMoney(_ usd: Double?) -> String {
+  private func fmtNumber(_ value: Double, digits: Int = 2) -> String {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    f.minimumFractionDigits = digits
+    f.maximumFractionDigits = digits
+    return f.string(from: NSNumber(value: abs(value))) ?? String(format: "%.(digits)f", abs(value))
+  }
+
+  private func fmtInt(_ value: Int) -> String {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    return f.string(from: NSNumber(value: value)) ?? "\(value)"
+  }
+
+  private func fmtSingleMoney(_ usd: Double?) -> String {
     guard let usd = usd, usd.isFinite else { return "N/A" }
     let rate = usdToCny > 0 ? usdToCny : 7.0
-    func num(_ n: Double) -> String {
-      let a = abs(n)
-      if a == 0 { return "0.00" }
-      if a < 0.01 { return String(format: "%.4f", a) }
-      return String(format: "%.2f", a)
-    }
-    let sign = usd < 0 ? "-" : ""
-    let u = "\(sign)$\(num(usd))"
-    let c = "\(sign)¥\(num(usd * rate))"
-    switch currencyMode {
-    case "usd": return u
-    case "cny": return c
-    default: return "\(u) (\(c))"
+    let targetVal = currencyMode == "cny" ? usd * rate : usd
+    let prefix = currencyMode == "cny" ? "¥" : "$"
+    let sign = targetVal < 0 ? "-" : ""
+    let digits = (abs(targetVal) > 0 && abs(targetVal) < 0.01) ? 4 : 2
+    return "\(sign)\(prefix)\(fmtNumber(targetVal, digits: digits))"
+  }
+
+  private var heroPrimaryMoney: String {
+    fmtSingleMoney(receipt.totals.estimatedCostUsd)
+  }
+
+  private var heroSecondaryCny: String? {
+    guard currencyMode == "both", let usd = receipt.totals.estimatedCostUsd, usd.isFinite else { return nil }
+    let rate = usdToCny > 0 ? usdToCny : 7.0
+    let cny = usd * rate
+    let digits = (abs(cny) > 0 && abs(cny) < 0.01) ? 4 : 2
+    return "≈ ¥\(fmtNumber(cny, digits: digits)) · 汇率 1:\(String(format: "%.4g", rate))"
+  }
+
+  private var titleText: String {
+    switch receipt.scope {
+    case "week": return "7 日 AI 账单"
+    case "month": return "30 日 AI 账单"
+    default: return "每日 AI 账单"
     }
   }
 
-  private func clockStr(_ ms: Double?) -> String {
-    guard let ms = ms else { return "--:--" }
-    let d = Date(timeIntervalSince1970: ms / 1000.0)
+  private func formatZhDate(_ dateStr: String) -> String {
+    let parts = dateStr.split(separator: "-")
+    if parts.count == 3, let y = Int(parts[0]), let m = Int(parts[1]), let d = Int(parts[2]) {
+      return "\(y)年\(m)月\(d)日"
+    }
+    return dateStr
+  }
+
+  private var dateDisplayText: String {
+    if receipt.scope == "day" {
+      return formatZhDate(receipt.date)
+    }
+    return "\(formatZhDate(receipt.startDate)) - \(formatZhDate(receipt.date))"
+  }
+
+  private var issuedDisplayText: String {
+    let d = Date(timeIntervalSince1970: receipt.generatedAtMs / 1000.0)
     let f = DateFormatter()
-    f.dateFormat = "HH:mm"
+    f.dateFormat = "yyyy年M月d日 HH:mm"
     return f.string(from: d)
   }
 
-  private func toolDisplayName(_ key: String) -> String {
-    switch key {
-    case "antigravity": return "Antigravity"
-    case "codex": return "Codex"
-    case "cursor": return "Cursor"
-    case "codebuddy": return "CodeBuddy"
-    default: return key
+  private func modelGlyphSymbol(_ model: String) -> String {
+    let lower = model.lowercased()
+    if lower.contains("claude") { return "sparkle" }
+    if lower.contains("gemini") { return "diamond.fill" }
+    if lower.contains("gpt") || lower.contains("codex") || lower.hasPrefix("o3") || lower.hasPrefix("o4") {
+      return "hexagon.fill"
     }
+    if lower.contains("grok") { return "bolt.fill" }
+    if lower.contains("deepseek") { return "waveform" }
+    return "circle.fill"
   }
 
-  private var currentPunchline: String {
-    guard !receipt.punchlines.isEmpty else {
-      return "THANK YOU FOR CODING WITH TOKENS"
-    }
-    return receipt.punchlines[abs(punchlineIndex) % receipt.punchlines.count]
+  private var useAgentHierarchy: Bool {
+    receipt.groupBy != "project" && !(receipt.agentBreakdown ?? []).isEmpty
   }
 
   var body: some View {
-    VStack(spacing: 10) {
-      // Header
-      VStack(spacing: 3) {
-        Text("AI TURN METER")
-          .font(.system(size: 16, weight: .bold, design: .monospaced))
+    VStack(spacing: 0) {
+      // Section 1: Title & Dates
+      VStack(spacing: 5) {
+        Text(titleText)
+          .font(.system(size: 20, weight: .bold))
           .tracking(2.0)
           .foregroundColor(inkColor)
-        Text("DAILY TOKEN RECEIPT · 算力消费小票")
-          .font(.system(size: 10, weight: .medium, design: .monospaced))
+        Text("由 AI Turn Meter 统计")
+          .font(.system(size: 10.5))
           .foregroundColor(mutedColor)
       }
-      .padding(.top, 10)
+      .padding(.top, 26)
+      .padding(.bottom, 16)
+
+      VStack(spacing: 5) {
+        kvRow("日期", dateDisplayText)
+        kvRow("开具", issuedDisplayText)
+      }
+      .padding(.bottom, 14)
 
       ReceiptDashedDivider(color: dashColor)
 
-      // Metadata block
-      VStack(alignment: .leading, spacing: 4) {
-        HStack {
-          Text("RECEIPT # \(receipt.receiptNo)")
-          Spacer()
-          Text(receipt.weekdayLabel)
+      // Section 2: Hero API Total Cost
+      VStack(spacing: 5) {
+        Text("API 总费用")
+          .font(.system(size: 11))
+          .foregroundColor(mutedColor)
+        Text(heroPrimaryMoney)
+          .font(.system(size: 35, weight: .heavy, design: .monospaced))
+          .tracking(-0.8)
+          .foregroundColor(inkColor)
+          .monospacedDigit()
+          .minimumScaleFactor(0.75)
+          .lineLimit(1)
+        if let cnyLine = heroSecondaryCny {
+          Text(cnyLine)
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundColor(mutedColor)
         }
-        .font(.system(size: 10.5, design: .monospaced))
-        .foregroundColor(mutedColor)
+        Text("按 API 价格折算 · 非发票")
+          .font(.system(size: 10))
+          .foregroundColor(subtleColor)
+          .padding(.top, 1)
+      }
+      .padding(.vertical, 16)
 
+      ReceiptDashedDivider(color: dashColor)
+
+      // Section 3: 4 Key Summary Stats
+      VStack(spacing: 6) {
+        kvRow("连续使用", "\(receipt.streakDays ?? 0) 天")
+        kvRow("请求数", fmtInt(receipt.totals.callCount))
+        kvRow("对话轮次", fmtInt(receipt.totals.turnCount))
+        kvRow("对比日均", receipt.vsDailyAvgRatio.map { String(format: "%.1f×", $0) } ?? "--")
+      }
+      .padding(.vertical, 13)
+
+      ReceiptDashedDivider(color: dashColor)
+
+      // Section 4: 2-Level AGENT / MODEL Breakdown (or Project breakdown)
+      VStack(alignment: .leading, spacing: 10) {
         HStack {
-          Text(receipt.rangeLabel)
-            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-            .foregroundColor(inkColor)
+          Text(receipt.groupBy == "project" ? "项目" : "AGENT / 模型")
           Spacer()
-          if currencyMode != "usd" {
-            Text("1:\(String(format: "%.2g", usdToCny))")
-              .font(.system(size: 10, design: .monospaced))
-              .foregroundColor(mutedColor)
-          }
+          Text("费用")
         }
+        .font(.system(size: 10.5))
+        .foregroundColor(subtleColor)
 
-        if !receipt.activeTools.isEmpty {
-          HStack(spacing: 4) {
-            ForEach(receipt.activeTools, id: \.self) { t in
-              Text(toolDisplayName(t))
-                .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                .foregroundColor(inkColor.opacity(0.85))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(chipBg)
-                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        if useAgentHierarchy, let groups = receipt.agentBreakdown {
+          VStack(alignment: .leading, spacing: 12) {
+            ForEach(groups) { ag in
+              VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                  ToolGlyph.iconView(for: ag.tool, size: 13)
+                    .foregroundColor(inkColor)
+                    .frame(width: 15, alignment: .center)
+                  Text(ag.label)
+                    .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                    .foregroundColor(inkColor)
+                    .lineLimit(1)
+                  Spacer(minLength: 6)
+                  Text(ag.priced ? fmtSingleMoney(ag.estimatedCostUsd) : "未定价")
+                    .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                    .foregroundColor(inkColor)
+                    .monospacedDigit()
+                }
+
+                ForEach(ag.models.prefix(8)) { m in
+                  HStack(spacing: 6) {
+                    Image(systemName: modelGlyphSymbol(m.model))
+                      .font(.system(size: 6.5))
+                      .foregroundColor(inkColor.opacity(0.72))
+                      .frame(width: 12, alignment: .center)
+                    Text(m.label)
+                      .font(.system(size: 11, design: .monospaced))
+                      .foregroundColor(inkColor.opacity(0.88))
+                      .lineLimit(1)
+                      .truncationMode(.middle)
+                    Spacer(minLength: 6)
+                    Text(m.priced ? fmtSingleMoney(m.estimatedCostUsd) : "未定价")
+                      .font(.system(size: 11, design: .monospaced))
+                      .foregroundColor(inkColor.opacity(0.88))
+                      .monospacedDigit()
+                  }
+                  .padding(.leading, 15)
+                }
+              }
             }
-            Spacer()
           }
-          .padding(.top, 2)
-        }
-      }
-
-      ReceiptDashedDivider(color: dashColor)
-
-      // Ledger header
-      HStack {
-        Text("ITEM / BREAKDOWN")
-        Spacer()
-        Text("AMOUNT")
-      }
-      .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-      .foregroundColor(mutedColor)
-
-      ReceiptDashedDivider(color: dashColor)
-
-      // Itemized lines
-      if receipt.items.isEmpty {
-        Text("当日暂无消费记录")
-          .font(.system(size: 11.5, design: .monospaced))
-          .foregroundColor(mutedColor)
-          .padding(.vertical, 14)
-      } else {
-        VStack(spacing: 8) {
-          ForEach(Array(receipt.items.prefix(12).enumerated()), id: \.element.id) { idx, item in
-            VStack(alignment: .leading, spacing: 2) {
-              HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(hideProjects && receipt.groupBy == "project" ? "Project #\(idx + 1)" : item.label)
+        } else if receipt.items.isEmpty {
+          Text("当日暂无消费记录")
+            .font(.system(size: 11.5))
+            .foregroundColor(mutedColor)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical, 12)
+        } else {
+          VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(receipt.items.prefix(12).enumerated()), id: \.element.id) { idx, item in
+              HStack(spacing: 6) {
+                Image(systemName: "folder.fill")
+                  .font(.system(size: 9))
+                  .foregroundColor(inkColor.opacity(0.75))
+                Text(hideProjects && receipt.groupBy == "project" ? "PROJECT #\(idx + 1)" : item.label.uppercased())
                   .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                   .foregroundColor(inkColor)
                   .lineLimit(1)
                   .truncationMode(.middle)
-                Spacer(minLength: 4)
-                Text(item.priced ? fmtMoney(item.estimatedCostUsd) : "未定价")
+                Spacer(minLength: 6)
+                Text(item.priced ? fmtSingleMoney(item.estimatedCostUsd) : "未定价")
                   .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                   .foregroundColor(inkColor)
                   .monospacedDigit()
               }
-              HStack(spacing: 4) {
-                if receipt.groupBy == "model", let sub = item.sublabel, !sub.isEmpty {
-                  Text("\(sub) ·")
-                }
-                Text("\(item.turnCount)轮 · 入\(MeterFormat.tokens(item.totalInputTokens))")
-                if let cr = item.cacheRatePct {
-                  Text("(缓存\(String(format: "%.0f%%", cr)))")
-                }
-                Text("· 出\(MeterFormat.tokens(item.outputTokens))")
-                Spacer(minLength: 0)
-              }
-              .font(.system(size: 9.8, design: .monospaced))
-              .foregroundColor(mutedColor)
-              .lineLimit(1)
             }
-          }
-          if receipt.items.count > 12 {
-            Text("... 其余 \(receipt.items.count - 12) 项已合并计入总计")
-              .font(.system(size: 10, design: .monospaced))
-              .foregroundColor(mutedColor)
           }
         }
       }
+      .padding(.vertical, 13)
 
       ReceiptDashedDivider(color: dashColor)
 
-      // Discount & Totals
-      VStack(spacing: 5) {
+      // Section 5: Bottom Token Summary
+      VStack(alignment: .leading, spacing: 6) {
+        kvRow("TOKEN 总量", MeterFormat.tokens(receipt.totals.totalTokens))
+        kvRow("输入", MeterFormat.tokens(receipt.totals.totalInputTokens))
+        kvRow("输出", MeterFormat.tokens(receipt.totals.outputTokens))
+        kvRow(
+          "缓存命中率",
+          receipt.totals.cacheRatePct.map { "\(Int($0.rounded()))%" } ?? "--"
+        )
         if let saved = receipt.totals.cacheSavingsUsd, saved > 0 {
-          HStack {
-            Text("原价 SUBTOTAL")
-              .font(.system(size: 10.5, design: .monospaced))
-              .foregroundColor(mutedColor)
-            Spacer()
-            Text(fmtMoney(receipt.totals.grossCostUsd))
-              .font(.system(size: 10.5, design: .monospaced))
-              .foregroundColor(mutedColor)
-          }
-          HStack {
-            Text("缓存立减 CACHE SAVED (\(MeterFormat.pct(receipt.totals.cacheRatePct)))")
-              .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-              .foregroundColor(accentColor)
-            Spacer()
-            Text("-\(fmtMoney(saved))")
-              .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-              .foregroundColor(accentColor)
-          }
-          ReceiptDashedDivider(color: dashColor)
-            .padding(.vertical, 2)
+          kvRow("缓存节省", fmtSingleMoney(saved))
         }
-
-        HStack(alignment: .firstTextBaseline) {
-          Text("TOTAL 实付等效")
-            .font(.system(size: 13, weight: .bold, design: .monospaced))
-            .foregroundColor(inkColor)
-          Spacer()
-          Text(fmtMoney(receipt.totals.estimatedCostUsd))
-            .font(.system(size: 15, weight: .bold, design: .monospaced))
-            .foregroundColor(inkColor)
-            .monospacedDigit()
+        if receipt.totals.unpricedTurnCount > 0 {
+          Text("\(receipt.totals.unpricedTurnCount) 次请求没有价格")
+            .font(.system(size: 10))
+            .foregroundColor(subtleColor)
+            .padding(.top, 2)
         }
       }
-
-      // 3-Column stats strip
-      HStack(spacing: 0) {
-        receiptStatCol(title: "TOKENS", value: MeterFormat.tokens(receipt.totals.totalTokens))
-        receiptStatCol(title: "TURNS", value: "\(receipt.totals.turnCount) 轮")
-        receiptStatCol(title: "AVG TPS", value: receipt.totals.avgTps.map { String(format: "%.0f t/s", $0) } ?? "--")
-      }
-      .padding(.vertical, 8)
-      .background(chipBg)
-      .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-
-      // 24h mini activity sparkline + hours / top project
-      if let counts = receipt.highlights?.hourlyCounts, counts.count == 24, (counts.max() ?? 0) > 0 {
-        let peak = max(1, counts.max() ?? 1)
-        VStack(alignment: .leading, spacing: 4) {
-          HStack(alignment: .bottom, spacing: 2) {
-            ForEach(0..<24, id: \.self) { h in
-              let c = counts[h]
-              RoundedRectangle(cornerRadius: 1)
-                .fill(c > 0 ? accentColor.opacity(0.85) : dashColor.opacity(0.6))
-                .frame(maxWidth: .infinity)
-                .frame(height: c > 0 ? max(3, CGFloat(c) / CGFloat(peak) * 18) : 2)
-            }
-          }
-          .frame(height: 18, alignment: .bottom)
-
-          HStack {
-            Text("活跃 \(clockStr(receipt.highlights?.firstTurnAtMs))-\(clockStr(receipt.highlights?.lastTurnAtMs))")
-            Spacer()
-            if !hideProjects, let tp = receipt.highlights?.topProject {
-              Text("TOP: \(tp.name)")
-                .lineLimit(1)
-                .truncationMode(.middle)
-            } else if let peakH = receipt.highlights?.peakHour {
-              Text("峰值 \(peakH)")
-            }
-          }
-          .font(.system(size: 9.5, design: .monospaced))
-          .foregroundColor(mutedColor)
-        }
-      }
+      .padding(.vertical, 13)
 
       ReceiptDashedDivider(color: dashColor)
 
-      // Punchline
-      HStack(spacing: 6) {
-        Text("“\(currentPunchline)”")
-          .font(.system(size: 10.5, design: .monospaced))
-          .foregroundColor(mutedColor)
-          .multilineTextAlignment(.center)
-          .frame(maxWidth: .infinity)
-        if showInteractiveControls && receipt.punchlines.count > 1, let onNext = onNextPunchline {
-          Button {
-            onNext()
-          } label: {
-            Image(systemName: "dice")
-              .font(.system(size: 11))
-              .foregroundColor(mutedColor)
-          }
-          .buttonStyle(.plain)
-          .help("换一句小票寄语")
-        }
+      // Section 6: Clean Centered Footer
+      VStack(spacing: 3) {
+        Text("AI Turn Meter · \(receipt.receiptNo)")
+          .font(.system(size: 10, design: .monospaced))
+          .foregroundColor(subtleColor)
+        Text("在 macOS 上统计每个 Agent 的 AI 用量")
+          .font(.system(size: 10))
+          .foregroundColor(subtleColor)
       }
-
-      // Barcode
-      VStack(spacing: 4) {
-        ReceiptBarcodeView(seed: receipt.barcodeSeed, inkColor: inkColor)
-        Text("\(receipt.receiptNo) · LOCAL PRIVACY RECEIPT")
-          .font(.system(size: 8.5, design: .monospaced))
-          .foregroundColor(mutedColor)
-      }
-      .padding(.top, 2)
-      .padding(.bottom, 10)
+      .padding(.top, 14)
+      .padding(.bottom, 22)
     }
-    .padding(.horizontal, 20)
-    .padding(.vertical, 12)
-    .frame(width: 390)
+    .padding(.horizontal, 26)
+    .frame(width: 358)
     .background(paperColor)
-    .clipShape(ReceiptZigzagShape(toothWidth: 10, toothHeight: 6))
-    .shadow(color: Color.black.opacity(isDark ? 0.35 : 0.12), radius: 10, x: 0, y: 4)
+    .clipShape(ReceiptBottomZigzagShape(toothWidth: 8, toothHeight: 5))
+    .shadow(color: Color.black.opacity(isDark ? 0.50 : 0.28), radius: 14, x: 0, y: 8)
   }
 
-  private func receiptStatCol(title: String, value: String) -> some View {
-    VStack(spacing: 2) {
-      Text(title)
-        .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+  private func kvRow(_ label: String, _ value: String) -> some View {
+    HStack {
+      Text(label)
+        .font(.system(size: 11.5))
         .foregroundColor(mutedColor)
+      Spacer(minLength: 8)
       Text(value)
-        .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+        .font(.system(size: 11.5, design: .monospaced))
         .foregroundColor(inkColor)
         .monospacedDigit()
     }
-    .frame(maxWidth: .infinity)
   }
 }
 
@@ -4084,20 +4116,19 @@ private struct DailyReceiptSectionView: View {
   @State private var rateText: String = ""
 
   private func renderReceiptImage(_ receipt: ReceiptDataResponse) -> NSImage? {
-    let bgColor: Color = vm.receiptTheme == "dark"
-      ? Color(red: 0.06, green: 0.07, blue: 0.09)
-      : Color(red: 0.92, green: 0.90, blue: 0.87)
-    let exportView = ThermalReceiptCardView(
-      receipt: receipt,
-      theme: vm.receiptTheme,
-      currencyMode: vm.receiptCurrencyMode,
-      usdToCny: vm.receiptUsdToCny,
-      hideProjects: vm.receiptHideProjects,
-      punchlineIndex: vm.receiptPunchlineIndex,
-      showInteractiveControls: false
-    )
-    .padding(24)
-    .background(bgColor)
+    let exportView = ZStack {
+      ReceiptMistyBackdropView(isDark: vm.receiptTheme == "dark")
+      ThermalReceiptCardView(
+        receipt: receipt,
+        theme: vm.receiptTheme,
+        currencyMode: vm.receiptCurrencyMode,
+        usdToCny: vm.receiptUsdToCny,
+        hideProjects: vm.receiptHideProjects
+      )
+      .padding(.horizontal, 52)
+      .padding(.vertical, 42)
+    }
+    .fixedSize()
 
     let renderer = ImageRenderer(content: exportView)
     renderer.scale = 2.0
@@ -4141,7 +4172,7 @@ private struct DailyReceiptSectionView: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      // Row 1: Date switcher + Scope + GroupBy
+      // Compact Controls Row 1: Date + Scope + View Mode
       HStack(spacing: 8) {
         HStack(spacing: 4) {
           Button {
@@ -4157,7 +4188,7 @@ private struct DailyReceiptSectionView: View {
           Text(vm.receiptDate)
             .font(.system(size: 12, weight: .semibold, design: .monospaced))
             .monospacedDigit()
-            .padding(.horizontal, 6)
+            .padding(.horizontal, 5)
 
           Button {
             vm.shiftReceiptDate(byDays: 1)
@@ -4192,20 +4223,19 @@ private struct DailyReceiptSectionView: View {
         Spacer()
 
         Picker("", selection: Binding(
-          get: { vm.receiptGroupBy },
+          get: { vm.receiptGroupBy == "project" ? "project" : "model" },
           set: { vm.receiptGroupBy = $0; vm.fetchReceipt() }
         )) {
-          Text("按模型").tag("model")
-          Text("按工具").tag("tool")
+          Text("Agent/模型").tag("model")
           Text("按项目").tag("project")
         }
         .pickerStyle(.segmented)
         .labelsHidden()
         .controlSize(.mini)
-        .frame(width: 170)
+        .frame(width: 148)
       }
 
-      // Row 2: Currency + Custom FX Rate + Theme + Privacy toggle
+      // Compact Controls Row 2: Currency + FX Rate + Theme + Privacy
       HStack(spacing: 10) {
         Picker("", selection: Binding(
           get: { vm.receiptCurrencyMode },
@@ -4228,7 +4258,7 @@ private struct DailyReceiptSectionView: View {
             TextField("7", text: $rateText)
               .textFieldStyle(.roundedBorder)
               .font(.system(size: 11, design: .monospaced))
-              .frame(width: 48)
+              .frame(width: 46)
               .onSubmit {
                 if let v = Double(rateText.trimmingCharacters(in: .whitespaces)), v > 0 {
                   vm.setReceiptUsdToCny(v)
@@ -4254,22 +4284,24 @@ private struct DailyReceiptSectionView: View {
         .controlSize(.mini)
         .frame(width: 106)
 
-        Toggle("隐藏项目名", isOn: Binding(
-          get: { vm.receiptHideProjects },
-          set: { vm.setReceiptHideProjects($0) }
-        ))
-        .toggleStyle(.checkbox)
-        .font(.system(size: 11))
+        if vm.receiptGroupBy == "project" {
+          Toggle("隐藏项目名", isOn: Binding(
+            get: { vm.receiptHideProjects },
+            set: { vm.setReceiptHideProjects($0) }
+          ))
+          .toggleStyle(.checkbox)
+          .font(.system(size: 11))
+        }
 
         Spacer()
       }
 
-      // Main Receipt Preview + Export Bar
+      // Main Receipt Preview with Misty Forest Frame
       if vm.receiptLoading && vm.receiptData == nil {
         HStack {
           Spacer()
           ProgressView().controlSize(.small)
-          Text("正在打印今日小票…")
+          Text("正在生成今日账单…")
             .font(.system(size: 12))
             .foregroundColor(.secondary)
           Spacer()
@@ -4277,25 +4309,19 @@ private struct DailyReceiptSectionView: View {
         .padding(.vertical, 28)
       } else if let receipt = vm.receiptData {
         VStack(spacing: 12) {
-          HStack {
-            Spacer()
+          ZStack {
+            ReceiptMistyBackdropView(isDark: vm.receiptTheme == "dark")
             ThermalReceiptCardView(
               receipt: receipt,
               theme: vm.receiptTheme,
               currencyMode: vm.receiptCurrencyMode,
               usdToCny: vm.receiptUsdToCny,
-              hideProjects: vm.receiptHideProjects,
-              punchlineIndex: vm.receiptPunchlineIndex,
-              showInteractiveControls: true,
-              onNextPunchline: { vm.receiptPunchlineIndex += 1 }
+              hideProjects: vm.receiptHideProjects
             )
-            Spacer()
+            .padding(.horizontal, 28)
+            .padding(.vertical, 26)
           }
-          .padding(.vertical, 14)
-          .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-              .fill(vm.receiptTheme == "dark" ? Color.black.opacity(0.28) : Color.primary.opacity(0.035))
-          )
+          .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
           HStack(spacing: 8) {
             Button {
@@ -4325,7 +4351,7 @@ private struct DailyReceiptSectionView: View {
             Button {
               vm.copyReceiptAsciiToClipboard()
             } label: {
-              Label("复制文本小票", systemImage: "text.alignleft")
+              Label("复制文本", systemImage: "text.alignleft")
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
@@ -4333,16 +4359,15 @@ private struct DailyReceiptSectionView: View {
             Spacer()
           }
 
-          // Quick jump historical daily ledger list
           if !receipt.availableDates.isEmpty {
             Divider()
-              .padding(.top, 4)
+              .padding(.top, 2)
             HStack {
-              Text("历史每日小票（点击切换日期）")
+              Text("历史每日账单（点击切换）")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.secondary)
               Spacer()
-              Text("近 \(receipt.availableDates.count) 个活跃日")
+              Text("近 \(receipt.availableDates.count) 天")
                 .font(.system(size: 10.5))
                 .foregroundColor(.secondary)
             }
@@ -4353,7 +4378,6 @@ private struct DailyReceiptSectionView: View {
                 Button {
                   vm.receiptDate = day.date
                   vm.receiptScope = "day"
-                  vm.receiptPunchlineIndex = 0
                   vm.fetchReceipt()
                 } label: {
                   HStack {
@@ -4386,7 +4410,7 @@ private struct DailyReceiptSectionView: View {
           }
         }
       } else {
-        Text("暂无小票数据，请点击刷新重试")
+        Text("暂无账单数据，请点击刷新重试")
           .font(.system(size: 12))
           .foregroundColor(.secondary)
           .frame(maxWidth: .infinity, alignment: .center)
@@ -4399,7 +4423,6 @@ private struct DailyReceiptSectionView: View {
     }
   }
 }
-
 // MARK: - Model Fingerprint & Degradation Detection Tab
 
 struct FingerprintTabView: View {
@@ -4412,9 +4435,11 @@ struct FingerprintTabView: View {
   @State private var epModel: String = ""
   @State private var epApiKey: String = ""
 
-  @State private var deepSampleCount: Int = 50
+  @State private var showManualProbeSheet: Bool = false
   @State private var manualClient: String = "antigravity"
   @State private var manualReplyDraft: String = ""
+  @State private var showAnomaliesExpanded: Bool = false
+  @State private var showAllRuns: Bool = false
   @State private var expandedRunId: String? = nil
 
   private func verdictColor(_ verdict: String) -> Color {
@@ -4433,25 +4458,26 @@ struct FingerprintTabView: View {
   private func verdictLabel(_ verdict: String) -> String {
     switch verdict {
     case "healthy", "pass": return "正常"
-    case "warning": return "疑似波动"
+    case "warning": return "有波动"
     case "degraded": return "疑似降智"
     case "suspected_swap": return "疑似换模"
-    case "baseline_recorded": return "已录基线"
+    case "baseline_recorded": return "已存基线"
     case "no_baseline": return "待建基线"
     case "insufficient_data": return "样本不足"
-    case "unavailable": return "未配置"
-    case "error": return "执行失败"
+    case "unavailable": return "未登录"
+    case "error": return "检测失败"
     default: return verdict
     }
   }
 
   private func modeLabel(_ mode: String) -> String {
     switch mode {
-    case "passive": return "L0 被动基线"
-    case "codex_protocol": return "L0.5 Codex 协议"
-    case "quick": return "L1 快速探针"
-    case "deep": return "L2 单 Token 指纹"
-    case "manual": return "半自动探针"
+    case "one_click": return "一键体检"
+    case "passive": return "日志诊断"
+    case "codex_protocol": return "路由核验"
+    case "quick": return "智商测试"
+    case "deep": return "深度指纹"
+    case "manual": return "出题验证"
     default: return mode
     }
   }
@@ -4463,106 +4489,188 @@ struct FingerprintTabView: View {
     return f.string(from: d)
   }
 
-  var body: some View {
-    VStack(spacing: 12) {
-      // Top header bar
-      HStack(spacing: 10) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("模型指纹与降智检测")
-            .font(.system(size: 16, weight: .semibold))
-          Text("支持全四家被动基线监测、Codex 协议头探查、快速能力探针与单 Token 分布指纹（全部手动触发）")
-            .font(.system(size: 11.5))
-            .foregroundColor(.secondary)
-        }
-        Spacer()
-        if let running = vm.fingerprintRunningAction {
-          HStack(spacing: 6) {
-            ProgressView().controlSize(.small)
-            Text("正在执行：\(running)")
-              .font(.system(size: 11.5))
-              .foregroundColor(.secondary)
-          }
-        }
-        Button {
-          vm.fetchFingerprintOverview()
-        } label: {
-          Image(systemName: "arrow.clockwise")
-            .font(.system(size: 12))
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .disabled(vm.fingerprintRunningAction != nil)
-        .help("刷新体检总览")
-      }
+  private var heroStatus: (icon: String, color: Color, title: String, subtitle: String) {
+    guard let ov = vm.fingerprintOverview else {
+      return ("checkmark.shield", .secondary, "准备就绪", "点击右侧「一键体检」，自动检查各客户端是否存在降智或换模")
+    }
+    let anomCount = ov.passive.anomalies.count
+    let codexTip = ov.codex.configured ? "Codex 当前 \(ov.codex.model)" : "Codex 未登录"
+    let baseSub = "近 \(ov.passive.days) 天共分析 \(ov.passive.totalTurnsScanned) 轮对话 · \(codexTip)"
 
-      ScrollView {
-        VStack(alignment: .leading, spacing: 14) {
-          // 1. L0 Passive Telemetry Card
-          SettingsGroupCard {
-            VStack(alignment: .leading, spacing: 10) {
-              HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                  Text("L0 · 全四家被动降智诊断（零 Token 消耗）")
-                    .font(.system(size: 13, weight: .semibold))
-                  Text("对比近 7 天同模型中位数，识别速度突增（切轻量模型）、思考深度归零与同会话回退")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                }
-                Spacer()
-                Button("重新扫描") {
-                  vm.runFingerprintCheck(actionId: "L0 被动基线扫描", payload: ["mode": "passive", "days": 7])
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(vm.fingerprintRunningAction != nil)
+    if let latestRun = ov.runs.first, latestRun.verdict == "suspected_swap" {
+      return ("xmark.shield.fill", .red, "检测到疑似换模", latestRun.summary)
+    }
+    if anomCount == 0 {
+      return ("checkmark.shield.fill", CodexBarPalette.paceGreen, "状态正常 · 未发现降智", baseSub)
+    }
+    let hasHigh = ov.passive.anomalies.contains { $0.severity == "high" }
+    return (
+      hasHigh ? "exclamationmark.shield.fill" : "exclamationmark.triangle.fill",
+      hasHigh ? .red : .orange,
+      "发现 \(anomCount) 条疑似波动",
+      baseSub
+    )
+  }
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 14) {
+        // 1. One-Click Hero Card + 4 Clients List
+        SettingsGroupCard {
+          VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+              Image(systemName: heroStatus.icon)
+                .font(.system(size: 26, weight: .medium))
+                .foregroundColor(heroStatus.color)
+                .frame(width: 34)
+
+              VStack(alignment: .leading, spacing: 3) {
+                Text(heroStatus.title)
+                  .font(.system(size: 15, weight: .semibold))
+                Text(heroStatus.subtitle)
+                  .font(.system(size: 11.5))
+                  .foregroundColor(.secondary)
+                  .lineLimit(2)
               }
 
-              if let passive = vm.fingerprintOverview?.passive {
-                Divider()
-                HStack(spacing: 8) {
-                  ForEach(["codex", "antigravity", "cursor", "codebuddy"], id: \.self) { k in
-                    if let t = passive.byTool[k] {
-                      VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 5) {
-                          ToolGlyph.iconView(for: k, size: 12)
-                          Text(t.toolLabel)
-                            .font(.system(size: 11.5, weight: .medium))
-                          Spacer()
-                          Text(verdictLabel(t.status))
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(verdictColor(t.status))
-                        }
-                        Text("\(t.turnCount) 轮 · 异常 \(t.anomalyCount)")
-                          .font(.system(size: 10.5))
-                          .foregroundColor(.secondary)
-                          .monospacedDigit()
-                        if let m = t.latestModel, !m.isEmpty {
-                          Text(m)
-                            .font(.system(size: 9.5, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        }
-                      }
-                      .padding(8)
-                      .frame(maxWidth: .infinity, alignment: .leading)
-                      .background(Color.primary.opacity(0.035))
-                      .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                    }
-                  }
-                }
+              Spacer(minLength: 8)
 
-                if passive.anomalies.isEmpty {
-                  Text("近 \(passive.days) 天共扫描 \(passive.totalTurnsScanned) 轮对话，暂未发现明显被动降级信号。")
+              if let running = vm.fingerprintRunningAction {
+                HStack(spacing: 6) {
+                  ProgressView().controlSize(.small)
+                  Text(running)
                     .font(.system(size: 11.5))
                     .foregroundColor(.secondary)
-                    .padding(.top, 2)
-                } else {
-                  VStack(alignment: .leading, spacing: 6) {
-                    Text("最近可疑异常信号（\(passive.anomalies.count) 条）")
-                      .font(.system(size: 11.5, weight: .medium))
-                      .foregroundColor(.secondary)
-                    ForEach(passive.anomalies.prefix(6)) { item in
+                }
+              } else {
+                Button {
+                  vm.runFingerprintCheck(actionId: "一键体检中…", payload: ["mode": "one_click", "days": 7])
+                } label: {
+                  Label("一键体检", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+              }
+            }
+            .padding(14)
+
+            if let ov = vm.fingerprintOverview {
+              Divider()
+
+              ForEach(Array(["codex", "antigravity", "cursor", "codebuddy"].enumerated()), id: \.element) { idx, key in
+                if idx > 0 { Divider().padding(.leading, 40) }
+                let info = ov.passive.byTool[key]
+                let modelText: String = {
+                  if key == "codex" && ov.codex.configured { return ov.codex.model }
+                  return info?.latestModel ?? "暂无对话"
+                }()
+                let status = info?.status ?? "insufficient_data"
+                let anomCount = info?.anomalyCount ?? 0
+
+                HStack(spacing: 10) {
+                  ToolGlyph.iconView(for: key, size: 15)
+                    .frame(width: 20)
+
+                  VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                      Text(vm.toolShortTitle(for: key))
+                        .font(.system(size: 12.5, weight: .medium))
+                      Text(modelText)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    }
+                    HStack(spacing: 6) {
+                      Circle()
+                        .fill(verdictColor(status))
+                        .frame(width: 6, height: 6)
+                      Text(anomCount > 0 ? "近 7 天发现 \(anomCount) 条波动" : verdictLabel(status))
+                        .font(.system(size: 10.5))
+                        .foregroundColor(anomCount > 0 ? verdictColor(status) : .secondary)
+                      if let tc = info?.turnCount, tc > 0 {
+                        Text("· \(tc) 轮")
+                          .font(.system(size: 10.5))
+                          .foregroundColor(.secondary)
+                      }
+                    }
+                  }
+
+                  Spacer()
+
+                  if key == "codex" {
+                    Button("测智商") {
+                      vm.runFingerprintCheck(actionId: "Codex 智商测试…", payload: ["mode": "quick", "target": "codex"])
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(vm.fingerprintRunningAction != nil || !ov.codex.configured)
+
+                    Menu {
+                      Button("核验官方路由（极快）") {
+                        vm.runFingerprintCheck(actionId: "Codex 路由核验…", payload: ["mode": "codex_protocol"])
+                      }
+                      Button("深度指纹比对（防量化）") {
+                        vm.runFingerprintCheck(
+                          actionId: "Codex 深度指纹…",
+                          payload: ["mode": "deep", "target": "codex", "sampleCount": 50]
+                        )
+                      }
+                      Divider()
+                      Button("将当前 Codex 录为参考基线") {
+                        vm.runFingerprintCheck(
+                          actionId: "录制 Codex 基线…",
+                          payload: ["mode": "deep", "target": "codex", "sampleCount": 50, "recordBaseline": true]
+                        )
+                      }
+                    } label: {
+                      Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 14))
+                        .foregroundColor(.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .disabled(vm.fingerprintRunningAction != nil || !ov.codex.configured)
+                  } else {
+                    Button("出题验证") {
+                      manualClient = key
+                      manualReplyDraft = ""
+                      showManualProbeSheet = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(vm.fingerprintRunningAction != nil)
+                  }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+              }
+
+              // Collapsible passive anomalies drawer
+              if !ov.passive.anomalies.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                  Button {
+                    showAnomaliesExpanded.toggle()
+                  } label: {
+                    HStack(spacing: 6) {
+                      Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.orange)
+                      Text("查看 \(ov.passive.anomalies.count) 条异常波动详情")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundColor(.primary)
+                      Spacer()
+                      Image(systemName: showAnomaliesExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                  }
+                  .buttonStyle(.plain)
+
+                  if showAnomaliesExpanded {
+                    ForEach(ov.passive.anomalies.prefix(8)) { item in
                       HStack(alignment: .top, spacing: 8) {
                         Circle()
                           .fill(item.severity == "high" ? Color.red : Color.orange)
@@ -4570,7 +4678,7 @@ struct FingerprintTabView: View {
                           .padding(.top, 5)
                         VStack(alignment: .leading, spacing: 2) {
                           HStack {
-                            Text("[\(item.toolLabel) · \(item.model)] \(item.title)")
+                            Text("\(item.toolLabel) · \(item.model)：\(item.title)")
                               .font(.system(size: 11.5, weight: .medium))
                             Spacer()
                             Text(formatTimestamp(item.completedAtMs))
@@ -4588,435 +4696,334 @@ struct FingerprintTabView: View {
                     }
                   }
                 }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
               }
             }
-            .padding(14)
           }
+        }
 
-          // 2. L0.5 + L1 + L2 Codex Local Probe Card
-          SettingsGroupCard {
-            VStack(alignment: .leading, spacing: 10) {
-              HStack {
-                HStack(spacing: 6) {
-                  ToolGlyph.iconView(for: "codex", size: 15)
-                  Text("L0.5 / L1 / L2 · Codex 本地端点专项检测")
-                    .font(.system(size: 13, weight: .semibold))
-                }
-                Spacer()
-                if let c = vm.fingerprintOverview?.codex {
-                  Text(c.configured ? "\(c.modelProvider) · \(c.model)" : "未检测到 ~/.codex 凭证")
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundColor(.secondary)
-                }
-              }
-
-              Text("自动复用本地 ~/.codex/auth.json 与 config.toml，支持响应头路由探查（x-codex-turn-state / safety-buffering）、8 题能力探针与单 Token 分布指纹。")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-
-              HStack(spacing: 8) {
-                Button("协议头探查 (L0.5)") {
-                  vm.runFingerprintCheck(actionId: "Codex 协议头探查", payload: ["mode": "codex_protocol"])
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(vm.fingerprintRunningAction != nil || !(vm.fingerprintOverview?.codex.configured ?? false))
-
-                Button("快速能力探针 (8 题)") {
-                  vm.runFingerprintCheck(actionId: "Codex 快速能力探针", payload: ["mode": "quick", "target": "codex"])
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(vm.fingerprintRunningAction != nil || !(vm.fingerprintOverview?.codex.configured ?? false))
-
-                Button("深度指纹 (\(deepSampleCount) 次)") {
-                  vm.runFingerprintCheck(
-                    actionId: "Codex 深度单 Token 指纹",
-                    payload: ["mode": "deep", "target": "codex", "sampleCount": deepSampleCount]
-                  )
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(vm.fingerprintRunningAction != nil || !(vm.fingerprintOverview?.codex.configured ?? false))
-
-                Button("录为参考基线") {
-                  vm.runFingerprintCheck(
-                    actionId: "录制 Codex 官方基线",
-                    payload: [
-                      "mode": "deep",
-                      "target": "codex",
-                      "sampleCount": deepSampleCount,
-                      "recordBaseline": true,
-                    ]
-                  )
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(vm.fingerprintRunningAction != nil || !(vm.fingerprintOverview?.codex.configured ?? false))
-              }
-            }
-            .padding(14)
-          }
-
-          // 3. Custom OpenAI / Anthropic Endpoints (L1 + L2) & Baselines
-          SettingsGroupCard {
-            VStack(alignment: .leading, spacing: 10) {
-              HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                  Text("L1 / L2 · 自定义 API / 中转站指纹验证")
-                    .font(.system(size: 13, weight: .semibold))
-                  Text("针对 OpenAI / Anthropic 兼容中转站，结合 8 题能力探针与 One-Token JS 散度识别偷换模型与静默量化")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                }
-                Spacer()
-                Picker("", selection: $deepSampleCount) {
-                  Text("25 次").tag(25)
-                  Text("50 次").tag(50)
-                  Text("100 次").tag(100)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.mini)
-                .frame(width: 145)
-                .help("深度单 Token 分布采样次数")
-
-                Button {
-                  epName = ""
-                  epProtocol = "openai"
-                  epBaseUrl = ""
-                  epModel = ""
-                  epApiKey = ""
-                  showAddEndpointSheet = true
-                } label: {
-                  Label("添加端点", systemImage: "plus")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-              }
-
-              let endpoints = vm.fingerprintOverview?.endpoints ?? []
-              if endpoints.isEmpty {
-                Text("尚未添加自定义端点。点击右上角「添加端点」配置中转站或官方 API（Key 仅存于本机 config.json）。")
-                  .font(.system(size: 11.5))
+        // 2. Third-party Relay / Custom API Verification (Compact Card)
+        SettingsGroupCard {
+          VStack(alignment: .leading, spacing: 10) {
+            HStack {
+              VStack(alignment: .leading, spacing: 2) {
+                Text("中转站 / 自定义 API 真伪验证")
+                  .font(.system(size: 13, weight: .semibold))
+                Text("怀疑第三方 API 掺水、偷换模型或静默量化？添加后一键检测")
+                  .font(.system(size: 11))
                   .foregroundColor(.secondary)
-                  .padding(.vertical, 6)
-              } else {
-                Divider()
-                ForEach(Array(endpoints.enumerated()), id: \.element.id) { idx, ep in
-                  if idx > 0 { Divider() }
-                  VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                      Text(ep.name)
-                        .font(.system(size: 12.5, weight: .semibold))
-                      Text(ep.protocolType.uppercased())
-                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1.5)
-                        .background(Color.primary.opacity(0.07))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                      Text(ep.model)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.secondary)
-                      Spacer()
-                      Button(role: .destructive) {
-                        vm.deleteFingerprintEndpoint(id: ep.id)
-                      } label: {
-                        Image(systemName: "trash")
-                          .font(.system(size: 11))
-                      }
-                      .buttonStyle(.borderless)
-                      .help("删除端点")
-                    }
+              }
+              Spacer()
+              Button {
+                epName = ""
+                epProtocol = "openai"
+                epBaseUrl = ""
+                epModel = ""
+                epApiKey = ""
+                showAddEndpointSheet = true
+              } label: {
+                Label("添加 API", systemImage: "plus")
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.small)
+            }
 
-                    Text("\(ep.baseUrl) · Key: \(ep.hasApiKey ? ep.apiKeyPreview : "未填写")")
-                      .font(.system(size: 10.5, design: .monospaced))
+            let endpoints = vm.fingerprintOverview?.endpoints ?? []
+            if !endpoints.isEmpty {
+              Divider()
+              ForEach(Array(endpoints.enumerated()), id: \.element.id) { idx, ep in
+                if idx > 0 { Divider() }
+                HStack(spacing: 10) {
+                  VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                      Text(ep.name)
+                        .font(.system(size: 12.5, weight: .medium))
+                      Text(ep.model)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    }
+                    Text("\(ep.protocolType.uppercased()) · \(ep.baseUrl)")
+                      .font(.system(size: 10, design: .monospaced))
                       .foregroundColor(.secondary)
                       .lineLimit(1)
                       .truncationMode(.middle)
-
-                    HStack(spacing: 8) {
-                      Button("快速探针 (8 题)") {
-                        vm.runFingerprintCheck(
-                          actionId: "\(ep.name) 快速探针",
-                          payload: ["mode": "quick", "target": ep.id]
-                        )
-                      }
-                      .buttonStyle(.bordered)
-                      .controlSize(.mini)
-                      .disabled(vm.fingerprintRunningAction != nil)
-
-                      Button("深度指纹 (\(deepSampleCount) 次)") {
-                        vm.runFingerprintCheck(
-                          actionId: "\(ep.name) 深度指纹",
-                          payload: ["mode": "deep", "target": ep.id, "sampleCount": deepSampleCount]
-                        )
-                      }
-                      .buttonStyle(.bordered)
-                      .controlSize(.mini)
-                      .disabled(vm.fingerprintRunningAction != nil)
-
-                      Button("录制为基线") {
-                        vm.runFingerprintCheck(
-                          actionId: "录制 \(ep.name) 基线",
-                          payload: [
-                            "mode": "deep",
-                            "target": ep.id,
-                            "sampleCount": deepSampleCount,
-                            "recordBaseline": true,
-                            "baselineName": "\(ep.name) (\(ep.model))",
-                          ]
-                        )
-                      }
-                      .buttonStyle(.bordered)
-                      .controlSize(.mini)
-                      .disabled(vm.fingerprintRunningAction != nil)
-                    }
                   }
-                  .padding(.vertical, 4)
-                }
-              }
-
-              // Saved baselines
-              let baselines = vm.fingerprintOverview?.baselines ?? []
-              if !baselines.isEmpty {
-                Divider()
-                Text("已录制单 Token 参考基线（\(baselines.count)）")
-                  .font(.system(size: 11.5, weight: .medium))
-                  .foregroundColor(.secondary)
-                ForEach(baselines) { bl in
-                  HStack {
-                    Image(systemName: "waveform.path.ecg")
-                      .font(.system(size: 11))
-                      .foregroundColor(CodexBarPalette.tealBar)
-                    Text(bl.name)
-                      .font(.system(size: 11.5, weight: .medium))
-                    Text(bl.model)
-                      .font(.system(size: 10.5, design: .monospaced))
-                      .foregroundColor(.secondary)
-                    Spacer()
-                    Text("\(bl.sampleCount) 样本 · \(formatTimestamp(bl.createdAtMs))")
-                      .font(.system(size: 10, design: .monospaced))
-                      .foregroundColor(.secondary)
-                    Button(role: .destructive) {
-                      vm.deleteFingerprintBaseline(id: bl.id)
-                    } label: {
-                      Image(systemName: "xmark.circle")
-                        .font(.system(size: 11))
-                    }
-                    .buttonStyle(.borderless)
-                    .help("删除基线")
+                  Spacer()
+                  Button("一键测真伪") {
+                    vm.runFingerprintCheck(
+                      actionId: "正在检测 \(ep.name)…",
+                      payload: ["mode": "quick", "target": ep.id]
+                    )
                   }
+                  .buttonStyle(.borderedProminent)
+                  .controlSize(.small)
+                  .disabled(vm.fingerprintRunningAction != nil)
+
+                  Menu {
+                    Button("深度指纹比对（防量化）") {
+                      vm.runFingerprintCheck(
+                        actionId: "深度指纹比对中…",
+                        payload: ["mode": "deep", "target": ep.id, "sampleCount": 50]
+                      )
+                    }
+                    Button("录制为官方标准基线") {
+                      vm.runFingerprintCheck(
+                        actionId: "正在录制基线…",
+                        payload: [
+                          "mode": "deep",
+                          "target": ep.id,
+                          "sampleCount": 50,
+                          "recordBaseline": true,
+                          "baselineName": "\(ep.name) (\(ep.model))",
+                        ]
+                      )
+                    }
+                    Divider()
+                    Button("删除此端点", role: .destructive) {
+                      vm.deleteFingerprintEndpoint(id: ep.id)
+                    }
+                  } label: {
+                    Image(systemName: "ellipsis.circle")
+                      .font(.system(size: 14))
+                      .foregroundColor(.secondary)
+                  }
+                  .menuStyle(.borderlessButton)
+                  .fixedSize()
+                  .disabled(vm.fingerprintRunningAction != nil)
                 }
+                .padding(.vertical, 2)
               }
             }
-            .padding(14)
-          }
 
-          // 4. Semi-auto Manual Probe for Private Clients (Antigravity / Cursor / CodeBuddy)
-          SettingsGroupCard {
-            VStack(alignment: .leading, spacing: 10) {
+            let baselines = vm.fingerprintOverview?.baselines ?? []
+            if !baselines.isEmpty {
+              Divider()
               HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                  Text("私有客户端半自动探针（Antigravity / Cursor / CodeBuddy）")
-                    .font(.system(size: 13, weight: .semibold))
-                  Text("1) 复制标准 5 题探针包发给对话模型 → 2) 粘贴模型回复（或留空自动读取该客户端最新回复）一键判分")
-                    .font(.system(size: 11))
+                Text("已保存标准基线")
+                  .font(.system(size: 11, weight: .medium))
+                  .foregroundColor(.secondary)
+                Spacer()
+              }
+              ForEach(baselines) { bl in
+                HStack(spacing: 6) {
+                  Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(CodexBarPalette.tealBar)
+                  Text(bl.name)
+                    .font(.system(size: 11.5))
+                  Text("\(bl.sampleCount) 样本")
+                    .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
-                }
-                Spacer()
-              }
-
-              HStack(spacing: 8) {
-                Picker("", selection: $manualClient) {
-                  Text("Antigravity").tag("antigravity")
-                  Text("Cursor").tag("cursor")
-                  Text("CodeBuddy").tag("codebuddy")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 240)
-
-                Button {
-                  if let prompt = vm.fingerprintOverview?.manualProbe.prompt {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(prompt, forType: .string)
-                    vm.bannerIsError = false
-                    vm.statusBanner = "已复制标准 5 题探针包，请粘贴到客户端发送"
+                  Spacer()
+                  Button(role: .destructive) {
+                    vm.deleteFingerprintBaseline(id: bl.id)
+                  } label: {
+                    Image(systemName: "xmark.circle")
+                      .font(.system(size: 11))
                   }
-                } label: {
-                  Label("复制探针题", systemImage: "doc.on.doc")
+                  .buttonStyle(.borderless)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Spacer()
-
-                Button("立即评分") {
-                  vm.runFingerprintCheck(
-                    actionId: "半自动探针评分",
-                    payload: [
-                      "mode": "manual_score",
-                      "tool": manualClient,
-                      "replyText": manualReplyDraft,
-                    ]
-                  )
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(vm.fingerprintRunningAction != nil)
               }
-
-              TextField("粘贴模型返回的 JSON 回复（留空则自动读取该客户端最新一轮回复）", text: $manualReplyDraft)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 11, design: .monospaced))
             }
-            .padding(14)
           }
+          .padding(14)
+        }
 
-          // 5. Recent Fingerprint Run History
+        // 3. Recent History (Compact)
+        let runs = vm.fingerprintOverview?.runs ?? []
+        if !runs.isEmpty {
           SettingsGroupCard {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 8) {
               HStack {
                 Text("最近体检记录")
                   .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Text("点击条目展开逐项明细")
-                  .font(.system(size: 10.5))
-                  .foregroundColor(.secondary)
+                if runs.count > 5 {
+                  Button(showAllRuns ? "收起" : "查看全部 (\(runs.count))") {
+                    showAllRuns.toggle()
+                  }
+                  .buttonStyle(.plain)
+                  .font(.system(size: 11))
+                  .foregroundColor(CodexBarPalette.accentBlue)
+                }
               }
 
-              let runs = vm.fingerprintOverview?.runs ?? []
-              if runs.isEmpty {
-                Text("暂无检测记录，请点击上方任意检测按钮开始首次体检。")
-                  .font(.system(size: 11.5))
-                  .foregroundColor(.secondary)
-                  .padding(.vertical, 8)
-              } else {
-                Divider()
-                ForEach(Array(runs.prefix(15).enumerated()), id: \.element.id) { idx, run in
-                  if idx > 0 { Divider() }
-                  let isExpanded = expandedRunId == run.id
-                  VStack(alignment: .leading, spacing: 6) {
-                    Button {
-                      expandedRunId = isExpanded ? nil : run.id
-                    } label: {
-                      HStack(spacing: 8) {
-                        Text(verdictLabel(run.verdict))
-                          .font(.system(size: 10, weight: .semibold))
-                          .foregroundColor(.white)
-                          .padding(.horizontal, 6)
-                          .padding(.vertical, 2)
-                          .background(verdictColor(run.verdict))
-                          .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+              Divider()
 
-                        VStack(alignment: .leading, spacing: 2) {
-                          HStack(spacing: 6) {
-                            Text(run.targetName)
-                              .font(.system(size: 12, weight: .semibold))
-                              .foregroundColor(.primary)
-                            Text(modeLabel(run.mode))
-                              .font(.system(size: 10))
-                              .foregroundColor(.secondary)
-                            if let m = run.requestedModel, !m.isEmpty {
-                              Text(m)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                            }
-                          }
-                          Text(run.summary)
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
-                            .lineLimit(isExpanded ? 4 : 1)
-                        }
-                        Spacer()
-                        if let score = run.score {
-                          Text("\(score)分")
-                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .foregroundColor(verdictColor(run.verdict))
-                        } else if let js = run.jsDistance {
-                          Text(String(format: "JS %.3f", js))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundColor(verdictColor(run.verdict))
-                        }
-                        Text(formatTimestamp(run.createdAtMs))
-                          .font(.system(size: 10, design: .monospaced))
-                          .foregroundColor(.secondary)
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                          .font(.system(size: 10))
-                          .foregroundColor(.secondary)
-                      }
-                      .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
+              let visibleRuns = showAllRuns ? Array(runs.prefix(20)) : Array(runs.prefix(5))
+              ForEach(Array(visibleRuns.enumerated()), id: \.element.id) { idx, run in
+                if idx > 0 { Divider() }
+                let isExpanded = expandedRunId == run.id
+                VStack(alignment: .leading, spacing: 6) {
+                  Button {
+                    expandedRunId = isExpanded ? nil : run.id
+                  } label: {
+                    HStack(spacing: 8) {
+                      Text(verdictLabel(run.verdict))
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(verdictColor(run.verdict))
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
 
-                    if isExpanded, let d = run.details {
-                      VStack(alignment: .leading, spacing: 4) {
-                        if let rm = run.responseModel, !rm.isEmpty {
-                          Text("实际返回模型: \(rm)\(d.avgLatencyMs.map { " · 平均耗时 \($0)ms" } ?? "")")
-                            .font(.system(size: 10.5, design: .monospaced))
+                      VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                          Text(run.targetName)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.primary)
+                          Text(modeLabel(run.mode))
+                            .font(.system(size: 10))
                             .foregroundColor(.secondary)
                         }
-                        if let js = d.meanJsDistance {
-                          Text(String(format: "平均 JS 散度: %.4f · 最大 JS 散度: %.4f · 基线: %@", js, d.maxJsDistance ?? js, d.baselineName ?? "无"))
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundColor(.secondary)
-                        }
-                        if let headers = d.headers, !headers.isEmpty {
-                          ForEach(headers.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
-                            Text("\(k): \(v)")
-                              .font(.system(size: 10, design: .monospaced))
-                              .foregroundColor(.secondary)
-                          }
-                        }
-                        if let probes = d.probes, !probes.isEmpty {
-                          ForEach(probes) { p in
-                            HStack(spacing: 6) {
-                              Image(systemName: p.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                .font(.system(size: 10.5))
-                                .foregroundColor(p.passed ? CodexBarPalette.paceGreen : .red)
-                              Text(p.name)
-                                .font(.system(size: 11, weight: .medium))
-                              Text(p.reason ?? "")
-                                .font(.system(size: 10.5))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                              Spacer()
-                              if let ms = p.latencyMs, ms > 0 {
-                                Text("\(ms)ms")
-                                  .font(.system(size: 10, design: .monospaced))
-                                  .foregroundColor(.secondary)
-                              }
-                            }
-                          }
-                        }
+                        Text(run.summary)
+                          .font(.system(size: 11))
+                          .foregroundColor(.secondary)
+                          .lineLimit(isExpanded ? 4 : 1)
                       }
-                      .padding(8)
-                      .background(Color.primary.opacity(0.03))
-                      .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                      Spacer()
+                      if let score = run.score {
+                        Text("\(score) 分")
+                          .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                          .foregroundColor(verdictColor(run.verdict))
+                      }
+                      Text(formatTimestamp(run.createdAtMs))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                      Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
                     }
+                    .contentShape(Rectangle())
                   }
-                  .padding(.vertical, 3)
+                  .buttonStyle(.plain)
+
+                  if isExpanded, let d = run.details {
+                    VStack(alignment: .leading, spacing: 4) {
+                      if let rm = run.responseModel, !rm.isEmpty {
+                        Text("服务端实际返回模型：\(rm)\(d.avgLatencyMs.map { " · 平均耗时 \($0)ms" } ?? "")")
+                          .font(.system(size: 10.5, design: .monospaced))
+                          .foregroundColor(.secondary)
+                      }
+                      if let js = d.meanJsDistance {
+                        Text(String(format: "指纹偏离度 (JS)：%.3f（<0.08 一致，>0.18 疑似换模）", js))
+                          .font(.system(size: 10.5, design: .monospaced))
+                          .foregroundColor(.secondary)
+                      }
+                      if let probes = d.probes, !probes.isEmpty {
+                        ForEach(probes) { p in
+                          HStack(spacing: 6) {
+                            Image(systemName: p.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                              .font(.system(size: 10.5))
+                              .foregroundColor(p.passed ? CodexBarPalette.paceGreen : .red)
+                            Text(p.name)
+                              .font(.system(size: 11, weight: .medium))
+                            Text(p.reason ?? "")
+                              .font(.system(size: 10.5))
+                              .foregroundColor(.secondary)
+                              .lineLimit(1)
+                            Spacer()
+                          }
+                        }
+                      }
+                    }
+                    .padding(8)
+                    .background(Color.primary.opacity(0.03))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                  }
                 }
+                .padding(.vertical, 2)
               }
             }
             .padding(14)
           }
         }
-        .padding(.bottom, 10)
       }
+      .padding(.bottom, 10)
     }
     .onAppear {
       vm.fetchFingerprintOverview(silent: vm.fingerprintOverview != nil)
     }
+    // 2-step Friendly Manual Probe Sheet for Antigravity / Cursor / CodeBuddy
+    .sheet(isPresented: $showManualProbeSheet) {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack {
+          ToolGlyph.iconView(for: manualClient, size: 18)
+          Text("给 \(vm.toolShortTitle(for: manualClient)) 出题测智商")
+            .font(.headline)
+          Spacer()
+        }
+
+        VStack(alignment: .leading, spacing: 8) {
+          HStack(spacing: 10) {
+            Text("1")
+              .font(.system(size: 11, weight: .bold))
+              .foregroundColor(.white)
+              .frame(width: 20, height: 20)
+              .background(CodexBarPalette.accentBlue)
+              .clipShape(Circle())
+            Text("复制 5 道标准智商题，粘贴发给 \(vm.toolShortTitle(for: manualClient))")
+              .font(.system(size: 12.5))
+            Spacer()
+            Button {
+              if let prompt = vm.fingerprintOverview?.manualProbe.prompt {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(prompt, forType: .string)
+                vm.bannerIsError = false
+                vm.statusBanner = "已复制测试题，请发给 \(vm.toolShortTitle(for: manualClient))"
+              }
+            } label: {
+              Label("复制测试题", systemImage: "doc.on.doc")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+          }
+
+          Divider()
+
+          HStack(spacing: 10) {
+            Text("2")
+              .font(.system(size: 11, weight: .bold))
+              .foregroundColor(.white)
+              .frame(width: 20, height: 20)
+              .background(CodexBarPalette.paceGreen)
+              .clipShape(Circle())
+            Text("等它回复完后点击「自动评分」（或手动粘贴回复）")
+              .font(.system(size: 12.5))
+            Spacer()
+          }
+
+          TextField("可选：直接粘贴模型回复的 JSON（留空则自动读取最新一轮）", text: $manualReplyDraft)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 11.5, design: .monospaced))
+        }
+
+        HStack {
+          Spacer()
+          Button("关闭") { showManualProbeSheet = false }
+          Button("自动评分") {
+            let reply = manualReplyDraft
+            let client = manualClient
+            showManualProbeSheet = false
+            vm.runFingerprintCheck(
+              actionId: "正在评分…",
+              payload: ["mode": "manual_score", "tool": client, "replyText": reply]
+            )
+          }
+          .buttonStyle(.borderedProminent)
+          .disabled(vm.fingerprintRunningAction != nil)
+        }
+      }
+      .padding(18)
+      .frame(width: 470)
+    }
+    // Add Custom API Sheet
     .sheet(isPresented: $showAddEndpointSheet) {
       VStack(alignment: .leading, spacing: 12) {
-        Text("添加自定义 API / 中转检测端点")
+        Text("添加自定义 API / 中转站")
           .font(.headline)
-        Text("仅用于手动触发模型指纹与降智体检，API Key 保存在本机 config.json 中，不会上传。")
+        Text("API Key 仅保存在本机 config.json 中，仅在你手动点击检测时调用。")
           .font(.system(size: 11.5))
           .foregroundColor(.secondary)
 
@@ -5026,7 +5033,7 @@ struct FingerprintTabView: View {
             TextField("例如：中转站 Opus / 官方直连", text: $epName).textFieldStyle(.roundedBorder)
           }
           HStack {
-            Text("协议").font(.system(size: 12)).frame(width: 68, alignment: .leading)
+            Text("接口类型").font(.system(size: 12)).frame(width: 68, alignment: .leading)
             Picker("", selection: $epProtocol) {
               Text("OpenAI 兼容").tag("openai")
               Text("Anthropic 兼容").tag("anthropic")
@@ -5057,7 +5064,7 @@ struct FingerprintTabView: View {
         HStack {
           Spacer()
           Button("取消") { showAddEndpointSheet = false }
-          Button("保存端点") {
+          Button("保存") {
             let n = epName.trimmingCharacters(in: .whitespacesAndNewlines)
             let b = epBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
             let m = epModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5071,11 +5078,10 @@ struct FingerprintTabView: View {
         }
       }
       .padding(18)
-      .frame(width: 470)
+      .frame(width: 460)
     }
   }
 }
-
 struct RecentTurnsTabView: View {
   @ObservedObject var vm: MeterViewModel
   @State private var hoveredTurnChip: String? = nil

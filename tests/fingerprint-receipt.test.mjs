@@ -90,7 +90,7 @@ test('L0 passive telemetry detects TPS spike, thinking drop, and flagship-to-lig
   }
 });
 
-test('L0.5 Codex protocol evaluator flags model mismatch, safety-buffering, and turn-state length', () => {
+test('L0.5 Codex protocol evaluator flags model mismatch, active safety-buffering, and ignores normal enabled header', () => {
   const mismatch = evaluateCodexProtocolSignals({
     requestedModel: 'gpt-6-astra',
     responseModel: 'gpt-6-luna',
@@ -99,6 +99,7 @@ test('L0.5 Codex protocol evaluator flags model mismatch, safety-buffering, and 
       'x-codex-safety-buffering-enabled': 'true',
       'x-oneapi-request-id': 'req-123',
     },
+    safetyBufferingActive: true,
     status: 200,
     latencyMs: 320,
   });
@@ -110,9 +111,15 @@ test('L0.5 Codex protocol evaluator flags model mismatch, safety-buffering, and 
   assert.ok(mismatch.findings.some((f) => f.code === 'third_party_relay'));
 
   const ok = evaluateCodexProtocolSignals({
-    requestedModel: 'gpt-6-sol',
-    responseModel: 'gpt-6-sol-2026-10',
-    headers: { 'x-request-id': 'req-ok' },
+    requestedModel: 'gpt-6.2-sol',
+    responseModel: 'gpt-6.2-sol',
+    headers: {
+      'x-codex-safety-buffering-enabled': 'true',
+      'x-codex-plan-type': 'plus',
+      'x-codex-active-limit': 'premium',
+      'x-request-id': 'req-ok',
+    },
+    safetyBufferingActive: false,
     status: 200,
     latencyMs: 180,
   });
@@ -324,6 +331,9 @@ test('Daily thermal receipt aggregates items, currency conversion (1:7 & custom)
     assert.equal(receipt.date, '2026-11-19');
     assert.equal(receipt.receiptNo, 'ATM-20261119-002');
     assert.equal(receipt.items.length, 2);
+    assert.equal(receipt.agentBreakdown.length, 2);
+    assert.equal(receipt.streakDays, 1);
+    assert.equal(receipt.vsDailyAvgRatio, 1);
     assert.ok(receipt.totals.estimatedCostUsd > 0);
     assert.ok(receipt.totals.cacheSavingsUsd > 0);
     assert.ok(receipt.totals.grossCostUsd > receipt.totals.estimatedCostUsd);
@@ -335,14 +345,15 @@ test('Daily thermal receipt aggregates items, currency conversion (1:7 & custom)
     assert.equal(buildBarcodeBars(receipt.barcodeSeed, 20).length, 20);
 
     const ascii = renderReceiptAscii(receipt, { currency: 'both', usdToCny: 7, hideProjects: true });
-    assert.ok(ascii.includes('AI TURN METER'));
+    assert.ok(ascii.includes('每日 AI 账单'));
     assert.ok(ascii.includes('ATM-20261119-002'));
     assert.ok(ascii.includes('1 USD = 7 CNY'));
     assert.ok(!ascii.includes('secret-repo'), 'hideProjects should strip project name');
 
     const svg = renderReceiptSvg(receipt, { theme: 'dark', currency: 'both', usdToCny: 7.2, hideProjects: false });
     assert.ok(svg.startsWith('<svg '));
-    assert.ok(svg.includes('AI TURN METER'));
+    assert.ok(svg.includes('每日 AI 账单'));
+    assert.ok(svg.includes('AI Turn Meter'));
     assert.ok(svg.includes('ATM-20261119-002'));
     assert.ok(svg.includes('1:7.2'));
   } finally {

@@ -1037,6 +1037,7 @@ export class TurnStore {
 
     const totalsAcc = createUsageAccumulator();
     const itemMap = new Map();
+    const agentMap = new Map();
     const projectMap = new Map();
     const modelCostMap = new Map();
     const toolSet = new Set();
@@ -1065,6 +1066,21 @@ export class TurnStore {
       const mName = row.model || 'unknown';
       if (!modelCostMap.has(mName)) modelCostMap.set(mName, createUsageAccumulator());
       addTurnToAccumulator(modelCostMap.get(mName), row, customRates);
+
+      if (!agentMap.has(row.tool)) {
+        agentMap.set(row.tool, {
+          tool: row.tool,
+          label: (TOOL_LABELS[row.tool] || row.tool).toUpperCase(),
+          acc: createUsageAccumulator(),
+          models: new Map(),
+        });
+      }
+      const ag = agentMap.get(row.tool);
+      addTurnToAccumulator(ag.acc, row, customRates);
+      if (!ag.models.has(mName)) {
+        ag.models.set(mName, { model: mName, label: mName.toUpperCase(), acc: createUsageAccumulator() });
+      }
+      addTurnToAccumulator(ag.models.get(mName).acc, row, customRates);
 
       let gKey;
       let gLabel;
@@ -1171,6 +1187,75 @@ export class TurnStore {
         };
       });
 
+    const agentBreakdown = Array.from(agentMap.values())
+      .map((ag) => {
+        const stats = finalizeAccumulator(ag.acc);
+        const models = Array.from(ag.models.values())
+          .map((m) => {
+            const ms = finalizeAccumulator(m.acc);
+            return {
+              model: m.model,
+              label: m.label,
+              priced: ms.pricedTurnCount > 0,
+              turnCount: ms.turnCount,
+              callCount: ms.callCount,
+              totalTokens: ms.totalTokens,
+              estimatedCostUsd: ms.estimatedCostUsd,
+            };
+          })
+          .sort(
+            (a, b) =>
+              (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
+          );
+        return {
+          tool: ag.tool,
+          label: ag.label,
+          priced: stats.pricedTurnCount > 0,
+          turnCount: stats.turnCount,
+          callCount: stats.callCount,
+          totalTokens: stats.totalTokens,
+          estimatedCostUsd: stats.estimatedCostUsd,
+          models,
+        };
+      })
+      .sort(
+        (a, b) =>
+          (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
+      );
+
+    // Compute consecutive active streak ending on range.date (or latest active day <= range.date)
+    const activeDateSet = new Set(availableDates.map((d) => d.date));
+    let streakDays = 0;
+    const [ay, am, ad] = range.date.split('-').map(Number);
+    for (let offset = 0; offset < 365; offset += 1) {
+      const probe = new Date(ay, am - 1, ad - offset);
+      const key = toLocalDateKey(probe.getTime());
+      if (activeDateSet.has(key)) {
+        streakDays += 1;
+      } else {
+        break;
+      }
+    }
+
+    // Compute ratio vs recent 30 active days daily average spend
+    const recent30Costs = availableDates
+      .slice(0, 30)
+      .map((d) => d.estimatedCostUsd)
+      .filter((v) => typeof v === 'number' && Number.isFinite(v) && v > 0);
+    const dailyAvgUsd =
+      recent30Costs.length > 0
+        ? recent30Costs.reduce((sum, v) => sum + v, 0) / recent30Costs.length
+        : null;
+    const spanDays = range.scope === 'week' ? 7 : range.scope === 'month' ? 30 : 1;
+    const currentPerDayUsd =
+      typeof totals.estimatedCostUsd === 'number' && Number.isFinite(totals.estimatedCostUsd)
+        ? totals.estimatedCostUsd / spanDays
+        : null;
+    const vsDailyAvgRatio =
+      dailyAvgUsd && dailyAvgUsd > 0 && currentPerDayUsd !== null && currentPerDayUsd > 0
+        ? Number((currentPerDayUsd / dailyAvgUsd).toFixed(1))
+        : null;
+
     const compactDate = range.date.replace(/-/g, '');
     const receiptNo = `ATM-${compactDate}-${String(totals.turnCount).padStart(3, '0')}`;
     const receipt = {
@@ -1184,8 +1269,11 @@ export class TurnStore {
       toolFilter: tool || 'all',
       generatedAtMs: nowMs,
       activeTools: Array.from(toolSet),
+      streakDays,
+      vsDailyAvgRatio,
       totals,
       items,
+      agentBreakdown,
       highlights: {
         firstTurnAtMs,
         lastTurnAtMs,

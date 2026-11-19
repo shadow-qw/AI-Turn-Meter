@@ -15,9 +15,25 @@ export function toLocalDateString(ms = Date.now()) {
   return `${y}-${m}-${day}`;
 }
 
+export function formatZhDate(dateStr) {
+  if (typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim())) {
+    const [y, m, d] = dateStr.trim().split('-').map(Number);
+    return `${y}年${m}月${d}日`;
+  }
+  return String(dateStr || '-');
+}
+
+export function formatZhDateTime(ms = Date.now()) {
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${hh}:${mm}`;
+}
+
 /**
  * Parse YYYY-MM-DD into local start-of-day timestamp.
  * @param {string | null | undefined} dateStr
+ * @param {string} [scope]
  * @param {number} [fallbackMs]
  */
 export function parseLocalDateRange(dateStr, scope = 'day', fallbackMs = Date.now()) {
@@ -97,46 +113,30 @@ export function buildReceiptPunchlines(receipt) {
   const saved = Number(totals.cacheSavingsUsd) || 0;
   const cacheRate = typeof totals.cacheRatePct === 'number' ? totals.cacheRatePct : 0;
   const turns = Number(totals.turnCount) || 0;
-  const totalTokens = Number(totals.totalTokens) || 0;
-  const lastAt = receipt?.highlights?.lastTurnAtMs;
-  const lastHour = typeof lastAt === 'number' ? new Date(lastAt).getHours() : null;
-
-  const list = [];
   if (turns === 0) {
-    return [
-      '今日未开张，Token 账户稳如泰山。',
-      '零消费日！模型正在后厨待命。',
-      '今天一行提示词没花钱，省到就是赚到。',
-    ];
+    return ['今日未开张，Token 账户稳如泰山。'];
   }
-  if (cost >= 30) {
-    list.push('今日算力尊享黑卡 VIP，硅谷显卡为您持续发热。');
-  } else if (cost >= 10) {
-    list.push('大额算力买单日：代码有没有写完先不说，Token 气势拉满了。');
-  } else if (cost >= 2) {
-    list.push('一杯精品咖啡换一整天 AI 副驾，这笔买卖血赚。');
-  } else {
-    list.push('精打细算模范开发者，小预算撬动大产出。');
+  const list = [];
+  if (cost >= 30) list.push('今日算力尊享 VIP，硅谷显卡为您持续发热。');
+  else if (cost >= 10) list.push('大额算力买单日，Token 气势拉满了。');
+  else list.push('精打细算模范开发者，小预算撬动大产出。');
+  if (cacheRate >= 85 && saved >= 0.5) {
+    list.push(`缓存命中 ${cacheRate.toFixed(0)}%，靠 Prompt Cache 省下 $${saved.toFixed(2)}。`);
   }
-
-  if (cacheRate >= 90 && saved >= 0.5) {
-    list.push(`缓存命中 ${cacheRate.toFixed(0)}%，靠 Prompt Cache 薅回 $${saved.toFixed(2)}，资深羊毛党认证。`);
-  } else if (cacheRate >= 75) {
-    list.push(`Prompt Cache 稳稳兜底（${cacheRate.toFixed(0)}%），少交了不少智商税。`);
-  }
-
-  if (lastHour !== null && (lastHour >= 23 || lastHour <= 4)) {
-    list.push('深夜食堂仍在出餐，建议给模型和自己都留点休息时间。');
-  }
-  if (totalTokens >= 20_000_000) {
-    list.push('千万级 Token 吞吐达成，今天读的上下文比整套百科全书还厚。');
-  } else if (turns >= 40) {
-    list.push(`单期狂聊 ${turns} 轮，AI 已经快比你更懂这个仓库了。`);
-  }
-
-  list.push('小票请妥善保管，作为今日与 AI 并肩作战的唯一凭证。');
-  list.push('THANK YOU FOR CODING WITH TOKENS · 欢迎下次光临');
+  list.push('按 API 价格折算 · 非发票');
   return list;
+}
+
+function fmtCommaNumber(n) {
+  const num = Math.round(Number(n) || 0);
+  return num.toLocaleString('en-US');
+}
+
+function fmtMoneyCore(n) {
+  const abs = Math.abs(n);
+  if (abs === 0) return '0.00';
+  if (abs < 0.01) return abs.toFixed(4);
+  return abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 /**
@@ -147,15 +147,9 @@ export function buildReceiptPunchlines(receipt) {
 export function formatReceiptMoney(usd, { currency = 'both', usdToCny = 7 } = {}) {
   if (typeof usd !== 'number' || !Number.isFinite(usd)) return 'N/A';
   const rate = Number.isFinite(Number(usdToCny)) && Number(usdToCny) > 0 ? Number(usdToCny) : 7;
-  const fmtNum = (n) => {
-    const abs = Math.abs(n);
-    if (abs === 0) return '0.00';
-    if (abs < 0.01) return abs.toFixed(4);
-    return abs.toFixed(2);
-  };
   const sign = usd < 0 ? '-' : '';
-  const usdStr = `${sign}$${fmtNum(usd)}`;
-  const cnyStr = `${sign}¥${fmtNum(usd * rate)}`;
+  const usdStr = `${sign}$${fmtMoneyCore(usd)}`;
+  const cnyStr = `${sign}¥${fmtMoneyCore(usd * rate)}`;
   if (currency === 'usd') return usdStr;
   if (currency === 'cny') return cnyStr;
   return `${usdStr} (${cnyStr})`;
@@ -181,128 +175,114 @@ function truncateText(text, maxChars = 28) {
   return `${str.slice(0, Math.max(4, maxChars - 1))}…`;
 }
 
-function formatClock(ms) {
-  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '--:--';
-  const d = new Date(ms);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+function receiptTitleForScope(scope) {
+  if (scope === 'week') return '7 日 AI 账单';
+  if (scope === 'month') return '30 日 AI 账单';
+  return '每日 AI 账单';
 }
 
 /**
- * Render thermal-paper style ASCII receipt for terminal or clipboard sharing.
+ * Render clean thermal-paper style ASCII receipt matching the Magpie editorial bill structure.
  * @param {object} receipt
  * @param {{ currency?: string, usdToCny?: number, hideProjects?: boolean, punchlineIndex?: number }} [opts]
  */
 export function renderReceiptAscii(
   receipt,
-  { currency = 'both', usdToCny = 7, hideProjects = false, punchlineIndex = 0 } = {}
+  { currency = 'both', usdToCny = 7, hideProjects = false } = {}
 ) {
   const W = 48;
   const hr = '-'.repeat(W);
-  const dhr = '='.repeat(W);
-  const zigzagTop = '/\\'.repeat(W / 2);
-  const zigzagBot = '\\/'.repeat(W / 2);
   const fmt = (val) => formatReceiptMoney(val, { currency, usdToCny });
+  const fmtLine = (val) => {
+    if (typeof val !== 'number' || !Number.isFinite(val)) return 'N/A';
+    return currency === 'cny' ? formatReceiptMoney(val, { currency: 'cny', usdToCny }) : formatReceiptMoney(val, { currency: 'usd', usdToCny });
+  };
   const totals = receipt.totals || {};
-  const toolsText =
-    Array.isArray(receipt.activeTools) && receipt.activeTools.length > 0
-      ? receipt.activeTools.map((t) => TOOL_LABELS[t] || t).join(' / ')
-      : '无活跃客户端';
-  const punchlines = Array.isArray(receipt.punchlines) && receipt.punchlines.length > 0
-    ? receipt.punchlines
-    : buildReceiptPunchlines(receipt);
-  const punchline = punchlines[Math.abs(Number(punchlineIndex) || 0) % punchlines.length];
+  const title = receiptTitleForScope(receipt.scope);
+  const dateDisplay =
+    receipt.scope === 'day'
+      ? formatZhDate(receipt.date)
+      : `${formatZhDate(receipt.startDate)} - ${formatZhDate(receipt.date)}`;
+  const issuedDisplay = formatZhDateTime(receipt.generatedAtMs || Date.now());
+  const rate = Number.isFinite(Number(usdToCny)) && Number(usdToCny) > 0 ? Number(usdToCny) : 7;
 
   const lines = [
-    zigzagTop,
+    '================================================',
+    `                  ${title}`,
+    '              AI TURN METER · DAILY RECEIPT',
+    '               由 AI Turn Meter 统计',
     '',
-    '          AI TURN METER  ·  DAILY RECEIPT',
-    '               本地算力消费热敏小票',
-    dhr,
-    padRow(`单号 RECEIPT #`, receipt.receiptNo || '-', W),
-    padRow(`日期 DATE`, receipt.rangeLabel || receipt.date || '-', W),
-    padRow(`终端 CLIENTS`, truncateText(toolsText, 30), W),
-    padRow(`汇总分组 GROUP`, receipt.groupBy === 'tool' ? '按提供商' : receipt.groupBy === 'project' ? '按项目' : '按模型', W),
+    padRow('单号', receipt.receiptNo || '-', W),
+    padRow('日期', dateDisplay, W),
+    padRow('开具', issuedDisplay, W),
     hr,
-    padRow('ITEM / TOKENS', 'AMOUNT', W),
+    '                   API 总费用',
+    `              ${fmt(totals.estimatedCostUsd)}`,
+    '             按 API 价格折算 · 非发票',
+    hr,
+    padRow('连续使用', `${receipt.streakDays || 0} 天`, W),
+    padRow('请求数', fmtCommaNumber(totals.callCount || 0), W),
+    padRow('对话轮次', `${fmtCommaNumber(totals.turnCount || 0)} 轮`, W),
+    padRow('对比日均', receipt.vsDailyAvgRatio ? `${receipt.vsDailyAvgRatio}×` : '--', W),
     hr,
   ];
 
-  const items = Array.isArray(receipt.items) ? receipt.items : [];
-  if (items.length === 0) {
-    lines.push('  (当日暂无对话消费记录)');
+  const useHierarchy =
+    receipt.groupBy !== 'project' &&
+    Array.isArray(receipt.agentBreakdown) &&
+    receipt.agentBreakdown.length > 0;
+
+  if (useHierarchy) {
+    lines.push(padRow('AGENT / 模型', '费用', W));
+    lines.push('');
+    for (const ag of receipt.agentBreakdown) {
+      lines.push(padRow(`■ ${ag.label}`, ag.priced ? fmtLine(ag.estimatedCostUsd) : '未定价', W));
+      for (const m of ag.models.slice(0, 8)) {
+        lines.push(padRow(`  • ${truncateText(m.label, 28)}`, m.priced ? fmtLine(m.estimatedCostUsd) : '未定价', W));
+      }
+      lines.push('');
+    }
   } else {
-    for (const item of items.slice(0, 14)) {
-      const displayName =
-        hideProjects && receipt.groupBy === 'project'
-          ? `Project #${items.indexOf(item) + 1}`
-          : truncateText(item.label, 28);
-      const money = item.priced ? fmt(item.estimatedCostUsd) : '未定价';
-      lines.push(padRow(displayName, money, W));
-      const cacheTag = item.cacheRatePct !== null && item.cacheRatePct !== undefined ? `缓存${item.cacheRatePct}%` : '无缓存';
-      const prefixTag = receipt.groupBy === 'model' && item.sublabel ? `${item.sublabel} · ` : '';
-      const detail = `  ${prefixTag}${item.turnCount}轮 · 入${formatTokens(item.totalInputTokens)}(${cacheTag}) · 出${formatTokens(item.outputTokens)}`;
-      lines.push(detail);
+    lines.push(padRow(receipt.groupBy === 'project' ? '项目' : 'AGENT / 模型', '费用', W));
+    lines.push('');
+    const items = Array.isArray(receipt.items) ? receipt.items : [];
+    if (items.length === 0) {
+      lines.push('  (当日暂无消费记录)');
+    } else {
+      items.slice(0, 14).forEach((item, idx) => {
+        const name =
+          hideProjects && receipt.groupBy === 'project'
+            ? `PROJECT #${idx + 1}`
+            : truncateText(String(item.label || '').toUpperCase(), 28);
+        lines.push(padRow(`• ${name}`, item.priced ? fmtLine(item.estimatedCostUsd) : '未定价', W));
+      });
     }
-    if (items.length > 14) {
-      lines.push(`  ... 其余 ${items.length - 14} 项已合并计入总计`);
-    }
+    lines.push('');
   }
 
   lines.push(hr);
-  if (typeof totals.grossCostUsd === 'number' && totals.cacheSavingsUsd > 0) {
-    lines.push(padRow('原价 SUBTOTAL (无缓存)', fmt(totals.grossCostUsd), W));
-    lines.push(
-      padRow(
-        `会员立减 CACHE SAVED (${totals.cacheRatePct ?? 0}%)`,
-        `-${formatReceiptMoney(totals.cacheSavingsUsd, { currency, usdToCny })}`,
-        W
-      )
-    );
-  }
-  lines.push(dhr);
-  lines.push(padRow('实付 TOTAL (API 等效)', fmt(totals.estimatedCostUsd), W));
-  lines.push(dhr);
-  lines.push(padRow('总计 TOKENS', `${formatTokens(totals.totalTokens)} (${totals.turnCount || 0} 轮 / ${totals.callCount || 0} 次)`, W));
+  lines.push(padRow('TOKEN 总量', formatTokens(totals.totalTokens), W));
+  lines.push(padRow('输入', formatTokens(totals.totalInputTokens), W));
+  lines.push(padRow('输出', formatTokens(totals.outputTokens), W));
   lines.push(
     padRow(
-      '输入 / 输出',
-      `${formatTokens(totals.totalInputTokens)} / ${formatTokens(totals.outputTokens)}`,
+      '缓存命中率',
+      totals.cacheRatePct !== null && totals.cacheRatePct !== undefined ? `${Math.round(totals.cacheRatePct)}%` : '--',
       W
     )
   );
-  if (totals.avgTps) {
-    lines.push(padRow('平均生成速度 AVG TPS', formatTps(totals.avgTps), W));
-  }
-  if (receipt.highlights?.firstTurnAtMs && receipt.highlights?.lastTurnAtMs) {
-    lines.push(
-      padRow(
-        '活跃时段 HOURS',
-        `${formatClock(receipt.highlights.firstTurnAtMs)} - ${formatClock(receipt.highlights.lastTurnAtMs)}`,
-        W
-      )
-    );
-  }
-  if (!hideProjects && receipt.highlights?.topProject?.name) {
-    lines.push(
-      padRow(
-        '最耗项目 TOP PROJECT',
-        truncateText(receipt.highlights.topProject.name, 22),
-        W
-      )
-    );
+  if (totals.cacheSavingsUsd > 0) {
+    lines.push(padRow('缓存节省', fmt(totals.cacheSavingsUsd), W));
   }
   if (currency !== 'usd') {
-    const rate = Number.isFinite(Number(usdToCny)) && Number(usdToCny) > 0 ? Number(usdToCny) : 7;
-    lines.push(padRow('折算汇率 FX RATE', `1 USD = ${rate} CNY`, W));
+    lines.push(padRow('折算汇率', `1 USD = ${rate} CNY`, W));
   }
-
+  if (totals.unpricedTurnCount > 0) {
+    lines.push(`${totals.unpricedTurnCount} 次请求没有价格`);
+  }
   lines.push(hr);
-  lines.push(`  “${punchline}”`);
-  lines.push('');
-  lines.push('  |||| ||| || |||| | ||| |||| || ||| |||| ||| ||');
-  lines.push(`             ${receipt.receiptNo || 'ATM-RECEIPT'}`);
-  lines.push('');
-  lines.push(zigzagBot);
+  lines.push('      在 macOS 上统计每个 Agent 的 AI 用量');
+  lines.push('\\/'.repeat(W / 2));
   return lines.join('\n');
 }
 
@@ -316,203 +296,283 @@ function escapeXml(str) {
 }
 
 /**
- * Render shareable vector thermal-paper receipt SVG (paper or dark theme).
+ * Render Magpie-style editorial thermal-paper receipt SVG with misty forest backdrop,
+ * flat top edge, crisp bottom serrated teeth, hero total, streak/ratio block,
+ * and 2-level AGENT -> MODEL breakdown.
  * @param {object} receipt
  * @param {{ theme?: 'paper' | 'dark', currency?: string, usdToCny?: number, hideProjects?: boolean, punchlineIndex?: number }} [opts]
  */
 export function renderReceiptSvg(
   receipt,
-  { theme = 'paper', currency = 'both', usdToCny = 7, hideProjects = false, punchlineIndex = 0 } = {}
+  { theme = 'paper', currency = 'both', usdToCny = 7, hideProjects = false } = {}
 ) {
   const dark = theme === 'dark';
-  const bgOuter = dark ? '#0F1115' : '#EAE6DF';
-  const paperBg = dark ? '#181B22' : '#FCFBF7';
-  const ink = dark ? '#F3F4F6' : '#1E1D1A';
-  const muted = dark ? '#9CA3AF' : '#6B675E';
-  const accent = dark ? '#34D399' : '#0F766E';
-  const dashColor = dark ? '#313744' : '#D4CFC3';
-  const badgeBg = dark ? '#232834' : '#F2EFE8';
+  const paperBg = dark ? '#181A1F' : '#F6F4EE';
+  const ink = dark ? '#F2F3F5' : '#171717';
+  const muted = dark ? '#9298A3' : '#6E6C66';
+  const subtle = dark ? '#6C727E' : '#96938B';
+  const dashColor = dark ? '#2F343F' : '#D8D4CA';
 
-  const fmt = (val) => formatReceiptMoney(val, { currency, usdToCny });
+  const rate = Number.isFinite(Number(usdToCny)) && Number(usdToCny) > 0 ? Number(usdToCny) : 7;
   const totals = receipt.totals || {};
-  const items = Array.isArray(receipt.items) ? receipt.items.slice(0, 12) : [];
-  const punchlines =
-    Array.isArray(receipt.punchlines) && receipt.punchlines.length > 0
-      ? receipt.punchlines
-      : buildReceiptPunchlines(receipt);
-  const punchline = punchlines[Math.abs(Number(punchlineIndex) || 0) % punchlines.length];
 
-  const cardX = 28;
-  const cardW = 424;
+  const fmtSingle = (usd) => {
+    if (typeof usd !== 'number' || !Number.isFinite(usd)) return 'N/A';
+    if (currency === 'cny') return formatReceiptMoney(usd, { currency: 'cny', usdToCny: rate });
+    return formatReceiptMoney(usd, { currency: 'usd', usdToCny: rate });
+  };
+
+  const heroPrimary =
+    currency === 'cny'
+      ? formatReceiptMoney(totals.estimatedCostUsd, { currency: 'cny', usdToCny: rate })
+      : formatReceiptMoney(totals.estimatedCostUsd, { currency: 'usd', usdToCny: rate });
+  const heroSecondary =
+    currency === 'both' && typeof totals.estimatedCostUsd === 'number'
+      ? `≈ ${formatReceiptMoney(totals.estimatedCostUsd, { currency: 'cny', usdToCny: rate })} · 1:${rate}`
+      : null;
+
+  const useHierarchy =
+    receipt.groupBy !== 'project' &&
+    Array.isArray(receipt.agentBreakdown) &&
+    receipt.agentBreakdown.length > 0;
+
+  const agents = useHierarchy ? receipt.agentBreakdown : [];
+  const flatItems = !useHierarchy && Array.isArray(receipt.items) ? receipt.items.slice(0, 14) : [];
+
+  // Calculate dynamic paper height cleanly
+  let ledgerHeight = 36;
+  if (useHierarchy) {
+    for (const ag of agents) {
+      ledgerHeight += 28 + ag.models.slice(0, 8).length * 22 + 12;
+    }
+  } else if (flatItems.length === 0) {
+    ledgerHeight += 36;
+  } else {
+    ledgerHeight += flatItems.length * 24 + 10;
+  }
+
+  const cardX = 56;
+  const cardW = 368;
   const totalW = cardW + cardX * 2;
-  const padX = cardX + 24;
-  const rightX = cardX + cardW - 24;
+  const padX = cardX + 28;
+  const rightX = cardX + cardW - 28;
+  const cardTop = 44;
 
-  const rowHeight = 40;
-  const itemsBlockH = items.length === 0 ? 44 : items.length * rowHeight;
-  const hasDiscount = typeof totals.cacheSavingsUsd === 'number' && totals.cacheSavingsUsd > 0;
-  const cardTop = 24;
-  const cardBodyH = 220 + itemsBlockH + (hasDiscount ? 48 : 0) + 215;
-  const totalH = cardTop + cardBodyH + 34;
+  const hasUnpriced = (totals.unpricedTurnCount || 0) > 0;
+  const hasSavings = (totals.cacheSavingsUsd || 0) > 0;
+  const cardBodyH =
+    126 + // Header + Date/Issued
+    (heroSecondary ? 128 : 112) + // Hero total
+    118 + // 4 summary metrics
+    ledgerHeight +
+    126 + (hasSavings ? 22 : 0) + (hasUnpriced ? 20 : 0) + // Token summary
+    76; // Footer
 
-  // Build zigzag polygon for paper shape
-  const toothW = 12;
-  const toothH = 7;
-  const teethCount = Math.floor(cardW / toothW);
-  const pts = [];
-  for (let i = 0; i <= teethCount; i += 1) {
-    const x = cardX + Math.min(cardW, i * toothW);
-    const y = i % 2 === 0 ? cardTop : cardTop + toothH;
-    pts.push(`${x},${y}`);
-  }
   const bottomY = cardTop + cardBodyH;
+  const totalH = bottomY + 54;
+
+  // Flat top edge, serrated bottom edge (exact reference geometry)
+  const toothW = 9;
+  const toothH = 6;
+  const teethCount = Math.floor(cardW / toothW);
+  const pts = [`${cardX},${cardTop}`, `${cardX + cardW},${cardTop}`, `${cardX + cardW},${bottomY - toothH}`];
   for (let i = teethCount; i >= 0; i -= 1) {
-    const x = cardX + Math.min(cardW, i * toothW);
+    const x = cardX + (cardW * i) / teethCount;
     const y = i % 2 === 0 ? bottomY : bottomY - toothH;
-    pts.push(`${x},${y}`);
+    pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
   }
 
-  let y = cardTop + 38;
   const parts = [];
+  const mono = "'SF Mono','Menlo','PingFang SC',monospace";
+  const sans = "'PingFang SC','-apple-system','Helvetica Neue',sans-serif";
   const addText = (x, yy, text, opts = {}) => {
     const size = opts.size || 12;
     const weight = opts.weight || 400;
     const fill = opts.fill || ink;
     const anchor = opts.anchor || 'start';
+    const family = opts.family || mono;
+    const ls = opts.spacing ? ` letter-spacing="${opts.spacing}"` : '';
     parts.push(
-      `<text x="${x}" y="${yy}" font-family="'SF Mono','Menlo','PingFang SC',monospace" font-size="${size}" font-weight="${weight}" fill="${fill}" text-anchor="${anchor}">${escapeXml(text)}</text>`
+      `<text x="${x}" y="${yy}" font-family="${family}" font-size="${size}" font-weight="${weight}" fill="${fill}" text-anchor="${anchor}"${ls}>${escapeXml(text)}</text>`
     );
   };
   const addDash = (yy) => {
     parts.push(
-      `<line x1="${padX}" y1="${yy}" x2="${rightX}" y2="${yy}" stroke="${dashColor}" stroke-width="1" stroke-dasharray="4 3"/>`
+      `<line x1="${padX}" y1="${yy}" x2="${rightX}" y2="${yy}" stroke="${dashColor}" stroke-width="1" stroke-dasharray="3 3"/>`
     );
   };
 
-  addText(totalW / 2, y, 'AI TURN METER', { size: 17, weight: 700, anchor: 'middle' });
-  y += 18;
-  addText(totalW / 2, y, 'DAILY TOKEN RECEIPT · 算力消费小票', { size: 10.5, fill: muted, anchor: 'middle' });
+  let y = cardTop + 40;
+  // Section 1: Title & Dates
+  addText(totalW / 2, y, receiptTitleForScope(receipt.scope), {
+    size: 20,
+    weight: 700,
+    anchor: 'middle',
+    family: sans,
+    spacing: '2',
+  });
+  y += 20;
+  addText(totalW / 2, y, '由 AI Turn Meter 统计', { size: 10.5, fill: muted, anchor: 'middle', family: sans });
+  y += 24;
+
+  const dateText =
+    receipt.scope === 'day'
+      ? formatZhDate(receipt.date)
+      : `${formatZhDate(receipt.startDate)} - ${formatZhDate(receipt.date)}`;
+  addText(padX, y, '日期', { size: 11, fill: muted, family: sans });
+  addText(rightX, y, dateText, { size: 11, fill: ink, anchor: 'end' });
+  y += 19;
+  addText(padX, y, '开具', { size: 11, fill: muted, family: sans });
+  addText(rightX, y, formatZhDateTime(receipt.generatedAtMs || Date.now()), { size: 11, fill: ink, anchor: 'end' });
   y += 16;
   addDash(y);
-  y += 20;
 
-  const toolsText =
-    Array.isArray(receipt.activeTools) && receipt.activeTools.length > 0
-      ? receipt.activeTools.map((t) => TOOL_LABELS[t] || t).join(' · ')
-      : '无记录';
-  addText(padX, y, `RECEIPT # ${receipt.receiptNo || '-'}`, { size: 10.5, fill: muted });
-  addText(rightX, y, receipt.weekdayLabel || '', { size: 10.5, fill: muted, anchor: 'end' });
-  y += 17;
-  addText(padX, y, receipt.rangeLabel || receipt.date || '-', { size: 11, weight: 600 });
-  y += 17;
-  addText(padX, y, `CLIENTS: ${truncateText(toolsText, 38)}`, { size: 10.5, fill: muted });
-  y += 14;
-  addDash(y);
+  // Section 2: Hero API Cost
+  y += 24;
+  addText(totalW / 2, y, 'API 总费用', { size: 11, fill: muted, anchor: 'middle', family: sans });
+  y += 42;
+  addText(totalW / 2, y, heroPrimary, { size: 36, weight: 800, anchor: 'middle', spacing: '-0.5' });
+  if (heroSecondary) {
+    y += 18;
+    addText(totalW / 2, y, heroSecondary, { size: 11, fill: muted, anchor: 'middle' });
+  }
   y += 18;
-
-  addText(padX, y, 'ITEM / BREAKDOWN', { size: 10, weight: 700, fill: muted });
-  addText(rightX, y, 'AMOUNT', { size: 10, weight: 700, fill: muted, anchor: 'end' });
-  y += 12;
+  addText(totalW / 2, y, '按 API 价格折算 · 非发票', { size: 10, fill: subtle, anchor: 'middle', family: sans });
+  y += 18;
   addDash(y);
+
+  // Section 3: 4 Key Stats (Streak / Requests / Turns / vs Daily Avg)
+  y += 22;
+  const statsRows = [
+    ['连续使用', `${receipt.streakDays || 0} 天`],
+    ['请求数', fmtCommaNumber(totals.callCount || 0)],
+    ['对话轮次', `${fmtCommaNumber(totals.turnCount || 0)}`],
+    ['对比日均', receipt.vsDailyAvgRatio ? `${receipt.vsDailyAvgRatio}×` : '--'],
+  ];
+  for (const [k, v] of statsRows) {
+    addText(padX, y, k, { size: 11.5, fill: muted, family: sans });
+    addText(rightX, y, v, { size: 11.5, fill: ink, anchor: 'end' });
+    y += 22;
+  }
+  y += 4;
+  addDash(y);
+
+  // Section 4: 2-Level AGENT / MODEL Ledger
+  y += 22;
+  addText(padX, y, receipt.groupBy === 'project' ? '项目' : 'AGENT / 模型', { size: 10.5, fill: subtle, family: sans });
+  addText(rightX, y, '费用', { size: 10.5, fill: subtle, anchor: 'end', family: sans });
   y += 22;
 
-  if (items.length === 0) {
-    addText(totalW / 2, y + 6, '当日暂无消费记录', { size: 12, fill: muted, anchor: 'middle' });
+  if (useHierarchy) {
+    for (const ag of agents) {
+      parts.push(`<circle cx="${padX + 5}" cy="${y - 4}" r="4" fill="${ink}"/>`);
+      addText(padX + 16, y, ag.label, { size: 12.5, weight: 700 });
+      addText(rightX, y, ag.priced ? fmtSingle(ag.estimatedCostUsd) : '未定价', {
+        size: 12.5,
+        weight: 700,
+        anchor: 'end',
+      });
+      y += 23;
+      for (const m of ag.models.slice(0, 8)) {
+        parts.push(`<circle cx="${padX + 20}" cy="${y - 3.5}" r="2.2" fill="${muted}"/>`);
+        addText(padX + 30, y, truncateText(m.label, 24), { size: 11, fill: ink });
+        addText(rightX, y, m.priced ? fmtSingle(m.estimatedCostUsd) : '未定价', {
+          size: 11,
+          fill: ink,
+          anchor: 'end',
+        });
+        y += 22;
+      }
+      y += 10;
+    }
+  } else if (flatItems.length === 0) {
+    addText(totalW / 2, y + 6, '当日暂无消费记录', { size: 11.5, fill: muted, anchor: 'middle', family: sans });
     y += 32;
   } else {
-    items.forEach((item, idx) => {
+    flatItems.forEach((item, idx) => {
       const label =
         hideProjects && receipt.groupBy === 'project'
-          ? `Project #${idx + 1}`
-          : truncateText(item.label, 26);
-      const money = item.priced ? fmt(item.estimatedCostUsd) : '未定价';
-      addText(padX, y, label, { size: 12, weight: 600 });
-      addText(rightX, y, money, { size: 12, weight: 600, anchor: 'end' });
-      const cacheTag = item.cacheRatePct !== null && item.cacheRatePct !== undefined ? `${item.cacheRatePct}%` : '--';
-      const prefixTag = receipt.groupBy === 'model' && item.sublabel ? `${item.sublabel} · ` : '';
-      addText(
-        padX,
-        y + 15,
-        `${prefixTag}${item.turnCount} 轮 · 入 ${formatTokens(item.totalInputTokens)} (缓存 ${cacheTag}) · 出 ${formatTokens(item.outputTokens)}`,
-        { size: 10, fill: muted }
-      );
-      y += rowHeight;
+          ? `PROJECT #${idx + 1}`
+          : truncateText(String(item.label || '').toUpperCase(), 25);
+      parts.push(`<circle cx="${padX + 5}" cy="${y - 4}" r="3" fill="${ink}"/>`);
+      addText(padX + 15, y, label, { size: 11.5, weight: 600 });
+      addText(rightX, y, item.priced ? fmtSingle(item.estimatedCostUsd) : '未定价', {
+        size: 11.5,
+        weight: 600,
+        anchor: 'end',
+      });
+      y += 24;
     });
+    y += 6;
   }
 
   addDash(y);
-  y += 20;
 
-  if (hasDiscount) {
-    addText(padX, y, '原价 SUBTOTAL', { size: 11, fill: muted });
-    addText(rightX, y, fmt(totals.grossCostUsd), { size: 11, fill: muted, anchor: 'end' });
-    y += 18;
-    addText(padX, y, `缓存立减 CACHE SAVED (${totals.cacheRatePct ?? 0}%)`, { size: 11, fill: accent, weight: 600 });
-    addText(rightX, y, `-${fmt(totals.cacheSavingsUsd)}`, { size: 11, fill: accent, weight: 600, anchor: 'end' });
-    y += 16;
-    addDash(y);
-    y += 24;
-  }
-
-  addText(padX, y, 'TOTAL 实付等效', { size: 13.5, weight: 700 });
-  addText(rightX, y, fmt(totals.estimatedCostUsd), { size: 15, weight: 700, anchor: 'end' });
+  // Section 5: Bottom Token Summary
   y += 22;
-
-  // Compact stats bar
-  parts.push(`<rect x="${padX}" y="${y}" width="${cardW - 48}" height="44" rx="6" fill="${badgeBg}"/>`);
-  const colW = (cardW - 48) / 3;
-  const statCols = [
-    ['TOKENS', formatTokens(totals.totalTokens)],
-    ['TURNS', `${totals.turnCount || 0} 轮`],
-    ['AVG TPS', totals.avgTps ? `${totals.avgTps} t/s` : '--'],
+  const tokenRows = [
+    ['TOKEN 总量', formatTokens(totals.totalTokens)],
+    ['输入', formatTokens(totals.totalInputTokens)],
+    ['输出', formatTokens(totals.outputTokens)],
+    [
+      '缓存命中率',
+      totals.cacheRatePct !== null && totals.cacheRatePct !== undefined ? `${Math.round(totals.cacheRatePct)}%` : '--',
+    ],
   ];
-  statCols.forEach(([k, v], i) => {
-    const cx = padX + colW * i + colW / 2;
-    addText(cx, y + 16, k, { size: 9, fill: muted, anchor: 'middle' });
-    addText(cx, y + 33, v, { size: 12, weight: 700, anchor: 'middle' });
-  });
-  y += 60;
-
-  const metaBits = [];
-  if (receipt.highlights?.firstTurnAtMs && receipt.highlights?.lastTurnAtMs) {
-    metaBits.push(`活跃 ${formatClock(receipt.highlights.firstTurnAtMs)}-${formatClock(receipt.highlights.lastTurnAtMs)}`);
+  if (hasSavings) {
+    tokenRows.push(['缓存节省', fmtSingle(totals.cacheSavingsUsd)]);
   }
-  if (!hideProjects && receipt.highlights?.topProject?.name) {
-    metaBits.push(`最耗项目 ${truncateText(receipt.highlights.topProject.name, 16)}`);
+  for (const [k, v] of tokenRows) {
+    addText(padX, y, k, { size: 11.5, fill: muted, family: sans });
+    addText(rightX, y, v, { size: 11.5, fill: ink, anchor: 'end' });
+    y += 22;
   }
-  if (currency !== 'usd') {
-    const rate = Number.isFinite(Number(usdToCny)) && Number(usdToCny) > 0 ? Number(usdToCny) : 7;
-    metaBits.push(`汇率 1:${rate}`);
-  }
-  if (metaBits.length > 0) {
-    addText(totalW / 2, y, metaBits.join(' · '), { size: 10, fill: muted, anchor: 'middle' });
+  if (hasUnpriced) {
+    addText(padX, y + 2, `${totals.unpricedTurnCount} 次请求没有价格`, { size: 10, fill: subtle, family: sans });
     y += 18;
   }
-
+  y += 8;
   addDash(y);
-  y += 20;
-  addText(totalW / 2, y, truncateText(`“${punchline}”`, 34), { size: 10.5, fill: muted, anchor: 'middle' });
-  y += 18;
 
-  // Deterministic barcode
-  const bars = buildBarcodeBars(receipt.barcodeSeed || receipt.receiptNo || receipt.date, 48);
-  const totalBarW = bars.reduce((s, b) => s + b.width + b.gap, 0);
-  let bx = (totalW - totalBarW) / 2;
-  for (const b of bars) {
-    parts.push(`<rect x="${bx.toFixed(1)}" y="${y}" width="${b.width}" height="28" fill="${ink}" opacity="0.88"/>`);
-    bx += b.width + b.gap;
-  }
-  y += 42;
-  addText(totalW / 2, y, `${receipt.receiptNo || 'ATM'} · LOCAL PRIVACY RECEIPT`, {
-    size: 9,
-    fill: muted,
+  // Section 6: Clean Centered Footer
+  y += 24;
+  addText(totalW / 2, y, `${receipt.receiptNo || 'AI TURN METER'} · AI Turn Meter`, {
+    size: 10,
+    fill: subtle,
     anchor: 'middle',
   });
+  y += 17;
+  addText(totalW / 2, y, '在 macOS 上统计每个 Agent 的 AI 用量', {
+    size: 10,
+    fill: subtle,
+    anchor: 'middle',
+    family: sans,
+  });
+
+  // Misty alpine lake gradient backdrop (inspired by the reference wallpaper frame)
+  const bgDef = dark
+    ? `<linearGradient id="mistBg" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#1E2528"/>
+        <stop offset="48%" stop-color="#141C1E"/>
+        <stop offset="100%" stop-color="#0E1416"/>
+      </linearGradient>`
+    : `<linearGradient id="mistBg" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#C8CEC9"/>
+        <stop offset="36%" stop-color="#8B9A94"/>
+        <stop offset="68%" stop-color="#4A5D57"/>
+        <stop offset="100%" stop-color="#374945"/>
+      </linearGradient>`;
+
+  const mountains = dark
+    ? `<path d="M0,${totalH * 0.42} L${totalW * 0.25},${totalH * 0.26} L${totalW * 0.52},${totalH * 0.38} L${totalW * 0.82},${totalH * 0.22} L${totalW},${totalH * 0.35} L${totalW},${totalH} L0,${totalH} Z" fill="#111819" opacity="0.55"/>`
+    : `<path d="M0,${totalH * 0.40} L${totalW * 0.22},${totalH * 0.24} L${totalW * 0.50},${totalH * 0.36} L${totalW * 0.84},${totalH * 0.20} L${totalW},${totalH * 0.34} L${totalW},${totalH} L0,${totalH} Z" fill="#2F403A" opacity="0.38"/>
+       <path d="M0,${totalH * 0.62} Q${totalW * 0.5},${totalH * 0.55} ${totalW},${totalH * 0.64} L${totalW},${totalH} L0,${totalH} Z" fill="#23332F" opacity="0.45"/>`;
 
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${totalW}" height="${totalH}" viewBox="0 0 ${totalW} ${totalH}">`,
-    `<defs><filter id="shadow" x="-10%" y="-5%" width="120%" height="115%"><feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="${dark ? '0.45' : '0.12'}"/></filter></defs>`,
-    `<rect width="${totalW}" height="${totalH}" fill="${bgOuter}"/>`,
+    `<defs>${bgDef}<filter id="shadow" x="-12%" y="-4%" width="124%" height="112%"><feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity="${dark ? '0.55' : '0.28'}"/></filter></defs>`,
+    `<rect width="${totalW}" height="${totalH}" fill="url(#mistBg)"/>`,
+    mountains,
     `<polygon points="${pts.join(' ')}" fill="${paperBg}" filter="url(#shadow)"/>`,
     ...parts,
     `</svg>`,
