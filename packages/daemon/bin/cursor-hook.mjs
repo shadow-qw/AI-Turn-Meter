@@ -2,6 +2,7 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { defaultStateDir, processCursorHookPayload } from '../src/adapters/cursor.mjs';
+import { AUTH_TOKEN_HEADER, readDaemonToken } from '../src/auth.mjs';
 
 const PORT = Number(process.env.AI_TURN_METER_PORT || 47831);
 
@@ -24,26 +25,31 @@ async function main() {
     return;
   }
 
-  const turn = processCursorHookPayload(payload);
-  if (!turn) return;
-
+  const stateDir = defaultStateDir();
+  const token = readDaemonToken(stateDir);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 600);
   try {
-    const res = await fetch(`http://127.0.0.1:${PORT}/v1/ingest`, {
+    const res = await fetch(`http://127.0.0.1:${PORT}/v1/ingest/cursor-hook`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(turn),
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { [AUTH_TOKEN_HEADER]: token } : {}),
+      },
+      body: JSON.stringify(payload),
       signal: ctrl.signal,
     });
     if (res.ok) return;
   } catch {
-    // Daemon offline: fall back to spool file so turn is never lost
+    // Daemon offline: fall back to local inflight processing + spool file so turn is never lost
   } finally {
     clearTimeout(timer);
   }
 
-  const spoolFile = join(defaultStateDir(), 'cursor-spool.jsonl');
+  const turn = processCursorHookPayload(payload, { stateDir });
+  if (!turn) return;
+
+  const spoolFile = join(stateDir, 'cursor-spool.jsonl');
   mkdirSync(dirname(spoolFile), { recursive: true });
   appendFileSync(spoolFile, `${JSON.stringify(turn)}\n`);
 }

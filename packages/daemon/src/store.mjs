@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -6,6 +6,15 @@ import { isCodexOpenAiModel } from './adapters/codex.mjs';
 import { formatCacheRate, formatInlineSummary, formatTps, normalizeTurn, TOOL_LABELS } from './format.mjs';
 import { defaultCustomPricingPath, estimateTurnCost, loadCustomPricing } from './pricing.mjs';
 import { buildReceiptPunchlines, parseLocalDateRange } from './receipt.mjs';
+
+function setBoundedCache(map, key, val, maxSize = 16) {
+  if (map.has(key)) map.delete(key);
+  while (map.size >= maxSize) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+  map.set(key, val);
+}
 
 function startOfLocalDayMs(nowMs = Date.now()) {
   const d = new Date(nowMs);
@@ -128,21 +137,21 @@ function finalizeAccumulator(acc) {
         : null;
 
   return {
-    turnCount: acc.turnCount,
-    callCount: acc.callCount,
-    totalInputTokens: acc.totalInputTokens,
-    uncachedInputTokens: acc.uncachedInputTokens,
-    cacheReadTokens: acc.cacheReadTokens,
-    cacheWriteTokens: acc.cacheWriteTokens,
-    outputTokens: acc.outputTokens,
-    thinkingTokens: acc.thinkingTokens,
-    totalTokens,
+    turnCount: Math.round(acc.turnCount),
+    callCount: Math.round(acc.callCount),
+    totalInputTokens: Math.round(acc.totalInputTokens),
+    uncachedInputTokens: Math.round(acc.uncachedInputTokens),
+    cacheReadTokens: Math.round(acc.cacheReadTokens),
+    cacheWriteTokens: Math.round(acc.cacheWriteTokens),
+    outputTokens: Math.round(acc.outputTokens),
+    thinkingTokens: Math.round(acc.thinkingTokens),
+    totalTokens: Math.round(totalTokens),
     cacheRatePct,
     avgTps,
     estimatedCostUsd,
     cacheSavingsUsd,
-    pricedTurnCount: acc.pricedTurnCount,
-    unpricedTurnCount: acc.unpricedTurnCount,
+    pricedTurnCount: Math.round(acc.pricedTurnCount),
+    unpricedTurnCount: Math.round(acc.unpricedTurnCount),
   };
 }
 
@@ -170,6 +179,7 @@ export class TurnStore {
       customPricingPath !== undefined ? customPricingPath : dbPath === ':memory:' ? null : defaultCustomPricingPath();
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec('PRAGMA busy_timeout = 5000;');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS turns (
         turn_uid TEXT PRIMARY KEY,
@@ -201,6 +211,7 @@ export class TurnStore {
 
       CREATE INDEX IF NOT EXISTS idx_turns_completed ON turns(completed_at_ms DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_tool_completed ON turns(tool, completed_at_ms DESC);
+      CREATE INDEX IF NOT EXISTS idx_turns_tool_host_completed ON turns(tool, host, completed_at_ms DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(tool, session_id);
       CREATE INDEX IF NOT EXISTS idx_turns_workspace ON turns(workspace_path, completed_at_ms DESC);
 
@@ -244,26 +255,35 @@ export class TurnStore {
       CREATE INDEX IF NOT EXISTS idx_fp_baselines_model ON fingerprint_baselines(model, created_at_ms DESC);
     `);
 
-    try {
-      this.db.exec('ALTER TABLE turns ADD COLUMN reply_preview TEXT;');
-    } catch {
-      // Column already exists on initialized databases
-    }
-    try {
-      this.db.exec('ALTER TABLE turns ADD COLUMN explicit_cost_usd REAL;');
-    } catch {
-      // Column already exists on initialized databases
+    const verRow = this.db.prepare('PRAGMA user_version').get();
+    const schemaVer = Number(verRow?.user_version || 0);
+    if (schemaVer < 1) {
+      try {
+        this.db.exec('ALTER TABLE turns ADD COLUMN reply_preview TEXT;');
+      } catch {
+        // Column already exists on initialized databases
+      }
+      try {
+        this.db.exec('ALTER TABLE turns ADD COLUMN explicit_cost_usd REAL;');
+      } catch {
+        // Column already exists on initialized databases
+      }
+      this.db.exec('PRAGMA user_version = 1;');
     }
 
     // Purge any legacy third-party gateway proxy turns (e.g. workbuddy/claude-opus-5.5) recorded under Codex.
-    const existingCodexRows = this.db.prepare(`SELECT turn_uid, model FROM turns WHERE tool = 'codex'`).all();
-    const staleCodexUids = existingCodexRows.filter((r) => !isCodexOpenAiModel(r.model)).map((r) => r.turn_uid);
-    if (staleCodexUids.length > 0) {
-      const delStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
-      for (const uid of staleCodexUids) {
-        delStmt.run(uid);
+    const codexModels = this.db.prepare(`SELECT DISTINCT model FROM turns WHERE tool = 'codex'`).all();
+    const staleCodexModels = codexModels.map((r) => r.model).filter((m) => !isCodexOpenAiModel(m));
+    if (staleCodexModels.length > 0) {
+      const delStmt = this.db.prepare(`DELETE FROM turns WHERE tool = 'codex' AND model = ?`);
+      for (const m of staleCodexModels) {
+        delStmt.run(m);
       }
     }
+
+    this.writeGeneration = 0;
+    this._usageBaseCache = new Map();
+    this._receiptCache = new Map();
 
     this.upsertStmt = this.db.prepare(`
       INSERT INTO turns (
@@ -386,6 +406,34 @@ export class TurnStore {
         t.replyPreview,
         t.explicitCostUsd
       );
+
+      // Bidirectional deduplication: if a local Cursor hook turn arrives after a cursor-cloud API event
+      // for the same session, remove the overlapping cloud placeholder so spend is never double-counted.
+      if (t.tool === 'cursor' && t.host !== 'cursor-cloud' && t.sessionId) {
+        const cloudRows = this.db
+          .prepare(
+            `SELECT turn_uid, completed_at_ms, total_input_tokens, output_tokens
+             FROM turns
+             WHERE tool = 'cursor' AND host = 'cursor-cloud' AND session_id = ?`
+          )
+          .all(t.sessionId);
+        if (cloudRows.length > 0) {
+          const delCloudStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
+          for (const cr of cloudRows) {
+            const crMs = Number(cr.completed_at_ms) || 0;
+            const crIn = Number(cr.total_input_tokens) || 0;
+            const crOut = Number(cr.output_tokens) || 0;
+            const closeInTime = Math.abs(crMs - t.completedAtMs) <= 6 * 3600_000;
+            const inputMatch = closeInTime && crIn > 0 && crIn === t.totalInputTokens;
+            const outputMatch = Math.abs(crMs - t.completedAtMs) <= 20_000 && crOut > 0 && crOut === t.outputTokens;
+            if (inputMatch || outputMatch) {
+              delCloudStmt.run(cr.turn_uid);
+            }
+          }
+        }
+      }
+
+      this.writeGeneration += 1;
     }
 
     return {
@@ -394,20 +442,33 @@ export class TurnStore {
     };
   }
 
+  getPricingVersionTag() {
+    if (!this.customPricingPath || !existsSync(this.customPricingPath)) return 0;
+    try {
+      return statSync(this.customPricingPath).mtimeMs || 0;
+    } catch {
+      return 0;
+    }
+  }
+
   /**
    * Attach formatted inline text and session cumulative totals (for hover/detail view).
    * @param {ReturnType<typeof normalizeTurn>} t
+   * @param {{ sessionAgg?: any, customRates?: Record<string, any> | null }} [opts]
    */
-  enrichRecord(t) {
-    const agg = this.sessionAggStmt.get(t.tool, t.sessionId) || {
-      turn_count: 1,
-      call_count: t.callCount,
-      total_input_tokens: t.totalInputTokens,
-      uncached_input_tokens: t.uncachedInputTokens,
-      cache_read_tokens: t.cacheReadTokens,
-      cache_write_tokens: t.cacheWriteTokens,
-      output_tokens: t.outputTokens,
-    };
+  enrichRecord(t, opts = {}) {
+    const agg =
+      opts.sessionAgg !== undefined
+        ? opts.sessionAgg
+        : this.sessionAggStmt.get(t.tool, t.sessionId) || {
+            turn_count: 1,
+            call_count: t.callCount,
+            total_input_tokens: t.totalInputTokens,
+            uncached_input_tokens: t.uncachedInputTokens,
+            cache_read_tokens: t.cacheReadTokens,
+            cache_write_tokens: t.cacheWriteTokens,
+            output_tokens: t.outputTokens,
+          };
     const sessionTotal = {
       turnCount: Number(agg.turn_count),
       callCount: Number(agg.call_count),
@@ -417,7 +478,12 @@ export class TurnStore {
       cacheWriteTokens: Number(agg.cache_write_tokens),
       outputTokens: Number(agg.output_tokens),
     };
-    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+    const customRates =
+      opts.customRates !== undefined
+        ? opts.customRates
+        : this.customPricingPath
+          ? loadCustomPricing(this.customPricingPath)
+          : null;
     const cost = estimateTurnCost(t, customRates);
     return {
       ...t,
@@ -429,9 +495,9 @@ export class TurnStore {
     };
   }
 
-  rowToTurn(row) {
+  rowToNormalizedTurn(row) {
     if (!row) return null;
-    const t = normalizeTurn({
+    return normalizeTurn({
       turnUid: row.turn_uid,
       tool: row.tool,
       host: row.host,
@@ -457,7 +523,68 @@ export class TurnStore {
       replyPreview: row.reply_preview || null,
       explicitCostUsd: row.explicit_cost_usd ?? null,
     });
-    return this.enrichRecord(t);
+  }
+
+  batchEnrichRows(rows) {
+    if (!rows || rows.length === 0) return [];
+    const normalized = rows.map((r) => this.rowToNormalizedTurn(r)).filter(Boolean);
+    if (normalized.length === 0) return [];
+
+    const pairMap = new Map();
+    for (const t of normalized) {
+      const k = `${t.tool}\0${t.sessionId}`;
+      if (!pairMap.has(k)) pairMap.set(k, [t.tool, t.sessionId]);
+    }
+    const pairs = Array.from(pairMap.values());
+    const aggMap = new Map();
+    const chunkSize = 100;
+    for (let i = 0; i < pairs.length; i += chunkSize) {
+      const chunk = pairs.slice(i, i + chunkSize);
+      const clauses = chunk.map(() => `(tool = ? AND session_id = ?)`).join(' OR ');
+      const params = chunk.flat();
+      const aggRows = this.db
+        .prepare(
+          `SELECT
+            tool,
+            session_id,
+            COUNT(*) AS turn_count,
+            COALESCE(SUM(call_count), 0) AS call_count,
+            COALESCE(SUM(total_input_tokens), 0) AS total_input_tokens,
+            COALESCE(SUM(uncached_input_tokens), 0) AS uncached_input_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens
+          FROM turns
+          WHERE ${clauses}
+          GROUP BY tool, session_id`
+        )
+        .all(...params);
+      for (const r of aggRows) {
+        aggMap.set(`${r.tool}\0${r.session_id}`, r);
+      }
+    }
+
+    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+    return normalized.map((t) => {
+      const fallbackAgg = {
+        turn_count: 1,
+        call_count: t.callCount,
+        total_input_tokens: t.totalInputTokens,
+        uncached_input_tokens: t.uncachedInputTokens,
+        cache_read_tokens: t.cacheReadTokens,
+        cache_write_tokens: t.cacheWriteTokens,
+        output_tokens: t.outputTokens,
+      };
+      return this.enrichRecord(t, {
+        sessionAgg: aggMap.get(`${t.tool}\0${t.sessionId}`) || fallbackAgg,
+        customRates,
+      });
+    });
+  }
+
+  rowToTurn(row) {
+    if (!row) return null;
+    return this.enrichRecord(this.rowToNormalizedTurn(row));
   }
 
   getIngestedFile(filePath) {
@@ -490,28 +617,46 @@ export class TurnStore {
 
   getLatestByTool() {
     const tools = ['codex', 'antigravity', 'cursor', 'codebuddy'];
-    const result = {};
     const stmt = this.db.prepare(
       `SELECT * FROM turns WHERE tool = ?
        ORDER BY (CASE WHEN host = 'cursor-cloud' THEN 0 ELSE 1 END) DESC, completed_at_ms DESC LIMIT 1`
     );
+    const rawByTool = new Map();
+    const rowsToEnrich = [];
     for (const tool of tools) {
-      result[tool] = this.rowToTurn(stmt.get(tool));
+      const row = stmt.get(tool) || null;
+      rawByTool.set(tool, row);
+      if (row) rowsToEnrich.push(row);
+    }
+    const enriched = this.batchEnrichRows(rowsToEnrich);
+    const byUid = new Map(enriched.map((t) => [t.turnUid, t]));
+    const result = {};
+    for (const tool of tools) {
+      const row = rawByTool.get(tool);
+      result[tool] = row ? byUid.get(row.turn_uid) || null : null;
     }
     return result;
   }
 
-  getRecentTurns(limit = 20, tool = null) {
+  getRecentTurns(limit = 20, tool = null, { excludeHosts = null } = {}) {
+    const excluded = Array.isArray(excludeHosts)
+      ? excludeHosts.filter((h) => typeof h === 'string' && h.length > 0)
+      : [];
+    const clauses = [];
+    const params = [];
     if (tool) {
-      const rows = this.db
-        .prepare(`SELECT * FROM turns WHERE tool = ? ORDER BY completed_at_ms DESC LIMIT ?`)
-        .all(tool, limit);
-      return rows.map((r) => this.rowToTurn(r));
+      clauses.push('tool = ?');
+      params.push(tool);
     }
+    if (excluded.length > 0) {
+      clauses.push(`host NOT IN (${excluded.map(() => '?').join(', ')})`);
+      params.push(...excluded);
+    }
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const rows = this.db
-      .prepare(`SELECT * FROM turns ORDER BY completed_at_ms DESC LIMIT ?`)
-      .all(limit);
-    return rows.map((r) => this.rowToTurn(r));
+      .prepare(`SELECT * FROM turns ${whereSql} ORDER BY completed_at_ms DESC LIMIT ?`)
+      .all(...params, limit);
+    return this.batchEnrichRows(rows);
   }
 
   /**
@@ -586,6 +731,37 @@ export class TurnStore {
       days === 'all' || days === 0 || days === '0' || days === null
         ? 0
         : Math.max(1, Math.round(Number(days) || 7));
+
+    const enabledKey = ['codex', 'cursor', 'antigravity', 'codebuddy']
+      .map((k) => (!enabledTools || enabledTools[k] !== false ? '1' : '0'))
+      .join('');
+    const pricingVer = this.getPricingVersionTag();
+    const cacheKey = `${this.writeGeneration}|${pricingVer}|${toLocalDateKey(nowMs)}|${Math.floor(nowMs / 60_000)}|${resolvedDays}|${tool || ''}|${enabledKey}`;
+
+    const overlayQuotas = (base) => {
+      const overlaidCards = {};
+      for (const [k, card] of Object.entries(base.cards)) {
+        const q = quotasByTool?.[k] || null;
+        overlaidCards[k] = {
+          ...card,
+          accountEmail: q?.accountEmail ?? null,
+          planTitle: q?.planTitle ?? null,
+          quotaWindows: Array.isArray(q?.quotaWindows) ? q.quotaWindows : [],
+          resetCreditsText: q?.resetCreditsText ?? null,
+          quotaHint: q?.quotaHint ?? null,
+        };
+      }
+      return {
+        ...base,
+        generatedAtMs: nowMs,
+        cards: overlaidCards,
+      };
+    };
+
+    const cached = this._usageBaseCache.get(cacheKey);
+    if (cached) {
+      return overlayQuotas(cached);
+    }
 
     let sinceMs = 0;
     if (resolvedDays > 0) {
@@ -721,9 +897,9 @@ export class TurnStore {
         ...finalizeAccumulator(acc),
       }));
 
-    const cards = this.buildCardsByTool(nowMs, customRates, quotasByTool, enabledTools);
+    const cards = this.buildCardsByTool(nowMs, customRates, null, enabledTools);
 
-    return {
+    const baseResult = {
       days: resolvedDays,
       tool: tool || null,
       sinceMs,
@@ -736,6 +912,8 @@ export class TurnStore {
       daily,
       cards,
     };
+    setBoundedCache(this._usageBaseCache, cacheKey, baseResult);
+    return overlayQuotas(baseResult);
   }
 
   buildLatestTurnMetrics(rows, todayFin) {
@@ -1019,6 +1197,15 @@ export class TurnStore {
   } = {}) {
     const range = parseLocalDateRange(date, scope, nowMs);
     const normalizedGroup = groupBy === 'tool' || groupBy === 'project' ? groupBy : 'model';
+    const enabledKey = ['codex', 'cursor', 'antigravity', 'codebuddy']
+      .map((k) => (!enabledTools || enabledTools[k] !== false ? '1' : '0'))
+      .join('');
+    const pricingVer = this.getPricingVersionTag();
+    const cacheKey = `${this.writeGeneration}|${pricingVer}|${range.date}|${range.scope}|${tool || ''}|${normalizedGroup}|${enabledKey}|${toLocalDateKey(nowMs)}`;
+    const cached = this._receiptCache.get(cacheKey);
+    if (cached) {
+      return { ...cached, generatedAtMs: nowMs };
+    }
     const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
 
     const rawRows = tool
@@ -1046,13 +1233,17 @@ export class TurnStore {
     let lastTurnAtMs = null;
 
     for (const row of rows) {
+      const toolKey = typeof row.tool === 'string' && row.tool.trim() ? row.tool.trim() : 'unknown';
       addTurnToAccumulator(totalsAcc, row, customRates);
-      toolSet.add(row.tool);
+      toolSet.add(toolKey);
       const ts = Number(row.completed_at_ms) || 0;
-      if (ts > 0) {
+      if (ts > 0 && Number.isFinite(ts)) {
         if (firstTurnAtMs === null || ts < firstTurnAtMs) firstTurnAtMs = ts;
         if (lastTurnAtMs === null || ts > lastTurnAtMs) lastTurnAtMs = ts;
-        hourlyCounts[new Date(ts).getHours()] += 1;
+        const hour = new Date(ts).getHours();
+        if (Number.isInteger(hour) && hour >= 0 && hour < 24) {
+          hourlyCounts[hour] += 1;
+        }
       }
 
       const rawWs = typeof row.workspace_path === 'string' ? row.workspace_path.trim() : '';
@@ -1063,19 +1254,19 @@ export class TurnStore {
       }
       addTurnToAccumulator(projectMap.get(projKey).acc, row, customRates);
 
-      const mName = row.model || 'unknown';
+      const mName = typeof row.model === 'string' && row.model.trim() ? row.model.trim() : 'unknown';
       if (!modelCostMap.has(mName)) modelCostMap.set(mName, createUsageAccumulator());
       addTurnToAccumulator(modelCostMap.get(mName), row, customRates);
 
-      if (!agentMap.has(row.tool)) {
-        agentMap.set(row.tool, {
-          tool: row.tool,
-          label: (TOOL_LABELS[row.tool] || row.tool).toUpperCase(),
+      if (!agentMap.has(toolKey)) {
+        agentMap.set(toolKey, {
+          tool: toolKey,
+          label: String(TOOL_LABELS[toolKey] || toolKey).toUpperCase(),
           acc: createUsageAccumulator(),
           models: new Map(),
         });
       }
-      const ag = agentMap.get(row.tool);
+      const ag = agentMap.get(toolKey);
       addTurnToAccumulator(ag.acc, row, customRates);
       if (!ag.models.has(mName)) {
         ag.models.set(mName, { model: mName, label: mName.toUpperCase(), acc: createUsageAccumulator() });
@@ -1085,20 +1276,20 @@ export class TurnStore {
       let gKey;
       let gLabel;
       let gSublabel;
-      let gTool = row.tool;
+      let gTool = toolKey;
       if (normalizedGroup === 'tool') {
-        gKey = row.tool;
-        gLabel = TOOL_LABELS[row.tool] || row.tool;
-        gSublabel = row.tool;
+        gKey = toolKey;
+        gLabel = TOOL_LABELS[toolKey] || toolKey;
+        gSublabel = toolKey;
       } else if (normalizedGroup === 'project') {
         gKey = projKey;
         gLabel = projName;
         gSublabel = rawWs || '独立对话';
         gTool = null;
       } else {
-        gKey = `${row.tool}\0${mName}`;
+        gKey = `${toolKey}\0${mName}`;
         gLabel = mName;
-        gSublabel = TOOL_LABELS[row.tool] || row.tool;
+        gSublabel = TOOL_LABELS[toolKey] || toolKey;
       }
       if (!itemMap.has(gKey)) {
         itemMap.set(gKey, { id: gKey, label: gLabel, sublabel: gSublabel, tool: gTool, acc: createUsageAccumulator() });
@@ -1299,6 +1490,7 @@ export class TurnStore {
       barcodeSeed: `${receiptNo}:${totals.totalTokens}:${totals.estimatedCostUsd ?? 0}`,
     };
     receipt.punchlines = buildReceiptPunchlines(receipt);
+    setBoundedCache(this._receiptCache, cacheKey, receipt);
     return receipt;
   }
 

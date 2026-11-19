@@ -498,11 +498,13 @@ test('HTTP server exposes /v1/receipt (json/ascii/svg) and /v1/fingerprint/* CRU
     const recAscii = await (await fetch(`${base}/v1/receipt?format=ascii&currency=both&rate=7`)).text();
     assert.ok(recAscii.includes('DAILY RECEIPT'));
 
+    const authHeaders = { 'Content-Type': 'application/json', 'x-atm-token': meter.authToken };
+
     // Fingerprint endpoint add -> overview -> delete
     const addRes = await (
       await fetch(`${base}/v1/fingerprint/endpoints`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
           name: 'My Relay',
           protocol: 'anthropic',
@@ -515,7 +517,7 @@ test('HTTP server exposes /v1/receipt (json/ascii/svg) and /v1/fingerprint/* CRU
     assert.equal(addRes.ok, true);
     assert.equal(addRes.endpoint.apiKeyPreview, 'sk-a...7654');
 
-    const overview = await (await fetch(`${base}/v1/fingerprint/overview`)).json();
+    const overview = await (await fetch(`${base}/v1/fingerprint/overview`, { headers: { 'x-atm-token': meter.authToken } })).json();
     assert.equal(overview.endpoints.length, 1);
     assert.ok(overview.manualProbe.prompt.includes('[ATM-PROBE-V1]'));
 
@@ -523,7 +525,7 @@ test('HTTP server exposes /v1/receipt (json/ascii/svg) and /v1/fingerprint/* CRU
     const passiveRun = await (
       await fetch(`${base}/v1/fingerprint/run`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ mode: 'passive', days: 7 }),
       })
     ).json();
@@ -533,7 +535,7 @@ test('HTTP server exposes /v1/receipt (json/ascii/svg) and /v1/fingerprint/* CRU
     const manualRun = await (
       await fetch(`${base}/v1/fingerprint/run`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ mode: 'manual_score', tool: 'cursor' }),
       })
     ).json();
@@ -545,6 +547,7 @@ test('HTTP server exposes /v1/receipt (json/ascii/svg) and /v1/fingerprint/* CRU
     const delRes = await (
       await fetch(`${base}/v1/fingerprint/endpoints?id=${encodeURIComponent(addRes.endpoint.id)}`, {
         method: 'DELETE',
+        headers: { 'x-atm-token': meter.authToken },
       })
     ).json();
     assert.equal(delRes.ok, true);
@@ -552,6 +555,106 @@ test('HTTP server exposes /v1/receipt (json/ascii/svg) and /v1/fingerprint/* CRU
     assert.equal(delRes.endpoints.length, 0);
   } finally {
     await meter.stop();
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('getReceiptData sanitizes blank tool/model fields and rounds integer token counts', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-receipt-sanitize-'));
+  const dbPath = join(tmpDir, 'meter.db');
+  const store = new TurnStore(dbPath);
+  try {
+    const ts = new Date(2026, 10, 19, 14, 0, 0).getTime();
+    store.db
+      .prepare(
+        `INSERT INTO turns (
+          turn_uid, tool, host, session_id, turn_id, model, workspace_path,
+          total_input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens,
+          output_tokens, thinking_tokens, call_count, completed_at_ms, tps_method
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run('dirty:1', '', 'local', 's1', 't1', '', null, 1234.6, 234.4, 1000.2, 0, 56.7, 0, 1.5, ts, 'none');
+
+    const receipt = store.getReceiptData({ date: '2026-11-19', scope: 'day', nowMs: ts + 60_000 });
+    assert.equal(receipt.totals.turnCount, 1);
+    assert.equal(Number.isInteger(receipt.totals.totalInputTokens), true);
+    assert.equal(Number.isInteger(receipt.totals.outputTokens), true);
+    assert.equal(Number.isInteger(receipt.totals.callCount), true);
+    assert.equal(receipt.agentBreakdown.length, 1);
+    assert.equal(receipt.agentBreakdown[0].tool, 'unknown');
+    assert.equal(receipt.agentBreakdown[0].label, 'UNKNOWN');
+    assert.equal(receipt.agentBreakdown[0].models[0].model, 'unknown');
+  } finally {
+    store.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('getRecentTurns(excludeHosts) & CdpInlineInjector prevent cursor-cloud billing events from crowding out cursor-ide turns', async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-cursor-cloud-iso-'));
+  const dbPath = join(tmpDir, 'meter.db');
+  const store = new TurnStore(dbPath);
+  try {
+    const baseMs = Date.UTC(2026, 10, 19, 8, 0, 0);
+    store.upsertTurn({
+      turnUid: 'cursor:local-conv:turn-1',
+      tool: 'cursor',
+      host: 'cursor-ide',
+      sessionId: 'local-conv',
+      turnId: 'turn-1',
+      model: 'gemini-4-neon',
+      completedAtMs: baseMs,
+      totalInputTokens: 500_000,
+      cacheReadTokens: 450_000,
+      outputTokens: 2100,
+      modelActiveMs: 30_000,
+      tpsMethod: 'e2e_minus_tools',
+      replyPreview: '本地真实对话回复预览',
+    });
+
+    // Flood with 70 newer cursor-cloud billing calls (e.g. grok-bot-default output=4, tps=null)
+    for (let i = 1; i <= 70; i += 1) {
+      store.upsertTurn({
+        turnUid: `cursor:api:cloud-${i}`,
+        tool: 'cursor',
+        host: 'cursor-cloud',
+        sessionId: 'cloud-grok-session',
+        turnId: `cloud-${i}`,
+        model: 'grok-bot-default',
+        completedAtMs: baseMs + i * 5000,
+        totalInputTokens: 135_800,
+        cacheReadTokens: 134_500,
+        outputTokens: 4,
+        tpsMethod: 'unavailable',
+      });
+    }
+
+    const unfiltered = store.getRecentTurns(60, 'cursor');
+    assert.equal(unfiltered.every((t) => t.host === 'cursor-cloud'), true);
+
+    const ideOnly = store.getRecentTurns(60, 'cursor', { excludeHosts: ['cursor-cloud'] });
+    assert.equal(ideOnly.length, 1);
+    assert.equal(ideOnly[0].turnUid, 'cursor:local-conv:turn-1');
+    assert.equal(ideOnly[0].host, 'cursor-ide');
+    assert.equal(ideOnly[0].outputTokens, 2100);
+    assert.ok(ideOnly[0].tps > 0);
+
+    // Verify CdpInlineInjector ignores cursor-cloud even if passed directly
+    let evaluated = false;
+    const injector = new CdpInlineInjector({
+      getTurnsForTool: () => unfiltered,
+    });
+    injector.resolvePort = () => 47922;
+    injector.findTargets = async () => [{ id: 't1', webSocketDebuggerUrl: 'ws://127.0.0.1/t1' }];
+    injector.evaluateOnTarget = async () => {
+      evaluated = true;
+      return true;
+    };
+    const pushed = await injector.pushTool({ tool: 'cursor', port: 47922 }, { force: true });
+    assert.equal(pushed, false);
+    assert.equal(evaluated, false);
+  } finally {
+    store.close();
     rmSync(tmpDir, { recursive: true, force: true });
   }
 });

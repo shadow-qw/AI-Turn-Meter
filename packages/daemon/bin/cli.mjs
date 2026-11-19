@@ -29,6 +29,7 @@ import {
   resolveAppPaths,
 } from '../src/apps.mjs';
 import { formatTokens, formatTps } from '../src/format.mjs';
+import { AUTH_TOKEN_HEADER, readDaemonToken } from '../src/auth.mjs';
 import {
   applyLocalSshConfig,
   applyRemoteCursorHooks,
@@ -413,9 +414,13 @@ async function cmdFingerprint(flags, jsonMode = false) {
 
   let out = null;
   try {
+    const token = readDaemonToken();
     const res = await fetch(`http://127.0.0.1:${PORT}/v1/fingerprint/run`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { [AUTH_TOKEN_HEADER]: token } : {}),
+      },
       body: JSON.stringify({
         mode,
         target,

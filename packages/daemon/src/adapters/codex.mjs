@@ -470,6 +470,7 @@ export class CodexAdapter {
     onTurns,
     sessionsDir = join(homedir(), '.codex', 'sessions'),
     archivedDir,
+    isEnabled = () => true,
   }) {
     this.store = store;
     this.onTurns = onTurns;
@@ -480,6 +481,7 @@ export class CodexAdapter {
         : basename(sessionsDir) === 'sessions'
           ? join(dirname(sessionsDir), 'archived_sessions')
           : null;
+    this.isEnabled = isEnabled;
     this.fileMtimes = new Map();
     this.watchers = [];
     this.timer = null;
@@ -487,6 +489,7 @@ export class CodexAdapter {
   }
 
   scan({ maxRecentFiles = 30 } = {}) {
+    if (this.isEnabled && !this.isEnabled()) return [];
     const collectLimit = Number.isFinite(maxRecentFiles) ? Math.max(maxRecentFiles * 3, 90) : Infinity;
     const rawPaths = [];
     collectJsonlFiles(this.sessionsDir, rawPaths, collectLimit);

@@ -4,6 +4,7 @@
  * `dist/AI-Turn-Meter-<version>-arm64.dmg` with self-contained Node >= 22.5 runtime.
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   cpSync,
@@ -16,7 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -174,7 +175,7 @@ execFileSync(process.execPath, [join(ROOT, 'scripts', 'package-vsix.mjs')], { st
 const distDir = join(ROOT, 'dist');
 mkdirSync(distDir, { recursive: true });
 for (const f of readdirSync(distDir)) {
-  if (/^AI-Turn-Meter-.*\.dmg$/.test(f)) {
+  if (/^AI-Turn-Meter-.*\.dmg(\.sha256)?$/.test(f)) {
     rmSync(join(distDir, f), { force: true });
   }
 }
@@ -193,35 +194,26 @@ mkdirSync(macosDir, { recursive: true });
 mkdirSync(join(runtimeDir, 'packages'), { recursive: true });
 mkdirSync(join(runtimeDir, 'dist'), { recursive: true });
 
-// 1. Compile native Swift app binary
-const swiftSrc = join(ROOT, 'packages', 'desktop-macos', 'main.swift');
+// 1. Compile native Swift Package binary (release arm64)
+const desktopPkgDir = join(ROOT, 'packages', 'desktop-macos');
 const appExe = join(macosDir, 'AITurnMeter');
-execFileSync(
-  '/usr/bin/swiftc',
-  [
-    '-O',
-    '-swift-version',
-    '5',
-    '-target',
-    'arm64-apple-macosx13.0',
-    swiftSrc,
-    '-o',
-    appExe,
-    '-framework',
-    'AppKit',
-    '-framework',
-    'SwiftUI',
-    '-framework',
-    'Foundation',
-    '-framework',
-    'WebKit',
-    '-framework',
-    'Security',
-    '-framework',
-    'LocalAuthentication',
-  ],
-  { stdio: 'inherit' }
-);
+const swiftEnv = { ...process.env };
+delete swiftEnv.TOOLCHAINS;
+execFileSync('/usr/bin/swift', ['build', '-c', 'release', '--arch', 'arm64', '--package-path', desktopPkgDir], {
+  stdio: 'inherit',
+  env: swiftEnv,
+});
+const swiftBinDir = execFileSync(
+  '/usr/bin/swift',
+  ['build', '-c', 'release', '--arch', 'arm64', '--package-path', desktopPkgDir, '--show-bin-path'],
+  { encoding: 'utf8', env: swiftEnv }
+).trim();
+const builtExe = join(swiftBinDir, 'AITurnMeterApp');
+if (!existsSync(builtExe)) {
+  throw new Error(`SwiftPM release binary not found: ${builtExe}`);
+}
+cpSync(builtExe, appExe);
+chmodSync(appExe, 0o755);
 
 // 2. Icon + Info.plist
 generateAppIcon(iconsetDir, join(resDir, 'AppIcon.icns'));
@@ -301,5 +293,9 @@ execFileSync(
   { stdio: 'inherit' }
 );
 
+const dmgSha256 = createHash('sha256').update(readFileSync(outDmg)).digest('hex');
+writeFileSync(`${outDmg}.sha256`, `${dmgSha256}  ${basename(outDmg)}\n`);
+
 rmSync(stageDir, { recursive: true, force: true });
 console.log(`Built DMG: ${outDmg}`);
+console.log(`SHA-256:   ${dmgSha256}`);

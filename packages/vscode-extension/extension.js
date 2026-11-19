@@ -1,6 +1,29 @@
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 const vscode = require('vscode');
+
+function readDaemonToken() {
+  try {
+    const envTok = process.env.AI_TURN_METER_TOKEN;
+    if (typeof envTok === 'string' && envTok.trim()) return envTok.trim();
+    const stateDir =
+      process.env.AI_TURN_METER_STATE_DIR || path.join(os.homedir(), '.local', 'share', 'ai-turn-meter');
+    const tokPath = path.join(stateDir, 'daemon.token');
+    if (!fs.existsSync(tokPath)) return null;
+    const raw = fs.readFileSync(tokPath, 'utf8').trim();
+    return raw || null;
+  } catch {
+    return null;
+  }
+}
+
+function authHeaders() {
+  const tok = readDaemonToken();
+  return tok ? { 'x-atm-token': tok } : {};
+}
 
 function detectHostTool(appName) {
   const low = String(appName || '').toLowerCase();
@@ -25,7 +48,16 @@ function fmtTps(tps) {
 
 function httpGetJson(urlStr) {
   return new Promise((resolve, reject) => {
-    const req = http.get(urlStr, { timeout: 1500 }, (res) => {
+    const parsed = new URL(urlStr);
+    const req = http.get(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: authHeaders(),
+        timeout: 1500,
+      },
+      (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c) => {
@@ -137,7 +169,15 @@ function activate(context) {
     }
     const { baseUrl } = getConfig();
     try {
-      sseReq = http.get(`${baseUrl}/events`, (res) => {
+      const parsed = new URL(`${baseUrl}/events`);
+      sseReq = http.get(
+        {
+          hostname: parsed.hostname,
+          port: parsed.port,
+          path: `${parsed.pathname}${parsed.search}`,
+          headers: authHeaders(),
+        },
+        (res) => {
         if (res.statusCode !== 200) {
           res.resume();
           scheduleReconnect();

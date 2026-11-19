@@ -482,9 +482,10 @@ test('TurnStore & HTTP server separate per-turn from sessionTotal and match work
     assert.ok(typeof healthRes.version === 'string' && healthRes.version.length > 0);
     assert.ok(typeof healthRes.root === 'string' && healthRes.root.length > 0);
 
+    const authHeaders = { 'Content-Type': 'application/json', 'x-atm-token': meter.authToken };
     const r1 = await fetch(`${baseUrl}/v1/ingest`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders,
       body: JSON.stringify({
         turnUid: 'cursor:s1:t1',
         tool: 'cursor',
@@ -504,7 +505,7 @@ test('TurnStore & HTTP server separate per-turn from sessionTotal and match work
 
     const r2 = await fetch(`${baseUrl}/v1/ingest`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders,
       body: JSON.stringify({
         turnUid: 'cursor:s1:t2',
         tool: 'cursor',
@@ -635,7 +636,7 @@ test('TurnStore & HTTP server separate per-turn from sessionTotal and match work
       // Strict per-tool isolation in /v1/match: never leak another tool's record even for the same workspace
       await fetch(`${baseUrl}/v1/ingest`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
           turnUid: 'codex:s-iso:t-iso',
           tool: 'codex',
@@ -664,7 +665,7 @@ test('TurnStore & HTTP server separate per-turn from sessionTotal and match work
       // Per-tool and global toggle via /v1/config
       await fetch(`${baseUrl}/v1/config`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ tools: { cursor: false } }),
       });
       const disabledCursor = await (
@@ -675,7 +676,7 @@ test('TurnStore & HTTP server separate per-turn from sessionTotal and match work
 
       await fetch(`${baseUrl}/v1/config`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ enabled: false }),
       });
       const disabledAll = await (
@@ -685,7 +686,7 @@ test('TurnStore & HTTP server separate per-turn from sessionTotal and match work
 
       await fetch(`${baseUrl}/v1/config`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ enabled: true, tools: { cursor: true } }),
       });
       const restoredCursor = await (
@@ -1749,7 +1750,7 @@ test('TurnStore.getUsageSummary & /v1/usage aggregate today, 7d, byTool, byModel
     const cfgInlineOff = await (
       await fetch(`${baseUrl}/v1/config`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-atm-token': meter.authToken },
         body: JSON.stringify({ inlineTools: { antigravity: false } }),
       })
     ).json();
@@ -1760,7 +1761,7 @@ test('TurnStore.getUsageSummary & /v1/usage aggregate today, 7d, byTool, byModel
 
     await fetch(`${baseUrl}/v1/config`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-atm-token': meter.authToken },
       body: JSON.stringify({ inlineTools: { antigravity: true } }),
     });
     const matchOn = await (await fetch(`${baseUrl}/v1/match?tool=antigravity`)).json();
@@ -2010,7 +2011,7 @@ test('Codex adapter filters third-party proxy models, recovers superseded turns,
 
     await fetch(`${baseUrl}/v1/config`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-atm-token': meter.authToken },
       body: JSON.stringify({ tools: { codebuddy: false } }),
     });
 
@@ -2133,7 +2134,7 @@ test('parseCursorQuotaSummary splits Cursor dual-pool model quotas cleanly and s
   try {
     const res = await fetch(`http://127.0.0.1:${addr.port}/v1/config`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-atm-token': meter.authToken },
       body: JSON.stringify({ cursorCookie: 'WorkosCursorSessionToken=user_1::tok' }),
     });
     assert.equal(res.status, 200);
@@ -2477,7 +2478,7 @@ test('parseCursorQuotaSummary supports unified weekly Sand pool and v2/usage-sta
   const tmpHome = mkdtempSync(join(tmpdir(), 'atm-cursor-cand-'));
   try {
     mkdirSync(join(tmpHome, '.config', 'cursor'), { recursive: true });
-    const jwt = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: 'auth0|user_agent_99', exp: Math.floor((nowMs + 86400_000) / 1000) })).toString('base64url')}.sig`;
+    const jwt = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: 'auth0|user_agent_99', exp: Math.floor((Date.now() + 86400_000) / 1000) })).toString('base64url')}.sig`;
     writeFileSync(join(tmpHome, '.config', 'cursor', 'auth.json'), JSON.stringify({ accessToken: jwt }));
     const res = await resolveCursorCookieCandidates({
       cursorCookie: 'WorkosCursorSessionToken=stale_user%3A%3Astale_tok',

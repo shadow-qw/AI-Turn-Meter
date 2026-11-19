@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { dirname, join } from 'node:path';
 import { URL } from 'node:url';
@@ -7,6 +7,12 @@ import { CodexAdapter } from './adapters/codex.mjs';
 import { AntigravityAdapter } from './adapters/antigravity.mjs';
 import { CodeBuddyAdapter } from './adapters/codebuddy.mjs';
 import { drainCursorSpool, processCursorHookPayload, syncCursorHistoryEvents } from './adapters/cursor.mjs';
+import { inspectAppsStatusAsync } from './apps.mjs';
+import {
+  loadOrCreateDaemonToken,
+  validateLocalRequest,
+  verifyDaemonToken,
+} from './auth.mjs';
 import { CdpInlineInjector } from './cdp-injector.mjs';
 import {
   analyzePassiveTelemetry,
@@ -18,12 +24,23 @@ import {
   sanitizeEndpoint,
   scoreManualProbeResponse,
 } from './fingerprint.mjs';
-import { getPackageMeta } from './installer.mjs';
+import { CURSOR_EVENTS, getPackageMeta } from './installer.mjs';
 import { fetchCursorQuota, getAllQuotas } from './quota.mjs';
 import { renderReceiptAscii, renderReceiptSvg } from './receipt.mjs';
 import { TurnStore } from './store.mjs';
 
 const TOOL_KEYS = ['antigravity', 'codex', 'cursor', 'codebuddy'];
+const CURSOR_EVENT_SET = new Set(CURSOR_EVENTS);
+const PROTECTED_ROUTES = new Set([
+  'POST /v1/config',
+  'POST /v1/cursor/sync-local',
+  'GET /v1/fingerprint/overview',
+  'POST /v1/fingerprint/endpoints',
+  'DELETE /v1/fingerprint/endpoints',
+  'DELETE /v1/fingerprint/baselines',
+  'POST /v1/fingerprint/run',
+  'POST /v1/ingest',
+]);
 
 function loadMeterConfig(configPath) {
   const defaults = {
@@ -35,6 +52,9 @@ function loadMeterConfig(configPath) {
     fingerprintEndpoints: [],
   };
   if (!configPath || !existsSync(configPath)) return defaults;
+  try {
+    chmodSync(configPath, 0o600);
+  } catch {}
   try {
     const raw = JSON.parse(readFileSync(configPath, 'utf8'));
     const tools = { ...defaults.tools };
@@ -87,6 +107,8 @@ export function createMeterServer({
   port = Number(process.env.AI_TURN_METER_PORT || 47831),
   dbPath,
   stateDir,
+  authToken = null,
+  requireAuthToken = true,
   enableWatchers = true,
   enableCdp = process.env.AI_TURN_METER_DISABLE_CDP !== '1',
   enableAntigravityRpc = true,
@@ -96,6 +118,7 @@ export function createMeterServer({
   const effectiveDbPath = dbPath !== undefined ? dbPath : store.dbPath;
   const hookStateDir =
     stateDir || (effectiveDbPath && effectiveDbPath !== ':memory:' ? dirname(effectiveDbPath) : undefined);
+  const effectiveToken = authToken || loadOrCreateDaemonToken(hookStateDir);
   const configPath = hookStateDir ? join(hookStateDir, 'config.json') : null;
   let config = loadMeterConfig(configPath);
   /** @type {Set<http.ServerResponse>} */
@@ -116,7 +139,12 @@ export function createMeterServer({
   function persistConfig() {
     if (!configPath) return;
     mkdirSync(dirname(configPath), { recursive: true });
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+    const tmpPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
+    writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmpPath, configPath);
+    try {
+      chmodSync(configPath, 0o600);
+    } catch {}
   }
 
   function broadcast(event, data) {
@@ -173,30 +201,80 @@ export function createMeterServer({
     return cursorSyncInflight;
   }
 
-  const codexAdapter = new CodexAdapter({ store, onTurns: onTurnsChanged });
+  const codexAdapter = new CodexAdapter({
+    store,
+    onTurns: onTurnsChanged,
+    isEnabled: () => isToolEnabled('codex'),
+  });
   const antigravityAdapter = new AntigravityAdapter({
     store,
     onTurns: onTurnsChanged,
     enableRpc: enableAntigravityRpc,
+    isEnabled: () => isToolEnabled('antigravity'),
   });
-  const codeBuddyAdapter = new CodeBuddyAdapter({ store, onTurns: onTurnsChanged });
+  const codeBuddyAdapter = new CodeBuddyAdapter({
+    store,
+    onTurns: onTurnsChanged,
+    isEnabled: () => isToolEnabled('codebuddy'),
+  });
 
   if (enableCdp) {
     cdpInjector = new CdpInlineInjector({
       shouldPushTool: (tool) => isInlineEnabled(tool),
       getTurnsForTool: (tool) => {
-        const recent = store.getRecentTurns(60, tool);
         if (tool === 'antigravity') {
-          return recent.filter((t) => t.host !== 'antigravity-subagent');
+          return store.getRecentTurns(60, tool, { excludeHosts: ['antigravity-subagent'] });
         }
-        return recent;
+        if (tool === 'cursor') {
+          return store.getRecentTurns(60, tool, { excludeHosts: ['cursor-cloud'] });
+        }
+        return store.getRecentTurns(60, tool);
       },
     });
   }
 
+  let appSnapshotCache = { atMs: 0, apps: null, inflight: null };
+  async function getCachedAppsStatus(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && appSnapshotCache.apps && now - appSnapshotCache.atMs < 5000) {
+      return appSnapshotCache.apps;
+    }
+    if (!forceRefresh && appSnapshotCache.inflight) {
+      return appSnapshotCache.inflight;
+    }
+    appSnapshotCache.inflight = inspectAppsStatusAsync({ allowMdfind: false })
+      .then((apps) => {
+        appSnapshotCache.apps = apps;
+        appSnapshotCache.atMs = Date.now();
+        return apps;
+      })
+      .finally(() => {
+        appSnapshotCache.inflight = null;
+      });
+    return appSnapshotCache.inflight;
+  }
+
   const server = http.createServer((req, res) => {
+    const localCheck = validateLocalRequest(req);
+    if (!localCheck.ok) {
+      res.writeHead(localCheck.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: localCheck.error }));
+      return;
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'options forbidden' }));
+      return;
+    }
+
     const url = new URL(req.url || '/', `http://127.0.0.1:${port}`);
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (requireAuthToken && PROTECTED_ROUTES.has(`${req.method} ${url.pathname}`)) {
+      if (!verifyDaemonToken(req, effectiveToken)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+        return;
+      }
+    }
 
     if (req.method === 'GET' && url.pathname === '/health') {
       const meta = getPackageMeta();
@@ -209,6 +287,41 @@ export function createMeterServer({
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ...store.getState(limit, config.tools), config: publicConfig(config) }));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/apps') {
+      const forceRefresh = url.searchParams.get('refresh') === '1';
+      const meta = getPackageMeta();
+      const listeningPort = server.address()?.port || port;
+      getCachedAppsStatus(forceRefresh)
+        .then((baseApps) => {
+          const state = { ...store.getState(30, config.tools), config: publicConfig(config) };
+          const apps = {};
+          for (const [k, entry] of Object.entries(baseApps)) {
+            apps[k] = {
+              ...entry,
+              latestTurn: state.byTool?.[k] || null,
+            };
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              version: meta.version,
+              port: listeningPort,
+              online: true,
+              config: state.config,
+              apps,
+              state,
+            })
+          );
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'failed to inspect apps' }));
+          }
+        });
       return;
     }
 
@@ -266,38 +379,45 @@ export function createMeterServer({
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/receipt') {
-      const date = url.searchParams.get('date') || null;
-      const scope = url.searchParams.get('scope') || 'day';
-      const tool = url.searchParams.get('tool') || null;
-      const groupBy = url.searchParams.get('groupBy') || 'model';
-      const format = (url.searchParams.get('format') || 'json').toLowerCase();
-      const theme = url.searchParams.get('theme') === 'dark' ? 'dark' : 'paper';
-      const currency = url.searchParams.get('currency') || 'both';
-      const rateRaw = Number(url.searchParams.get('rate'));
-      const usdToCny = Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 7;
-      const hideProjects = url.searchParams.get('hideProjects') === '1' || url.searchParams.get('hideProjects') === 'true';
-      const punchlineIndex = Number(url.searchParams.get('punchline')) || 0;
+      try {
+        const date = url.searchParams.get('date') || null;
+        const scope = url.searchParams.get('scope') || 'day';
+        const tool = url.searchParams.get('tool') || null;
+        const groupBy = url.searchParams.get('groupBy') || 'model';
+        const format = (url.searchParams.get('format') || 'json').toLowerCase();
+        const theme = url.searchParams.get('theme') === 'dark' ? 'dark' : 'paper';
+        const currency = url.searchParams.get('currency') || 'both';
+        const rateRaw = Number(url.searchParams.get('rate'));
+        const usdToCny = Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 7;
+        const hideProjects = url.searchParams.get('hideProjects') === '1' || url.searchParams.get('hideProjects') === 'true';
+        const punchlineIndex = Number(url.searchParams.get('punchline')) || 0;
 
-      const receipt = store.getReceiptData({
-        date,
-        scope,
-        tool,
-        groupBy,
-        enabledTools: config.tools,
-      });
+        const receipt = store.getReceiptData({
+          date,
+          scope,
+          tool,
+          groupBy,
+          enabledTools: config.tools,
+        });
 
-      if (format === 'ascii' || format === 'text') {
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end(renderReceiptAscii(receipt, { currency, usdToCny, hideProjects, punchlineIndex }));
-        return;
+        if (format === 'ascii' || format === 'text') {
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end(renderReceiptAscii(receipt, { currency, usdToCny, hideProjects, punchlineIndex }));
+          return;
+        }
+        if (format === 'svg') {
+          res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8' });
+          res.end(renderReceiptSvg(receipt, { theme, currency, usdToCny, hideProjects, punchlineIndex }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(receipt));
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err?.message || 'receipt generation failed' }));
+        }
       }
-      if (format === 'svg') {
-        res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8' });
-        res.end(renderReceiptSvg(receipt, { theme, currency, usdToCny, hideProjects, punchlineIndex }));
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(receipt));
       return;
     }
 
@@ -413,16 +533,22 @@ export function createMeterServer({
         url.pathname === '/v1/fingerprint/run')
     ) {
       let body = '';
+      let aborted = false;
       req.setEncoding('utf8');
       req.on('data', (chunk) => {
+        if (aborted) return;
         body += chunk;
-        if (body.length > 1024 * 1024) {
-          res.writeHead(413);
-          res.end('Payload too large');
+        if (Buffer.byteLength(body, 'utf8') > 1024 * 1024) {
+          aborted = true;
+          if (!res.headersSent) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Payload too large' }));
+          }
           req.destroy();
         }
       });
       req.on('end', () => {
+        if (aborted) return;
         try {
           const payload = body.trim() ? JSON.parse(body) : {};
           if (url.pathname === '/v1/fingerprint/endpoints') {
@@ -578,7 +704,9 @@ export function createMeterServer({
                 let replyText = typeof payload?.replyText === 'string' ? payload.replyText.trim() : '';
                 let model = typeof payload?.model === 'string' && payload.model.trim() ? payload.model.trim() : 'unknown';
                 if (!replyText) {
-                  const latest = store.getRecentTurns(5, tool).find((t) => t.replyPreview);
+                  const latest = store
+                    .getRecentTurns(5, tool, { excludeHosts: ['cursor-cloud', 'antigravity-subagent'] })
+                    .find((t) => t.replyPreview);
                   if (latest) {
                     replyText = latest.replyPreview || '';
                     if (model === 'unknown' && latest.model) model = latest.model;
@@ -711,6 +839,8 @@ export function createMeterServer({
           }
           if (url.pathname === '/v1/config') {
             const prevInline = Object.fromEntries(TOOL_KEYS.map((k) => [k, isInlineEnabled(k)]));
+            const prevTools = { ...config.tools };
+            const prevEnabled = config.enabled;
             let refreshQuota = false;
             if (typeof payload?.enabled === 'boolean') config.enabled = payload.enabled;
             if (payload?.tools && typeof payload.tools === 'object') {
@@ -742,8 +872,24 @@ export function createMeterServer({
                 else if (!was && now) cdpInjector.pushAll({ force: true, tools: [k] }).catch(() => {});
               }
             }
+            if (enableWatchers && config.enabled) {
+              const becameEnabled = (k) => (!prevEnabled && config.tools[k] !== false) || (prevTools[k] === false && config.tools[k] !== false);
+              if (becameEnabled('codex')) {
+                try { codexAdapter.scan({ maxRecentFiles: 12 }); } catch {}
+              }
+              if (becameEnabled('antigravity')) {
+                antigravityAdapter.scan({ maxRecentFiles: 8 }).catch(() => {});
+              }
+              if (becameEnabled('codebuddy')) {
+                try { codeBuddyAdapter.scan({ maxRecent: 10 }); } catch {}
+              }
+            }
             if (refreshQuota && enableQuotaProbe) {
-              getAllQuotas(Date.now(), { forceRefresh: true, cursorCookie: config.cursorCookie }).catch(() => {});
+              getAllQuotas(Date.now(), {
+                forceRefresh: true,
+                cursorCookie: config.cursorCookie,
+                enabledTools: config.tools,
+              }).catch(() => {});
               triggerCursorHistorySync({ force: true });
             } else if (payload?.tools?.cursor === true) {
               triggerCursorHistorySync({ force: false });
@@ -755,6 +901,12 @@ export function createMeterServer({
 
           let turn = payload;
           if (url.pathname === '/v1/ingest/cursor-hook') {
+            const evName = payload?.hook_event_name || payload?.event;
+            if (typeof evName !== 'string' || !CURSOR_EVENT_SET.has(evName)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'invalid cursor hook event' }));
+              return;
+            }
             turn = processCursorHookPayload(payload, hookStateDir ? { stateDir: hookStateDir } : undefined);
             if (!turn) {
               res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -807,7 +959,10 @@ export function createMeterServer({
     }
     cdpInjector?.start();
     if (enableQuotaProbe) {
-      getAllQuotas().catch(() => {});
+      getAllQuotas(Date.now(), {
+        cursorCookie: config.cursorCookie,
+        enabledTools: config.tools,
+      }).catch(() => {});
       cursorInitialSyncTimer = setTimeout(() => {
         cursorInitialSyncTimer = null;
         triggerCursorHistorySync({ force: true });
@@ -842,5 +997,14 @@ export function createMeterServer({
     store.close();
   }
 
-  return { server, store, start, stop, codexAdapter, antigravityAdapter, codeBuddyAdapter };
+  return {
+    server,
+    store,
+    authToken: effectiveToken,
+    start,
+    stop,
+    codexAdapter,
+    antigravityAdapter,
+    codeBuddyAdapter,
+  };
 }

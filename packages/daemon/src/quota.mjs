@@ -1,24 +1,29 @@
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
-import { execFile } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 import { zstdDecompressSync } from 'node:zlib';
+import { discoverAntigravityLanguageServers } from './adapters/antigravity.mjs';
+import {
+  httpRequestJson,
+  parseSystemProxyInfo,
+  resetNetProxyCacheForTests,
+  resolveAppHelperBin,
+  runProcessWithStdin,
+} from './net.mjs';
 
-const execFileAsync = promisify(execFile);
+export { httpRequestJson, parseSystemProxyInfo };
 
 const CACHE_TTL_MS = 45_000;
 const ERROR_RETRY_TTL_MS = 5_000;
 const STALE_GRACE_MS = 15 * 60 * 1000;
-const PROXY_CACHE_TTL_MS = 15_000;
 
 let cachedResult = null;
 let cachedAtMs = 0;
-let cachedCookieKey = '';
+let cachedCacheKey = '';
 let cachedTtlMs = CACHE_TTL_MS;
 let inflightPromise = null;
 let lastGoodByTool = {
@@ -26,258 +31,15 @@ let lastGoodByTool = {
   cursor: null,
   antigravity: null,
 };
-let cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
 
 export function resetQuotaCacheForTests() {
   cachedResult = null;
   cachedAtMs = 0;
-  cachedCookieKey = '';
+  cachedCacheKey = '';
   cachedTtlMs = CACHE_TTL_MS;
   inflightPromise = null;
   lastGoodByTool = { codex: null, cursor: null, antigravity: null };
-  cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
-}
-
-export function parseSystemProxyInfo(scutilOutput = '', env = process.env) {
-  const envProxy =
-    env.HTTPS_PROXY ||
-    env.https_proxy ||
-    env.ALL_PROXY ||
-    env.all_proxy ||
-    env.HTTP_PROXY ||
-    env.http_proxy ||
-    null;
-
-  const text = String(scutilOutput || '');
-  const getBool = (key) => new RegExp(`\\b${key}\\s*:\\s*1\\b`).test(text);
-  const getVal = (key) => {
-    const m = text.match(new RegExp(`\\b${key}\\s*:\\s*([^\\s\\n]+)`));
-    return m?.[1] || null;
-  };
-
-  const httpEnabled = getBool('HTTPEnable');
-  const httpsEnabled = getBool('HTTPSEnable');
-  const socksEnabled = getBool('SOCKSEnable');
-  const pacEnabled = getBool('ProxyAutoConfigEnable') || getBool('ProxyAutoDiscoveryEnable');
-  const hasSystemProxy = Boolean(envProxy || httpEnabled || httpsEnabled || socksEnabled || pacEnabled);
-
-  let fallbackProxyUrl = envProxy ? String(envProxy).trim() : null;
-  if (!fallbackProxyUrl && httpsEnabled) {
-    const host = getVal('HTTPSProxy');
-    const port = getVal('HTTPSPort');
-    if (host && port) fallbackProxyUrl = `http://${host}:${port}`;
-  }
-  if (!fallbackProxyUrl && httpEnabled) {
-    const host = getVal('HTTPProxy');
-    const port = getVal('HTTPPort');
-    if (host && port) fallbackProxyUrl = `http://${host}:${port}`;
-  }
-  if (!fallbackProxyUrl && socksEnabled) {
-    const host = getVal('SOCKSProxy');
-    const port = getVal('SOCKSPort');
-    if (host && port) fallbackProxyUrl = `socks5h://${host}:${port}`;
-  }
-
-  return { hasSystemProxy, fallbackProxyUrl };
-}
-
-function resolveAppHelperBin() {
-  if (process.env.AI_TURN_METER_DISABLE_NATIVE_NET === '1' || process.env.NODE_TEST_CONTEXT) {
-    return null;
-  }
-  const candidates = [];
-  if (process.env.AI_TURN_METER_HELPER_BIN) {
-    candidates.push(process.env.AI_TURN_METER_HELPER_BIN);
-  }
-  if (process.env.AI_TURN_METER_STABLE_ROOT) {
-    candidates.push(join(process.env.AI_TURN_METER_STABLE_ROOT, '..', '..', 'MacOS', 'AITurnMeter'));
-  }
-  try {
-    const srcDir = dirname(fileURLToPath(import.meta.url));
-    candidates.push(join(srcDir, '..', '..', '..', '..', 'MacOS', 'AITurnMeter'));
-  } catch {}
-  candidates.push('/Applications/AI Turn Meter.app/Contents/MacOS/AITurnMeter');
-  candidates.push(join(homedir(), 'Applications', 'AI Turn Meter.app', 'Contents', 'MacOS', 'AITurnMeter'));
-  for (const p of candidates) {
-    try {
-      if (p && existsSync(p)) return p;
-    } catch {}
-  }
-  return null;
-}
-
-async function getProxyState(nowMs = Date.now()) {
-  if (process.env.AI_TURN_METER_DISABLE_NATIVE_NET === '1' || process.env.NODE_TEST_CONTEXT) {
-    return parseSystemProxyInfo('', process.env);
-  }
-  if (nowMs - cachedProxyState.checkedAt < PROXY_CACHE_TTL_MS) {
-    return cachedProxyState;
-  }
-  let scutilOut = '';
-  if (process.platform === 'darwin') {
-    try {
-      const { stdout } = await execFileAsync('/usr/sbin/scutil', ['--proxy'], { timeout: 1000 });
-      scutilOut = stdout || '';
-    } catch {}
-  }
-  const parsed = parseSystemProxyInfo(scutilOut, process.env);
-  cachedProxyState = { checkedAt: nowMs, ...parsed };
-  return cachedProxyState;
-}
-
-function runProcessWithStdin(bin, args, inputStr, timeoutMs) {
-  return new Promise((resolve) => {
-    const child = execFile(
-      bin,
-      args,
-      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
-      (err, stdout) => {
-        if (err) {
-          resolve({ ok: false, stdout: stdout || '', error: err.message });
-          return;
-        }
-        resolve({ ok: true, stdout: stdout || '' });
-      }
-    );
-    if (child.stdin) {
-      child.stdin.on('error', () => {});
-      child.stdin.end(inputStr || '');
-    }
-  });
-}
-
-async function nativeUrlSessionFetchJson(helperBin, url, { method = 'GET', headers = {}, body = null, timeoutMs = 8000 }) {
-  const payload = JSON.stringify({
-    url,
-    method,
-    headers,
-    body: body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
-    timeoutMs,
-  });
-  const res = await runProcessWithStdin(helperBin, ['--net-fetch-json'], payload, timeoutMs + 3000);
-  if (!res.ok || !res.stdout.trim()) {
-    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: res.error || 'native helper failed' };
-  }
-  try {
-    const out = JSON.parse(res.stdout);
-    const status = typeof out.status === 'number' ? out.status : null;
-    if (!status) {
-      return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: out.error || 'network error' };
-    }
-    if (status === 401 || status === 403) {
-      return { ok: false, status, data: null, errorKind: 'unauthorized', errorMessage: `HTTP ${status}` };
-    }
-    if (status < 200 || status >= 300) {
-      return { ok: false, status, data: null, errorKind: 'http', errorMessage: `HTTP ${status}` };
-    }
-    try {
-      return { ok: true, status, data: out.body ? JSON.parse(out.body) : null, errorKind: 'ok', errorMessage: null };
-    } catch {
-      return { ok: false, status, data: null, errorKind: 'parse', errorMessage: 'invalid json' };
-    }
-  } catch (e) {
-    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: e?.message || 'native parse error' };
-  }
-}
-
-async function curlFetchJson(url, { method = 'GET', headers = {}, body = null, timeoutMs = 8000, proxyUrl = null }) {
-  if (!existsSync('/usr/bin/curl')) {
-    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: 'curl unavailable' };
-  }
-  const args = [
-    '-sS',
-    '--max-time',
-    String(Math.max(2, Math.ceil(timeoutMs / 1000))),
-    '-X',
-    method,
-    '-w',
-    '\n__ATM_HTTP:%{http_code}',
-  ];
-  if (proxyUrl) {
-    args.push('--proxy', proxyUrl);
-  }
-  for (const [k, v] of Object.entries(headers || {})) {
-    if (v !== undefined && v !== null) args.push('-H', `${k}: ${v}`);
-  }
-  const bodyStr = body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
-  if (bodyStr !== null) {
-    args.push('--data-binary', '@-');
-  }
-  args.push(url);
-
-  const res = await runProcessWithStdin('/usr/bin/curl', args, bodyStr || '', timeoutMs + 2500);
-  if (!res.ok) {
-    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: res.error || 'curl error' };
-  }
-  const marker = '\n__ATM_HTTP:';
-  const idx = res.stdout.lastIndexOf(marker);
-  if (idx === -1) {
-    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: 'curl no status' };
-  }
-  const bodyOut = res.stdout.slice(0, idx);
-  const status = Number(res.stdout.slice(idx + marker.length).trim()) || null;
-  if (!status) {
-    return { ok: false, status: null, data: null, errorKind: 'network', errorMessage: 'curl status 0' };
-  }
-  if (status === 401 || status === 403) {
-    return { ok: false, status, data: null, errorKind: 'unauthorized', errorMessage: `HTTP ${status}` };
-  }
-  if (status < 200 || status >= 300) {
-    return { ok: false, status, data: null, errorKind: 'http', errorMessage: `HTTP ${status}` };
-  }
-  try {
-    return { ok: true, status, data: bodyOut ? JSON.parse(bodyOut) : null, errorKind: 'ok', errorMessage: null };
-  } catch {
-    return { ok: false, status, data: null, errorKind: 'parse', errorMessage: 'invalid json' };
-  }
-}
-
-export async function httpRequestJson(
-  url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000 } = {}
-) {
-  const helperBin = resolveAppHelperBin();
-  const proxyState = await getProxyState();
-  const bodyStr = body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined;
-
-  if (helperBin && proxyState.hasSystemProxy) {
-    return nativeUrlSessionFetchJson(helperBin, url, { method, headers, body: bodyStr ?? null, timeoutMs });
-  }
-
-  try {
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: bodyStr,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (res.status === 401 || res.status === 403) {
-      return { ok: false, status: res.status, data: null, errorKind: 'unauthorized', errorMessage: `HTTP ${res.status}` };
-    }
-    if (!res.ok) {
-      return { ok: false, status: res.status, data: null, errorKind: 'http', errorMessage: `HTTP ${res.status}` };
-    }
-    try {
-      const data = await res.json();
-      return { ok: true, status: res.status, data, errorKind: 'ok', errorMessage: null };
-    } catch {
-      return { ok: false, status: res.status, data: null, errorKind: 'parse', errorMessage: 'invalid json' };
-    }
-  } catch (err) {
-    if (helperBin) {
-      return nativeUrlSessionFetchJson(helperBin, url, { method, headers, body: bodyStr ?? null, timeoutMs });
-    }
-    if (proxyState.fallbackProxyUrl) {
-      return curlFetchJson(url, { method, headers, body: bodyStr ?? null, timeoutMs, proxyUrl: proxyState.fallbackProxyUrl });
-    }
-    return {
-      ok: false,
-      status: null,
-      data: null,
-      errorKind: 'network',
-      errorMessage: err?.cause?.code || err?.message || 'fetch failed',
-    };
-  }
+  resetNetProxyCacheForTests();
 }
 
 function clampPct(v) {
@@ -746,12 +508,13 @@ export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true 
   }
 }
 
-function postLocalLsJson(port, csrf, path) {
+function postLocalLsJson(port, csrf, path, useHttps = true) {
   return new Promise((resolve, reject) => {
+    const mod = useHttps ? https : http;
     const body = JSON.stringify({
       metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
     });
-    const req = https.request(
+    const req = mod.request(
       {
         hostname: '127.0.0.1',
         port,
@@ -792,55 +555,35 @@ function parseIsoMs(str) {
 export async function fetchAntigravityQuota(nowMs = Date.now()) {
   const empty = { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null };
   try {
-    const { stdout: psOut } = await execFileAsync('/bin/ps', ['-ax', '-o', 'pid=,command='], {
-      timeout: 2000,
-    });
-    const lsLines = psOut
-      .split('\n')
-      .filter((l) => l.includes('language_server') && l.includes('csrf_token'));
-    if (lsLines.length === 0) return empty;
+    const servers = await discoverAntigravityLanguageServers();
+    if (!servers || servers.length === 0) return empty;
 
-    for (const line of lsLines.slice(0, 3)) {
-      const mPid = line.trim().match(/^(\d+)\s+/);
-      const mCsrf = line.match(/--csrf_token[=\s]+([^\s]+)/);
-      if (!mPid || !mCsrf) continue;
-      const pid = mPid[1];
-      const csrf = mCsrf[1];
-
-      let lsofOut = '';
-      try {
-        ({ stdout: lsofOut } = await execFileAsync(
-          '/usr/sbin/lsof',
-          ['-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', pid],
-          { timeout: 2000 }
-        ));
-      } catch {
-        continue;
-      }
-
-      const ports = [...new Set([...lsofOut.matchAll(/:(\d+)\s+\(LISTEN\)/g)].map((m) => Number(m[1])))];
-      for (const port of ports) {
-        try {
-          const uRes = await postLocalLsJson(
-            port,
-            csrf,
-            '/exa.language_server_pb.LanguageServerService/GetUserStatus'
-          );
-          if (uRes.status !== 200) continue;
-          const uJson = JSON.parse(uRes.body);
-          const us = uJson?.userStatus;
-          if (!us) continue;
-
-          const accountEmail = us.email || null;
-          const planTitle = us.userTier?.name || us.planStatus?.planInfo?.planName || null;
-
-          let quotaWindows = [];
+    for (const srv of servers.slice(0, 3)) {
+      for (const port of srv.ports) {
+        for (const useHttps of [true, false]) {
           try {
-            const qRes = await postLocalLsJson(
+            const uRes = await postLocalLsJson(
               port,
-              csrf,
-              '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary'
+              srv.csrf,
+              '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+              useHttps
             );
+            if (uRes.status !== 200) continue;
+            const uJson = JSON.parse(uRes.body);
+            const us = uJson?.userStatus;
+            if (!us) continue;
+
+            const accountEmail = us.email || null;
+            const planTitle = us.userTier?.name || us.planStatus?.planInfo?.planName || null;
+
+            let quotaWindows = [];
+            try {
+              const qRes = await postLocalLsJson(
+                port,
+                srv.csrf,
+                '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary',
+                useHttps
+              );
             if (qRes.status === 200) {
               const qJson = JSON.parse(qRes.body);
               const groups = qJson?.response?.groups || qJson?.groups || [];
@@ -940,8 +683,9 @@ export async function fetchAntigravityQuota(nowMs = Date.now()) {
             }
           }
 
-          return { accountEmail, planTitle, quotaWindows, resetCreditsText: null };
-        } catch {}
+            return { accountEmail, planTitle, quotaWindows, resetCreditsText: null };
+          } catch {}
+        }
       }
     }
   } catch {}
@@ -1766,30 +1510,40 @@ export async function getAllQuotas(
   nowMs = Date.now(),
   { forceRefresh = false, allowNetwork = true, cursorCookie = null, enabledTools = null } = {}
 ) {
+  const isEnabled = (k) => !enabledTools || enabledTools[k] !== false;
+  const enabledKey = ['codex', 'antigravity', 'cursor', 'codebuddy']
+    .map((k) => (isEnabled(k) ? '1' : '0'))
+    .join('');
   const cookieKey = cursorCookie ? String(cursorCookie).trim() : '';
-  if (!forceRefresh && cachedResult && cachedCookieKey === cookieKey && nowMs - cachedAtMs < cachedTtlMs) {
+  const cacheKey = `${cookieKey}|${enabledKey}`;
+
+  if (!forceRefresh && cachedResult && cachedCacheKey === cacheKey && nowMs - cachedAtMs < cachedTtlMs) {
     return assembleAllQuotas(cachedResult, enabledTools);
   }
-  if (!forceRefresh && inflightPromise && cachedCookieKey === cookieKey) {
+  if (!forceRefresh && inflightPromise && cachedCacheKey === cacheKey) {
     const raw = await inflightPromise;
     return assembleAllQuotas(raw, enabledTools);
   }
-  cachedCookieKey = cookieKey;
+  cachedCacheKey = cacheKey;
+
+  const emptySnap = () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null });
 
   inflightPromise = (async () => {
     const [codexRaw, antigravityRaw, cursorRaw] = await Promise.all([
-      fetchCodexQuota(nowMs, { allowNetwork }),
-      fetchAntigravityQuota(nowMs),
-      fetchCursorQuota(nowMs, { allowNetwork, cursorCookie }),
+      isEnabled('codex') ? fetchCodexQuota(nowMs, { allowNetwork }) : Promise.resolve(emptySnap()),
+      isEnabled('antigravity') ? fetchAntigravityQuota(nowMs) : Promise.resolve(emptySnap()),
+      isEnabled('cursor') ? fetchCursorQuota(nowMs, { allowNetwork, cursorCookie }) : Promise.resolve(emptySnap()),
     ]);
-    const codebuddy = fetchCodeBuddyQuota();
-    const codex = reconcileWithStaleGrace('codex', codexRaw, nowMs);
-    const antigravity = reconcileWithStaleGrace('antigravity', antigravityRaw, nowMs);
-    const cursor = reconcileWithStaleGrace('cursor', cursorRaw, nowMs);
+    const codebuddy = isEnabled('codebuddy') ? fetchCodeBuddyQuota() : emptySnap();
+    const codex = isEnabled('codex') ? reconcileWithStaleGrace('codex', codexRaw, nowMs) : emptySnap();
+    const antigravity = isEnabled('antigravity')
+      ? reconcileWithStaleGrace('antigravity', antigravityRaw, nowMs)
+      : emptySnap();
+    const cursor = isEnabled('cursor') ? reconcileWithStaleGrace('cursor', cursorRaw, nowMs) : emptySnap();
 
     const anyTransientFailure = Boolean(
-      (codexRaw?._errorKind === 'network' && !codexRaw.quotaWindows?.length) ||
-        (cursorRaw?._errorKind === 'network' && !cursorRaw.quotaWindows?.length)
+      (isEnabled('codex') && codexRaw?._errorKind === 'network' && !codexRaw.quotaWindows?.length) ||
+        (isEnabled('cursor') && cursorRaw?._errorKind === 'network' && !cursorRaw.quotaWindows?.length)
     );
     cachedTtlMs = anyTransientFailure ? ERROR_RETRY_TTL_MS : CACHE_TTL_MS;
 

@@ -9,7 +9,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,7 +23,7 @@ execFileSync(process.execPath, [join(ROOT, 'scripts', 'package-vsix.mjs')], { st
 const distDir = join(ROOT, 'dist');
 mkdirSync(distDir, { recursive: true });
 for (const f of readdirSync(distDir)) {
-  if (/^ai-turn-meter-.*\.tar\.gz$/.test(f)) {
+  if (/^ai-turn-meter-.*\.tar\.gz(\.sha256)?$/.test(f)) {
     rmSync(join(distDir, f), { force: true });
   }
 }
@@ -36,7 +36,17 @@ rmSync(stageRoot, { recursive: true, force: true });
 mkdirSync(join(stagePkg, 'dist'), { recursive: true });
 
 for (const item of ['package.json', 'README.md', 'packages', 'scripts']) {
-  cpSync(join(ROOT, item), join(stagePkg, item), { recursive: true });
+  cpSync(join(ROOT, item), join(stagePkg, item), {
+    recursive: true,
+    filter: (src) => {
+      const normalized = src.replace(/\\/g, '/');
+      return (
+        !normalized.includes('/.build') &&
+        !normalized.includes('/.swiftpm') &&
+        !normalized.endsWith('/.DS_Store')
+      );
+    },
+  });
 }
 cpSync(join(distDir, 'ai-turn-meter.vsix'), join(stagePkg, 'dist', 'ai-turn-meter.vsix'));
 
@@ -47,6 +57,7 @@ execFileSync('tar', ['-czf', outTarball, '-C', stageRoot, folderName], {
 rmSync(stageRoot, { recursive: true, force: true });
 
 const sha256 = createHash('sha256').update(readFileSync(outTarball)).digest('hex');
+writeFileSync(`${outTarball}.sha256`, `${sha256}  ${basename(outTarball)}\n`);
 
 const formulaPath = join(ROOT, 'packaging', 'homebrew', 'ai-turn-meter.rb');
 let rb = readFileSync(formulaPath, 'utf8');

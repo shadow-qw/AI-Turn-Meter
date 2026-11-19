@@ -813,7 +813,7 @@ export class CdpInlineInjector {
     this.getTurnsForTool = getTurnsForTool;
     this.shouldPushTool = shouldPushTool;
     this.timer = null;
-    this.lastPushedByTool = new Map();
+    this.lastPushedByTarget = new Map();
     this.runtimeSource = buildInjectedRuntimeSource();
   }
 
@@ -902,10 +902,12 @@ export class CdpInlineInjector {
     }
     let turns = [];
     if (typeof this.getTurnsForTool === 'function') {
-      turns = (this.getTurnsForTool(spec.tool) || []).filter(Boolean);
+      turns = (this.getTurnsForTool(spec.tool) || []).filter(
+        (t) => t && t.host !== 'cursor-cloud' && t.host !== 'antigravity-subagent'
+      );
     } else if (typeof this.getTurnForTool === 'function') {
       const one = this.getTurnForTool(spec.tool);
-      if (one) turns = [one];
+      if (one && one.host !== 'cursor-cloud' && one.host !== 'antigravity-subagent') turns = [one];
     }
     if (turns.length === 0) return false;
 
@@ -913,27 +915,52 @@ export class CdpInlineInjector {
       .slice(0, 16)
       .map((t) => `${t.turnUid}:${t.completedAtMs}:${t.tps}:${t.totalInputTokens}:${t.replyPreview || ''}`)
       .join('|');
-    if (!force && this.lastPushedByTool.get(spec.tool) === sig) return false;
 
     const port = this.resolvePort(spec);
     if (!port) return false;
     const targets = await this.findTargets(port);
+    const prefix = `${spec.tool}:`;
+    const activeKeys = new Set();
+    for (const target of targets) {
+      activeKeys.add(`${prefix}${target.id || target.webSocketDebuggerUrl}`);
+    }
+    for (const k of Array.from(this.lastPushedByTarget.keys())) {
+      if (k.startsWith(prefix) && !activeKeys.has(k)) {
+        this.lastPushedByTarget.delete(k);
+      }
+    }
     if (targets.length === 0) return false;
 
-    const payloadExpr = `${this.runtimeSource}\nwindow.__aiTurnMeterUpdateTurns(${JSON.stringify(turns)}, ${JSON.stringify(spec.tool)});`;
+    let payloadExpr = null;
     let anyOk = false;
     for (const target of targets) {
+      const targetKey = `${prefix}${target.id || target.webSocketDebuggerUrl}`;
+      const targetUrl = target.url || '';
+      const prev = this.lastPushedByTarget.get(targetKey);
+      if (!force && prev && prev.sig === sig && prev.url === targetUrl) {
+        continue;
+      }
+      if (!payloadExpr) {
+        payloadExpr = `${this.runtimeSource}\nwindow.__aiTurnMeterUpdateTurns(${JSON.stringify(turns)}, ${JSON.stringify(spec.tool)});`;
+      }
       const ok = await this.evaluateOnTarget(target.webSocketDebuggerUrl, payloadExpr);
-      if (ok) anyOk = true;
+      if (ok) {
+        this.lastPushedByTarget.set(targetKey, { sig, url: targetUrl });
+        anyOk = true;
+      }
     }
-    if (anyOk) this.lastPushedByTool.set(spec.tool, sig);
     return anyOk;
   }
 
   async clearTool(tool) {
     const spec = this.specs.find((s) => s.tool === tool);
     if (!spec) return false;
-    this.lastPushedByTool.delete(tool);
+    const prefix = `${tool}:`;
+    for (const k of Array.from(this.lastPushedByTarget.keys())) {
+      if (k.startsWith(prefix)) {
+        this.lastPushedByTarget.delete(k);
+      }
+    }
     const port = this.resolvePort(spec);
     if (!port) return false;
     const targets = await this.findTargets(port);

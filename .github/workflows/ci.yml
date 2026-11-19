@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Check version parity
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const ext = require("./packages/vscode-extension/package.json");
+            if (pkg.version !== ext.version) {
+              throw new Error(`Version mismatch: root=${pkg.version} vs vsix=${ext.version}`);
+            }
+          '
+
+      - name: Run Node & Swift tests
+        run: npm run test:all
+
+      - name: Build macOS release binary & package VSIX
+        run: |
+          npm run build:macos
+          npm run package:vsix
