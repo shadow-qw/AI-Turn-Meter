@@ -12,6 +12,7 @@ export const APP_SPECS = {
     bundleName: 'Antigravity.app',
     exeRelPath: 'Contents/MacOS/Antigravity',
     portFileRel: ['Library', 'Application Support', 'Antigravity', 'DevToolsActivePort'],
+    port: Number(process.env.AI_TURN_METER_ANTIGRAVITY_CDP_PORT || 47924),
   },
   codex: {
     key: 'codex',
@@ -162,16 +163,14 @@ export function isAppRunning(spec, processLines = null) {
 }
 
 export function readActivePort(spec, homeDir = homedir(), listeningPorts = null) {
-  if (spec.port) return isPortListening(spec.port, listeningPorts) ? spec.port : null;
   const portFile = spec.portFile || (spec.portFileRel ? join(homeDir, ...spec.portFileRel) : null);
   if (portFile && existsSync(portFile)) {
     try {
       const p = Number(readFileSync(portFile, 'utf8').trim().split(/\r?\n/)[0]);
-      return Number.isInteger(p) && isPortListening(p, listeningPorts) ? p : null;
-    } catch {
-      return null;
-    }
+      if (Number.isInteger(p) && isPortListening(p, listeningPorts)) return p;
+    } catch {}
   }
+  if (spec.port) return isPortListening(spec.port, listeningPorts) ? spec.port : null;
   return null;
 }
 

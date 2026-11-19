@@ -179,7 +179,7 @@ async function openSingleApp(target, { exitOnError = true } = {}) {
     return fail(`Not installed: ${spec.bundleName}`);
   }
   const activePort = readActivePort(spec);
-  if (target === 'antigravity' || (activePort && (await isCdpHttpReady(activePort)))) {
+  if (activePort && (await isCdpHttpReady(activePort))) {
     execFileSync('open', ['-a', spec.appPath]);
     console.log(`Focused ${spec.name}`);
     return true;
@@ -190,9 +190,15 @@ async function openSingleApp(target, { exitOnError = true } = {}) {
   let running = isAppRunning(spec);
 
   if (running) {
+    let quitErr = '';
     try {
-      execFileSync('osascript', ['-e', `tell application "${spec.name}" to quit`], { stdio: 'ignore' });
-    } catch {}
+      execFileSync('osascript', ['-e', `tell application "${spec.name}" to quit`], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+    } catch (e) {
+      quitErr = String(e?.stderr || e?.message || '').trim();
+    }
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
       if (!isAppRunning(spec)) {
@@ -202,8 +208,11 @@ async function openSingleApp(target, { exitOnError = true } = {}) {
       await sleepMs(250);
     }
     if (running) {
+      const hint = quitErr
+        ? `（${quitErr.slice(0, 80)}）`
+        : '（可能存在未保存文件、确认弹窗或系统未授权自动化退出）';
       return fail(
-        `${spec.name} 未在 8 秒内退出（可能存在未保存文件或确认弹窗），请手动退出后重试 ai-turn-meter open ${target}`
+        `${spec.name} 未在 8 秒内退出${hint}，请先按 ⌘Q 手动退出 ${spec.name}，再重试开启`
       );
     }
     const helperDeadline = Date.now() + 2000;
@@ -247,7 +256,7 @@ async function openSingleApp(target, { exitOnError = true } = {}) {
 async function cmdOpen(target) {
   if (target === 'all') {
     let allOk = true;
-    for (const k of ['codex', 'cursor', 'codebuddy']) {
+    for (const k of ['antigravity', 'codex', 'cursor', 'codebuddy']) {
       if (resolveAppPaths(APP_SPECS[k]).installed) {
         const ok = await openSingleApp(k, { exitOnError: false });
         if (!ok) allOk = false;

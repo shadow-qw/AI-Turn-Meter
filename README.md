@@ -17,7 +17,7 @@
                                                        ├─ Fingerprint & Degradation Engine
                                                        ├─ HTTP + SSE API (/v1/*, /events)
                                                        └─ CdpInlineInjector (WebSocket)
-                                                             ├─ Antigravity (DevToolsActivePort)
+                                                             ├─ Antigravity (DevToolsActivePort / :47924)
                                                              ├─ Codex Desktop (:47921)
                                                              ├─ Cursor (:47922, 可选)
                                                              └─ CodeBuddy CN (:47923, 可选)
@@ -45,7 +45,7 @@
 
 | 客户端 | 常驻展示位置 | 可选聊天底栏内嵌胶囊（CDP） |
 |---|---|---|
-| **Antigravity Desktop** | 每条回复操作栏（`1m ago 📋 👍 👎` 左侧，自动检测 `DevToolsActivePort`） | 默认自动开启 |
+| **Antigravity Desktop** | 每条回复操作栏（`1m ago 📋 👍 👎` 左侧，优先检测 `DevToolsActivePort`，未开启时可带 `:47924` 调试口拉起） | 自动检测或 `ai-turn-meter open antigravity` |
 | **Codex Desktop (`ChatGPT.app`)** | 聊天回复操作栏左侧（`47921` 端口） | 运行 `ai-turn-meter open codex` 拉起 |
 | **Cursor** | 右下角状态栏（VSIX，含 Remote-SSH 本机 UI 运行） | 手动退出 Cursor 后运行 `ai-turn-meter open cursor`（`47922`） |
 | **CodeBuddy CN** | 右下角状态栏（VSIX） | 手动退出 CodeBuddy CN 后运行 `ai-turn-meter open codebuddy`（`47923`） |
@@ -58,9 +58,10 @@
   `输入 1.13M (96%) · 输出 13.5k · 289 tok/s`
 - **悬浮详情卡 / 状态栏 Tooltip**：顶部模型名 + 调用数，中部四列（`输入` | `输出` | `缓存率` | `速度`），底部当前会话累计参考。
 - **原生 macOS 菜单栏（可在「设置 → 菜单栏」自由开关与定制）**：
-  - 图标样式支持 `双条配额`、`仪表盘` 以及 **`无图标（仅文字）`**（适合直接在顶栏展示 `Token · 金额`）；
+  - 图标样式支持 `配额进度条（自适应单/双栏，默认）`、`仪表盘` 以及 **`无图标（仅文字）`**（适合直接在顶栏展示 `Token · 金额`）；
   - 文本模式支持 `仅图标`、`配额百分比`、`今日费用`、`今日用量 + 费用`、`实时速度`、`最近一轮简报`；
-  - 用量与费用范围支持 `全部软件汇总（默认）` 与 `仅当前展示软件`，与配额图标软件独立解耦。
+  - 用量与费用范围支持 `全部软件汇总（默认）` 与 `仅当前展示软件`，与配额图标软件独立解耦；
+  - 套餐配额支持 Codex（5h/周窗口）、Antigravity 多模型池、Cursor 双池（Cursor 模型 / 其他模型）与独立 **Grok Bot** 周配额池。
 
 ### 2.3 每日 AI 账单（热敏小票风 Day Card）
 

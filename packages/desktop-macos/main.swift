@@ -557,7 +557,7 @@ enum MenuBarIconStyle: String, CaseIterable {
 
   var title: String {
     switch self {
-    case .dualBar: return "双条配额（默认）"
+    case .dualBar: return "配额进度条（默认）"
     case .gauge: return "仪表盘"
     case .none: return "无图标（仅文字）"
     }
@@ -974,7 +974,7 @@ final class MeterViewModel: ObservableObject {
   }
 
   var appsNeedingInlineCdp: [String] {
-    ["codex", "cursor", "codebuddy"].filter { key in
+    ["antigravity", "codex", "cursor", "codebuddy"].filter { key in
       guard isToolEnabled(key), let entry = apps[key] else { return false }
       return entry.installed && entry.cdpPort == nil
     }
@@ -1502,11 +1502,41 @@ final class MeterViewModel: ObservableObject {
       inlineMasterEnabled = true
       body["inlineEnabled"] = true
     }
+    let needsRestart = enabled && (apps[key]?.cdpPort == nil)
+    let banner = needsRestart
+      ? "\(displayTitle(for: key)) 内置显示开关已开启，请点击「重启并开启」以激活调试口"
+      : "\(displayTitle(for: key)) 内置 TPS 已\(enabled ? "开启" : "关闭")"
     postConfig(
       body,
       quietBanner: false,
-      bannerText: "\(displayTitle(for: key)) 内置 TPS 已\(enabled ? "开启" : "关闭")"
+      bannerText: banner
     )
+  }
+
+  func openAppWithInlineCdp(_ key: String) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let title = displayTitle(for: key)
+    terminateRunningAppGently(for: key)
+    runAction(args: ["open", key], successText: "已为 \(title) 开启消息旁显示")
+  }
+
+  func openAllAppsWithInlineCdp() {
+    guard !busy, !runtime.runningFromDmg else { return }
+    for key in appsNeedingInlineCdp {
+      terminateRunningAppGently(for: key)
+    }
+    runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
+  }
+
+  private func terminateRunningAppGently(for key: String) {
+    guard let targetPath = apps[key]?.appPath else { return }
+    let targetStd = (targetPath as NSString).standardizingPath
+    for runningApp in NSWorkspace.shared.runningApplications {
+      if let bundlePath = runningApp.bundleURL?.path,
+         (bundlePath as NSString).standardizingPath == targetStd {
+        runningApp.terminate()
+      }
+    }
   }
 
   func saveCursorCookie(_ raw: String?) {
@@ -2487,7 +2517,7 @@ struct ContentView: View {
                   let isSelected = vm.settingsPane == .provider(key)
                   let dotColor: Color = {
                     if !installed || !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.35) }
-                    if key != "antigravity" && entry?.cdpPort == nil { return .orange }
+                    if entry?.cdpPort == nil { return .orange }
                     return Color(red: 0.20, green: 0.72, blue: 0.42)
                   }()
 
@@ -2736,7 +2766,7 @@ private struct ProviderSettingsDetailView: View {
     let enabled = vm.isToolEnabled(key)
     let active = installed && vm.isActiveOverall && enabled
     let isDimmed = !installed || !enabled || !vm.masterEnabled
-    let needsInline = installed && vm.isActiveOverall && enabled && key != "antigravity" && entry?.cdpPort == nil
+    let needsInline = installed && vm.isActiveOverall && enabled && entry?.cdpPort == nil
     let card = vm.usageData?.cards?[key]
     let latestTurn = entry?.latestTurn
     let windows = card?.quotaWindows ?? []
@@ -2747,7 +2777,7 @@ private struct ProviderSettingsDetailView: View {
       if !vm.masterEnabled { return "全局暂停" }
       if !enabled { return "已关闭" }
       if let port = entry?.cdpPort { return "正常运行 · CDP:\(port)" }
-      return "正常运行"
+      return "未开启调试口"
     }()
 
     ScrollView {
@@ -2796,12 +2826,13 @@ private struct ProviderSettingsDetailView: View {
                 .font(.system(size: 12.5))
               Spacer()
               if needsInline && !vm.runtime.runningFromDmg {
-                Button("开启消息旁") {
-                  vm.runAction(args: ["open", key], successText: "已为 \(vm.displayTitle(for: key)) 开启消息旁显示")
+                Button("重启并开启") {
+                  vm.openAppWithInlineCdp(key)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
                 .controlSize(.mini)
                 .disabled(vm.busy)
+                .help("温和退出并带调试口重新打开 \(vm.displayTitle(for: key))，以显示消息旁 TPS")
               } else if installed, let appPath = entry?.appPath {
                 Button("打开") {
                   NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
@@ -3086,7 +3117,7 @@ private struct GeneralSettingsPaneView: View {
           if vm.isActiveOverall && !vm.appsNeedingInlineCdp.isEmpty {
             settingsControlRow(title: "接入消息旁胶囊") {
               Button("全部开启") {
-                vm.runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
+                vm.openAllAppsWithInlineCdp()
               }
               .buttonStyle(.bordered)
               .controlSize(.small)
@@ -5649,11 +5680,17 @@ private struct ProviderSwitcherBar: View {
   @Binding var selection: String
   @State private var hoveredKey: String? = nil
 
+  private func isToolAvailable(_ key: String) -> Bool {
+    if vm.apps[key]?.installed ?? false { return true }
+    let card = vm.usageData?.cards?[key]
+    return !(card?.quotaWindows?.isEmpty ?? true) || (card?.accountEmail != nil)
+  }
+
   private var switcherKeys: [String] {
     let useFallback = vm.apps.isEmpty
     let tools = ["codex", "cursor", "antigravity", "codebuddy"].filter { key in
-      let installed = useFallback ? true : (vm.apps[key]?.installed ?? false)
-      return installed && vm.isToolEnabled(key)
+      let available = useFallback ? true : isToolAvailable(key)
+      return available && vm.isToolEnabled(key)
     }
     return ["all"] + tools
   }
@@ -5673,8 +5710,7 @@ private struct ProviderSwitcherBar: View {
         let isSelected = selection == key
         let isHovered = hoveredKey == key
         let isAll = key == "all"
-        let entry = vm.apps[key]
-        let installed = isAll || (entry?.installed ?? false)
+        let installed = isAll || isToolAvailable(key)
         let active = !isAll && installed && vm.isActiveOverall && vm.isToolEnabled(key)
         let frac = indicatorFraction(for: key, installed: installed, active: active)
         let fillColor: Color = {
@@ -6964,7 +7000,6 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
     for key in candidateKeys {
       guard vm.isToolEnabled(key) else { continue }
-      if let entry = vm.apps[key], !entry.installed { continue }
       if let windows = vm.usageData?.cards?[key]?.quotaWindows, !windows.isEmpty {
         let primary = vm.quotaDisplayMode.displayPct(fromRemaining: windows[0].remainingPct)
         let secondary = windows.count > 1 ? vm.quotaDisplayMode.displayPct(fromRemaining: windows[1].remainingPct) : nil
@@ -6993,7 +7028,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     if cachedIconKey == key, let img = cachedIconImage {
       return img
     }
-    let img = Self.makeDualBarTemplateIcon(
+    let img = Self.makeQuotaBarTemplateIcon(
       primaryPct: primary,
       secondaryPct: secondary,
       stale: stale || !vm.isActiveOverall
@@ -7092,13 +7127,30 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     return lines.joined(separator: "\n")
   }
 
-  private static func makeDualBarTemplateIcon(
+  private static func makeQuotaBarTemplateIcon(
     primaryPct: Double?,
     secondaryPct: Double?,
     stale: Bool
   ) -> NSImage {
     let size = NSSize(width: 18, height: 18)
     let img = NSImage(size: size, flipped: false) { _ in
+      let hasPrimary = primaryPct != nil
+      let hasSecondary = secondaryPct != nil
+
+      // Match CodexBar IconRenderer (#3154): when a provider exposes only one quota window
+      // (e.g. Codex Pro weekly-only or single-pool Cursor), collapse to a single prominent bar
+      // instead of reserving an empty second lane.
+      if hasPrimary != hasSecondary {
+        let singleRect = NSRect(x: 1.5, y: 5.0, width: 15.0, height: 8.0)
+        Self.drawQuotaBar(
+          rect: singleRect,
+          remainingPct: primaryPct ?? secondaryPct,
+          stale: stale,
+          dimmed: false
+        )
+        return true
+      }
+
       let topRect = NSRect(x: 1.5, y: 9.5, width: 15.0, height: 6.0)
       let bottomRect = NSRect(x: 1.5, y: 2.5, width: 15.0, height: 4.0)
 
@@ -7112,7 +7164,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         rect: bottomRect,
         remainingPct: secondaryPct,
         stale: stale,
-        dimmed: primaryPct != nil && secondaryPct == nil
+        dimmed: !hasPrimary && !hasSecondary
       )
       return true
     }

@@ -253,6 +253,8 @@ const infoPlist = `<?xml version="1.0" encoding="UTF-8"?>
   <string>${version}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>用于温和退出并带本地调试口重新打开受支持的 AI 客户端，以启用消息旁 TPS 显示。</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

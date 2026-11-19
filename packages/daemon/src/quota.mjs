@@ -401,14 +401,100 @@ function formatCodexPlan(planType) {
   const map = {
     plus: 'Plus',
     pro: 'Pro',
+    prolite: 'Pro Lite',
+    pro_lite: 'Pro Lite',
+    'pro-lite': 'Pro Lite',
+    go: 'Go',
     team: 'Team',
+    business: 'Business',
     enterprise: 'Enterprise',
+    education: 'Education',
     edu: 'Edu',
     free: 'Free',
+    free_workspace: 'Free Workspace',
     k12: 'K12',
   };
   const key = String(planType).trim().toLowerCase();
   return map[key] || String(planType);
+}
+
+function classifyCodexWindowRole(w, fallbackRole) {
+  const secs = Number(w?.limit_window_seconds);
+  if (Number.isFinite(secs) && secs > 0) {
+    if (secs >= 25 * 86400) return 'monthly';
+    if (secs >= 5 * 86400 && secs <= 10 * 86400) return 'weekly';
+    if (secs >= 3600 && secs <= 12 * 3600) return 'session';
+  }
+  return fallbackRole;
+}
+
+export function normalizeCodexRateWindows(rateLimit, nowMs = Date.now()) {
+  if (!rateLimit || typeof rateLimit !== 'object') return [];
+  const roleMeta = {
+    session: { id: 'codex-session', title: '会话', defaultSecs: 18000 },
+    weekly: { id: 'codex-weekly', title: '每周', defaultSecs: 604800 },
+    monthly: { id: 'codex-monthly', title: '每月', defaultSecs: 2592000 },
+  };
+
+  const rawEntries = [
+    { raw: rateLimit.primary_window, fallbackRole: 'session' },
+    { raw: rateLimit.secondary_window, fallbackRole: 'weekly' },
+  ].filter(
+    (entry) =>
+      entry.raw && typeof entry.raw.used_percent === 'number' && Number.isFinite(entry.raw.used_percent)
+  );
+
+  const byRole = new Map();
+  for (const { raw, fallbackRole } of rawEntries) {
+    const role = classifyCodexWindowRole(raw, fallbackRole);
+    if (!byRole.has(role)) {
+      byRole.set(role, raw);
+    }
+  }
+
+  // Mirror CodexBar's secondaryGloballyCapsPrimary: when weekly quota is exhausted and not yet reset,
+  // the 5h session window is effectively capped at 0% remaining.
+  const weeklyRaw = byRole.get('weekly');
+  let weeklyCapsSession = false;
+  if (weeklyRaw && weeklyRaw.used_percent >= 100) {
+    const weeklyResetAtMs =
+      typeof weeklyRaw.reset_at === 'number' && weeklyRaw.reset_at > 0
+        ? weeklyRaw.reset_at * 1000
+        : typeof weeklyRaw.reset_after_seconds === 'number' && weeklyRaw.reset_after_seconds > 0
+          ? nowMs + weeklyRaw.reset_after_seconds * 1000
+          : null;
+    if (weeklyResetAtMs === null || weeklyResetAtMs > nowMs) {
+      weeklyCapsSession = true;
+    }
+  }
+
+  const quotaWindows = [];
+  for (const role of ['session', 'weekly', 'monthly']) {
+    const w = byRole.get(role);
+    if (!w) continue;
+    const meta = roleMeta[role];
+    const resetAtMs =
+      typeof w.reset_at === 'number' && w.reset_at > 0
+        ? w.reset_at * 1000
+        : typeof w.reset_after_seconds === 'number' && w.reset_after_seconds > 0
+          ? nowMs + w.reset_after_seconds * 1000
+          : null;
+    const effectiveUsedPct = role === 'session' && weeklyCapsSession ? 100 : w.used_percent;
+    const win = computeQuotaWindow({
+      id: meta.id,
+      title: meta.title,
+      usedPct: effectiveUsedPct,
+      windowSeconds:
+        typeof w.limit_window_seconds === 'number' && w.limit_window_seconds > 0
+          ? w.limit_window_seconds
+          : meta.defaultSecs,
+      resetAtMs,
+      nowMs,
+    });
+    if (win) quotaWindows.push(win);
+  }
+
+  return quotaWindows;
 }
 
 function resolveCodexAuthCandidatePaths(codexHome, homeDir = homedir()) {
@@ -613,46 +699,25 @@ export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true 
       const localRl = findNewestCodexRateLimits(codexHome, nowMs);
       if (localRl) {
         if (localRl.plan_type) planTitle = formatCodexPlan(localRl.plan_type);
-        const normalizeLocalWin = (w, defaultSecs) => {
+        const normalizeLocalWin = (w) => {
           if (!w || typeof w.used_percent !== 'number') return null;
           const resetSec = typeof w.resets_at === 'number' && w.resets_at > 0 ? w.resets_at : null;
           const elapsedReset = resetSec !== null && resetSec * 1000 <= nowMs;
           return {
             used_percent: elapsedReset ? 0 : w.used_percent,
-            limit_window_seconds: w.window_minutes ? w.window_minutes * 60 : defaultSecs,
+            limit_window_seconds:
+              typeof w.window_minutes === 'number' && w.window_minutes > 0 ? w.window_minutes * 60 : null,
             reset_at: elapsedReset ? null : resetSec,
           };
         };
         rateLimit = {
-          primary_window: normalizeLocalWin(localRl.primary, 18000),
-          secondary_window: normalizeLocalWin(localRl.secondary, 604800),
+          primary_window: normalizeLocalWin(localRl.primary),
+          secondary_window: normalizeLocalWin(localRl.secondary),
         };
       }
     }
 
-    const quotaWindows = [];
-    const buildCodexWin = (w, id, title, defaultSecs) => {
-      if (!w || typeof w.used_percent !== 'number') return null;
-      const resetAtMs =
-        typeof w.reset_at === 'number' && w.reset_at > 0
-          ? w.reset_at * 1000
-          : typeof w.reset_after_seconds === 'number'
-            ? nowMs + w.reset_after_seconds * 1000
-            : null;
-      return computeQuotaWindow({
-        id,
-        title,
-        usedPct: w.used_percent,
-        windowSeconds: w.limit_window_seconds || defaultSecs,
-        resetAtMs,
-        nowMs,
-      });
-    };
-
-    const pWin = buildCodexWin(rateLimit?.primary_window, 'codex-session', '会话', 18000);
-    if (pWin) quotaWindows.push(pWin);
-    const sWin = buildCodexWin(rateLimit?.secondary_window, 'codex-weekly', '每周', 604800);
-    if (sWin) quotaWindows.push(sWin);
+    const quotaWindows = normalizeCodexRateWindows(rateLimit, nowMs);
 
     let quotaHint = null;
     if (quotaWindows.length === 0) {
@@ -1159,17 +1224,32 @@ export function parseCursorQuotaSummary(
   const hasTotalPct = typeof plan?.totalPercentUsed === 'number' && Number.isFinite(plan.totalPercentUsed);
   const hasPlanCents = typeof plan?.limit === 'number' && plan.limit > 0 && typeof plan?.used === 'number';
 
+  const sandStartMs = sandUsage?.currentPeriodStart ? Date.parse(sandUsage.currentPeriodStart) : NaN;
   const sandResetMs = sandUsage?.nextResetTimestampUtc ? Date.parse(sandUsage.nextResetTimestampUtc) : NaN;
+  const sandWindowSecs =
+    Number.isFinite(sandStartMs) && Number.isFinite(sandResetMs) && sandResetMs > sandStartMs
+      ? (sandResetMs - sandStartMs) / 1000
+      : 7 * 86400;
   const sandHasLimit =
     typeof sandUsage?.includedLimitZero === 'boolean'
       ? !sandUsage.includedLimitZero
       : Boolean(sandUsage?.hasNonZeroIncludedLimit);
+  const sandUsedPct =
+    typeof sandUsage?.usagePercent === 'number' && Number.isFinite(sandUsage.usagePercent)
+      ? sandUsage.usagePercent
+      : null;
   const hasUnifiedWeekly = Boolean(
     sandUsage?.isUnified &&
       sandHasLimit &&
-      typeof sandUsage?.usagePercent === 'number' &&
+      sandUsedPct !== null &&
       Number.isFinite(sandResetMs) &&
       sandResetMs > nowMs
+  );
+  const hasGrokBotPool = Boolean(
+    !hasUnifiedWeekly &&
+      sandHasLimit &&
+      sandUsedPct !== null &&
+      (sandUsage?.grokPlanLabel || (Number.isFinite(sandResetMs) && sandResetMs > nowMs))
   );
 
   const quotaWindows = [];
@@ -1178,8 +1258,8 @@ export function parseCursorQuotaSummary(
     const win = computeQuotaWindow({
       id: 'cursor-weekly',
       title: '每周共享池',
-      usedPct: sandUsage.usagePercent,
-      windowSeconds: 7 * 86400,
+      usedPct: sandUsedPct,
+      windowSeconds: sandWindowSecs,
       resetAtMs: sandResetMs,
       nowMs,
     });
@@ -1282,6 +1362,22 @@ export function parseCursorQuotaSummary(
         if (win) quotaWindows.push(win);
       }
     }
+  }
+
+  // Append standalone Grok Bot / Sand weekly quota pool when present alongside dual-pool plans.
+  if (hasGrokBotPool) {
+    const rawLabel = typeof sandUsage?.grokPlanLabel === 'string' && sandUsage.grokPlanLabel.trim()
+      ? sandUsage.grokPlanLabel.trim().replace(/\s+plan$/i, '')
+      : 'Grok Bot';
+    const grokWin = computeQuotaWindow({
+      id: 'cursor-grok-bot',
+      title: rawLabel,
+      usedPct: sandUsedPct,
+      windowSeconds: sandWindowSecs,
+      resetAtMs: Number.isFinite(sandResetMs) ? sandResetMs : null,
+      nowMs,
+    });
+    if (grokWin) quotaWindows.push(grokWin);
   }
 
   let resetCreditsText = null;
@@ -1590,32 +1686,29 @@ function assembleAllQuotas(raw, enabledTools = null) {
 
   const overviewWindows = [];
   if (isEnabled('codex') && codex.quotaWindows.length > 0) {
-    const c5h = codex.quotaWindows[0];
-    const cWk = codex.quotaWindows[1];
+    const cPrimary = codex.quotaWindows[0];
+    const cSecondary = codex.quotaWindows[1];
     overviewWindows.push({
-      ...c5h,
+      ...cPrimary,
       id: 'overview-codex',
-      title: `Codex ${c5h.title}`,
-      subtitle: c5h.subtitle
-        ? `${c5h.subtitle}${cWk ? ` · 每周 ${Math.round(cWk.remainingPct)}%` : ''}`
-        : cWk
-          ? `每周剩余 ${Math.round(cWk.remainingPct)}%`
+      title: `Codex ${cPrimary.title}`,
+      subtitle: cPrimary.subtitle
+        ? `${cPrimary.subtitle}${cSecondary ? ` · ${cSecondary.title} ${Math.round(cSecondary.remainingPct)}%` : ''}`
+        : cSecondary
+          ? `${cSecondary.title}剩余 ${Math.round(cSecondary.remainingPct)}%`
           : null,
     });
   }
   if (isEnabled('cursor') && cursor.quotaWindows.length > 0) {
     const curWin = cursor.quotaWindows[0];
-    const curSecond = cursor.quotaWindows[1];
-    const curSub = [
-      curWin.subtitle,
-      curSecond ? `${curSecond.title} ${Math.round(curSecond.remainingPct)}%` : null,
-    ]
-      .filter(Boolean)
-      .join(' · ');
+    const extraSubs = cursor.quotaWindows
+      .slice(1)
+      .map((w) => `${w.title} ${Math.round(w.remainingPct)}%`);
+    const curSub = [curWin.subtitle, ...extraSubs].filter(Boolean).join(' · ');
     overviewWindows.push({
       ...curWin,
       id: 'overview-cursor',
-      title: curSecond ? 'Cursor 模型' : 'Cursor',
+      title: cursor.quotaWindows.length > 1 ? 'Cursor 模型' : 'Cursor',
       subtitle: curSub || null,
     });
   }

@@ -21,6 +21,9 @@ import {
   renderReceiptSvg,
 } from '../packages/daemon/src/receipt.mjs';
 import { estimateTurnCost, resolveModelPricing } from '../packages/daemon/src/pricing.mjs';
+import { APP_SPECS, readActivePort } from '../packages/daemon/src/apps.mjs';
+import { CdpInlineInjector } from '../packages/daemon/src/cdp-injector.mjs';
+import { parseCursorQuotaSummary } from '../packages/daemon/src/quota.mjs';
 import { createMeterServer } from '../packages/daemon/src/server.mjs';
 import { TurnStore } from '../packages/daemon/src/store.mjs';
 
@@ -388,6 +391,71 @@ test('Pricing resolves gemini-4-neon, inverted Claude names, parenthetical conte
   assert.equal(est.priced, true);
   assert.ok(est.costUsd > 2 && est.costUsd < 4);
   assert.ok(est.savingsUsd > 7);
+});
+
+test('Antigravity CDP port resolution prefers DevToolsActivePort and falls back to static port 47924', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-agy-port-'));
+  try {
+    const injector = new CdpInlineInjector({ getTurnsForTool: () => [] });
+    const missingPortFile = join(tmpDir, 'DevToolsActivePort');
+    // Fallback to static port when DevToolsActivePort is absent
+    assert.equal(
+      injector.resolvePort({ tool: 'antigravity', portFile: missingPortFile, port: 47924 }),
+      47924
+    );
+    assert.equal(
+      readActivePort({ ...APP_SPECS.antigravity, portFile: missingPortFile, port: 47924 }, tmpDir, new Set([47924])),
+      47924
+    );
+    assert.equal(
+      readActivePort({ ...APP_SPECS.antigravity, portFile: missingPortFile, port: 47924 }, tmpDir, new Set()),
+      null
+    );
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('parseCursorQuotaSummary appends standalone Grok Bot weekly quota alongside dual-pool plans', () => {
+  const nowMs = Date.parse('2026-11-19T07:24:00.000Z');
+  const parsed = parseCursorQuotaSummary(
+    {
+      billingCycleStart: '2026-10-30T16:06:35.000Z',
+      billingCycleEnd: '2026-11-30T16:06:35.000Z',
+      membershipType: 'enterprise',
+      individualUsage: {
+        plan: {
+          autoPercentUsed: 32.68,
+          apiPercentUsed: 100,
+        },
+        onDemand: {
+          enabled: true,
+          used: 14247,
+          limit: 33300,
+        },
+      },
+    },
+    {
+      nowMs,
+      sandUsage: {
+        currentPeriodStart: '2026-11-18T02:44:41.695Z',
+        nextResetTimestampUtc: '2026-11-25T02:44:41.695Z',
+        usagePercent: 0.56769,
+        hasAvailableUsage: true,
+        hasNonZeroIncludedLimit: true,
+        grokPlanLabel: 'Grok Bot Plan',
+        isTeamSeat: true,
+      },
+    }
+  );
+
+  assert.equal(parsed.quotaWindows.length, 3);
+  assert.equal(parsed.quotaWindows[0].id, 'cursor-auto');
+  assert.equal(parsed.quotaWindows[1].id, 'cursor-api');
+  assert.equal(parsed.quotaWindows[2].id, 'cursor-grok-bot');
+  assert.equal(parsed.quotaWindows[2].title, 'Grok Bot');
+  assert.equal(Math.round(parsed.quotaWindows[2].remainingPct), 99);
+  assert.ok(parsed.quotaWindows[2].resetText.includes('天'));
 });
 
 test('HTTP server exposes /v1/receipt (json/ascii/svg) and /v1/fingerprint/* CRUD & run endpoints', async () => {

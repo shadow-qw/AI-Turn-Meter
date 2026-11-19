@@ -7,6 +7,7 @@ export function getDefaultCdpSpecs() {
     {
       tool: 'antigravity',
       portFile: join(homedir(), 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort'),
+      port: Number(process.env.AI_TURN_METER_ANTIGRAVITY_CDP_PORT || 47924),
     },
     {
       tool: 'codex',
@@ -817,17 +818,15 @@ export class CdpInlineInjector {
   }
 
   resolvePort(spec) {
-    if (typeof spec.port === 'number' && spec.port > 0 && spec.port <= 65535) {
-      return spec.port;
-    }
     if (spec.portFile && existsSync(spec.portFile)) {
       try {
         const lines = readFileSync(spec.portFile, 'utf8').trim().split(/\r?\n/);
         const port = Number(lines[0]);
-        return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
-      } catch {
-        return null;
-      }
+        if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
+      } catch {}
+    }
+    if (typeof spec.port === 'number' && spec.port > 0 && spec.port <= 65535) {
+      return spec.port;
     }
     return null;
   }

@@ -54,6 +54,7 @@ import {
   computeQuotaWindow,
   decryptCursorSafeStorageToken,
   fetchCodexQuota,
+  normalizeCodexRateWindows,
   parseCursorQuotaSummary,
   parseSystemProxyInfo,
   resetQuotaCacheForTests,
@@ -2487,5 +2488,113 @@ test('parseCursorQuotaSummary supports unified weekly Sand pool and v2/usage-sta
     assert.equal(res.candidates[1].source, 'cursor-agent');
   } finally {
     rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test('normalizeCodexRateWindows & fetchCodexQuota align with CodexBar for weekly-only Codex Pro, reversed order, monthly, and weekly cap', async () => {
+  const nowMs = Date.UTC(2026, 10, 19, 8, 0, 0);
+  const in3DaysSec = Math.floor((nowMs + 3 * 86400 * 1000) / 1000);
+  const in2HoursSec = Math.floor((nowMs + 2 * 3600 * 1000) / 1000);
+
+  // 1. Weekly-only Pro plan returned in primary_window (limit_window_seconds = 604800)
+  const weeklyInPrimary = normalizeCodexRateWindows(
+    {
+      primary_window: { used_percent: 24, limit_window_seconds: 604800, reset_at: in3DaysSec },
+      secondary_window: null,
+    },
+    nowMs
+  );
+  assert.equal(weeklyInPrimary.length, 1);
+  assert.equal(weeklyInPrimary[0].id, 'codex-weekly');
+  assert.equal(weeklyInPrimary[0].title, '每周');
+  assert.equal(weeklyInPrimary[0].remainingPct, 76);
+
+  // 2. Weekly-only returned in secondary_window with primary_window null
+  const weeklyInSecondary = normalizeCodexRateWindows(
+    {
+      primary_window: null,
+      secondary_window: { used_percent: 40, limit_window_seconds: 604800, reset_at: in3DaysSec },
+    },
+    nowMs
+  );
+  assert.equal(weeklyInSecondary.length, 1);
+  assert.equal(weeklyInSecondary[0].id, 'codex-weekly');
+  assert.equal(weeklyInSecondary[0].title, '每周');
+  assert.equal(weeklyInSecondary[0].remainingPct, 60);
+
+  // 3. Reversed windows (primary=7d, secondary=5h) normalize to [session, weekly]
+  const reversed = normalizeCodexRateWindows(
+    {
+      primary_window: { used_percent: 30, limit_window_seconds: 604800, reset_at: in3DaysSec },
+      secondary_window: { used_percent: 15, limit_window_seconds: 18000, reset_at: in2HoursSec },
+    },
+    nowMs
+  );
+  assert.equal(reversed.length, 2);
+  assert.equal(reversed[0].id, 'codex-session');
+  assert.equal(reversed[0].remainingPct, 85);
+  assert.equal(reversed[1].id, 'codex-weekly');
+  assert.equal(reversed[1].remainingPct, 70);
+
+  // 4. Exhausted weekly window caps session window at 0% remaining
+  const capped = normalizeCodexRateWindows(
+    {
+      primary_window: { used_percent: 12, limit_window_seconds: 18000, reset_at: in2HoursSec },
+      secondary_window: { used_percent: 100, limit_window_seconds: 604800, reset_at: in3DaysSec },
+    },
+    nowMs
+  );
+  assert.equal(capped.length, 2);
+  assert.equal(capped[0].id, 'codex-session');
+  assert.equal(capped[0].remainingPct, 0);
+  assert.equal(capped[1].id, 'codex-weekly');
+  assert.equal(capped[1].remainingPct, 0);
+
+  // 5. Monthly single window (30 days)
+  const monthlyOnly = normalizeCodexRateWindows(
+    {
+      primary_window: { used_percent: 18, limit_window_seconds: 2592000, reset_at: in3DaysSec },
+      secondary_window: null,
+    },
+    nowMs
+  );
+  assert.equal(monthlyOnly.length, 1);
+  assert.equal(monthlyOnly[0].id, 'codex-monthly');
+  assert.equal(monthlyOnly[0].title, '每月');
+  assert.equal(monthlyOnly[0].remainingPct, 82);
+
+  // 6. Local JSONL fallback with weekly-only Codex Pro rate_limits
+  const prevCodexHome = process.env.CODEX_HOME;
+  const codexHome = mkdtempSync(join(tmpdir(), 'atm-codex-pro-weekly-'));
+  try {
+    const sessionsDir = join(codexHome, 'sessions', '2026', '11', '19');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, 'rollout-pro-weekly.jsonl'),
+      `${JSON.stringify({
+        timestamp: new Date(nowMs - 60_000).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          rate_limits: {
+            limit_id: 'codex',
+            plan_type: 'pro',
+            primary: { used_percent: 33, window_minutes: 10080, resets_at: in3DaysSec },
+            secondary: null,
+          },
+        },
+      })}\n`
+    );
+    process.env.CODEX_HOME = codexHome;
+    const quota = await fetchCodexQuota(nowMs, { allowNetwork: false });
+    assert.equal(quota.planTitle, 'Pro');
+    assert.equal(quota.quotaWindows.length, 1);
+    assert.equal(quota.quotaWindows[0].id, 'codex-weekly');
+    assert.equal(quota.quotaWindows[0].title, '每周');
+    assert.equal(quota.quotaWindows[0].remainingPct, 67);
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    rmSync(codexHome, { recursive: true, force: true });
   }
 });
