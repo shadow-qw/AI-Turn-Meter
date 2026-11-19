@@ -1,0 +1,29 @@
+name: baseline
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Verify exact source SHA
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Test with isolated environment
+        run: |
+          scratch=$(mktemp -d)
+          env -i PATH="$PATH" HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" \
+            XDG_DATA_HOME="$scratch/data" CODEX_HOME="$scratch/codex" \
+            AI_TURN_METER_DB="$scratch/meter.db" TMPDIR="$scratch" npm test
