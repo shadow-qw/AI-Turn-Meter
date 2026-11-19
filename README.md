@@ -1,8 +1,8 @@
 # AI Turn Meter
 
-一套面向 macOS 的单后台多客户端回合统计工具，统一采集并内嵌展示 **Antigravity**、**Codex Desktop (`ChatGPT.app`)**、**Cursor**、**CodeBuddy CN** 每轮对话的输入 Token、输出 Token、缓存命中率与生成速度（TPS）。
+一套面向 macOS 的单后台多客户端 AI 用量与回合监控工具，统一采集并展示 **Antigravity**、**Codex Desktop (`ChatGPT.app`)**、**Cursor**、**CodeBuddy CN** 每轮对话的输入 Token、输出 Token、缓存命中率、生成速度（TPS）、API 等效费用、套餐剩余配额、**每日 AI 账单小票**以及**模型指纹与降智检测**。
 
-全套能力由 **1 个常驻本地守护进程**（`com.local.ai-turn-meter.daemon`）、**1 个 CLI**（`ai-turn-meter`）与 **1 个通用 VSIX 扩展**（`dist/ai-turn-meter.vsix`）完成，无系统顶栏图标或刘海悬浮窗。
+全套能力由 **1 个常驻本地守护进程**（`com.local.ai-turn-meter.daemon`）、**1 个原生 macOS 控制台与可选菜单栏应用**（`AI Turn Meter.app`）、**1 个 CLI**（`ai-turn-meter`）与 **1 个通用 VSIX 扩展**（`dist/ai-turn-meter.vsix`）完成。
 
 ---
 
@@ -12,7 +12,10 @@
   Codex JSONL (~/.codex/sessions) ──────────────┐
   Antigravity Logs + LanguageServer RPC ─────────┼─▶ Daemon (127.0.0.1:47831)
   CodeBuddy IDE history + CLI JSONL ─────────────┤     ├─ TurnStore (SQLite meter.db)
-  Cursor Hooks (本地 node / Remote-SSH curl) ────┘     ├─ HTTP + SSE API (/v1/*, /events)
+  Cursor Hooks (本地 node / Remote-SSH curl) ────┘     ├─ Pricing & Quota Probes
+                                                       ├─ Receipt Renderer (ASCII / SVG)
+                                                       ├─ Fingerprint & Degradation Engine
+                                                       ├─ HTTP + SSE API (/v1/*, /events)
                                                        └─ CdpInlineInjector (WebSocket)
                                                              ├─ Antigravity (DevToolsActivePort)
                                                              ├─ Codex Desktop (:47921)
@@ -23,38 +26,56 @@
 核心源码与入口分布：
 
 - 守护进程与 HTTP/SSE 服务：[packages/daemon/bin/daemon.mjs](packages/daemon/bin/daemon.mjs)、[packages/daemon/src/server.mjs](packages/daemon/src/server.mjs)
-- 存储与匹配引擎：[packages/daemon/src/store.mjs](packages/daemon/src/store.mjs)
+- 存储、用量聚合与账单引擎：[packages/daemon/src/store.mjs](packages/daemon/src/store.mjs)、[packages/daemon/src/pricing.mjs](packages/daemon/src/pricing.mjs)、[packages/daemon/src/quota.mjs](packages/daemon/src/quota.mjs)
+- 每日 AI 账单（热敏小票 ASCII / SVG 渲染）：[packages/daemon/src/receipt.mjs](packages/daemon/src/receipt.mjs)
+- 模型指纹与降智检测引擎：[packages/daemon/src/fingerprint.mjs](packages/daemon/src/fingerprint.mjs)
 - 口径归一化与格式化：[packages/daemon/src/format.mjs](packages/daemon/src/format.mjs)
 - 各客户端适配器：[packages/daemon/src/adapters/](packages/daemon/src/adapters/)（`codex.mjs`、`antigravity.mjs`、`cursor.mjs`、`codebuddy.mjs`）
 - CDP 内嵌脚本注入器：[packages/daemon/src/cdp-injector.mjs](packages/daemon/src/cdp-injector.mjs)
 - 统一 CLI 与安装器：[packages/daemon/bin/cli.mjs](packages/daemon/bin/cli.mjs)、[packages/daemon/src/installer.mjs](packages/daemon/src/installer.mjs)、[packages/daemon/src/apps.mjs](packages/daemon/src/apps.mjs)
 - IDE 状态栏扩展：[packages/vscode-extension/package.json](packages/vscode-extension/package.json)、[packages/vscode-extension/extension.js](packages/vscode-extension/extension.js)
-- 原生 macOS 控制台软件：[packages/desktop-macos/main.swift](packages/desktop-macos/main.swift)
+- 原生 macOS 控制台与菜单栏软件：[packages/desktop-macos/main.swift](packages/desktop-macos/main.swift)
 - 安装、发布打包与 Homebrew Formula：[scripts/](scripts/)（`install.mjs`、`package-vsix.mjs`、`build-dmg.mjs`、`build-release.mjs`、`verify-local.mjs`、`uninstall.mjs`）、[packaging/homebrew/ai-turn-meter.rb](packaging/homebrew/ai-turn-meter.rb)
 
 ---
 
-## 2. 展示形态与位置
+## 2. 核心功能与展示形态
 
-### 2.1 四家展示位置
+### 2.1 四家客户端回合监控位置
 
 | 客户端 | 常驻展示位置 | 可选聊天底栏内嵌胶囊（CDP） |
 |---|---|---|
 | **Antigravity Desktop** | 每条回复操作栏（`1m ago 📋 👍 👎` 左侧，自动检测 `DevToolsActivePort`） | 默认自动开启 |
 | **Codex Desktop (`ChatGPT.app`)** | 聊天回复操作栏左侧（`47921` 端口） | 运行 `ai-turn-meter open codex` 拉起 |
-| **Cursor** | 右下角状态栏（`v0.1.2` VSIX，含 Remote-SSH 本机 UI 运行） | 手动退出 Cursor 后运行 `ai-turn-meter open cursor`（`47922`） |
-| **CodeBuddy CN** | 右下角状态栏（`v0.1.2` VSIX） | 手动退出 CodeBuddy CN 后运行 `ai-turn-meter open codebuddy`（`47923`） |
+| **Cursor** | 右下角状态栏（VSIX，含 Remote-SSH 本机 UI 运行） | 手动退出 Cursor 后运行 `ai-turn-meter open cursor`（`47922`） |
+| **CodeBuddy CN** | 右下角状态栏（VSIX） | 手动退出 CodeBuddy CN 后运行 `ai-turn-meter open codebuddy`（`47923`） |
 
 > 安全约束：`ai-turn-meter open` 在目标进程已运行时仅通过 AppleScript 温和请求退出（最长等待 8 秒），绝不强制 `pkill`，也不会修改任何 `.app` 安装包签名。
 
-### 2.2 展示格式
+### 2.2 展示格式与顶部菜单栏
 
 - **单行主摘要（内嵌胶囊 & 状态栏）**：只显示**当前这一轮**指标，不混入整场对话累计值：
   `输入 1.13M (96%) · 输出 13.5k · 289 tok/s`
-- **悬浮详情卡 / 状态栏 Tooltip**：已简化为无尾注小字的四列并排视图：
-  - 顶部：模型名 + `N 次调用`
-  - 中部四列：`输入` | `输出` | `缓存率` | `速度`
-  - 底部：分隔线 + `会话 (N 轮)` 累计 `输入 / 输出` 参考
+- **悬浮详情卡 / 状态栏 Tooltip**：顶部模型名 + 调用数，中部四列（`输入` | `输出` | `缓存率` | `速度`），底部当前会话累计参考。
+- **原生 macOS 菜单栏（可在「设置 → 菜单栏」自由开关与定制）**：
+  - 图标样式支持 `双条配额`、`仪表盘` 以及 **`无图标（仅文字）`**（适合直接在顶栏展示 `Token · 金额`）；
+  - 文本模式支持 `仅图标`、`配额百分比`、`今日费用`、`今日用量 + 费用`、`实时速度`、`最近一轮简报`；
+  - 用量与费用范围支持 `全部软件汇总（默认）` 与 `仅当前展示软件`，与配额图标软件独立解耦。
+
+### 2.3 每日 AI 账单（热敏小票风 Day Card）
+
+在 macOS 应用的 **`用量 → 每日账单`** 或 CLI `ai-turn-meter receipt` 中查看和分享：
+- **极简热敏小票视觉**：顶平底锯齿米白热敏纸（支持热敏纸 / 暗夜双主题）搭配雾感山林湖畔渐变衬底；
+- **六段式账单结构**：居中「每日 AI 账单」与日期/开具时间 → 超大居中 API 总费用 → 连续使用天数 / 请求数 / 对话轮次 / 对比近 30 天日均倍数 → 两级 **`AGENT / 模型`** 费用明细清单（也可切换按项目分组并支持隐私隐藏项目名） → 底部 Token 总量 / 输入 / 输出 / 缓存命中率与缓存节省汇总；
+- **多币种与一键分享**：支持 `USD+¥` / `USD` / `CNY ¥` 三种模式与自定义汇率（默认 `1:7`），支持一键**复制高清图片、保存 2x PNG、导出矢量 SVG 与复制终端纯文本小票**。
+
+### 2.4 模型指纹与降智检测
+
+在 macOS 应用左侧边栏的 **`降智检测`** 或 CLI `ai-turn-meter fingerprint` 中全部手动触发：
+- **一键全面体检**：单次点击自动扫描全四家近 7 天历史对话异常（速度突增疑似切轻量模型、思考深度骤降/归零、同会话旗舰回退轻量）并核验本地 Codex 官方路由；
+- **Codex 本地端点专项核验**：复用 `~/.codex/auth.json` 与 `config.toml`，适配官方 `/backend-api/codex/responses` SSE 流式响应，核对实际返回模型、套餐档位与流内 `safety_buffering` 状态，并支持一键跑 8 题能力探针（`测智商`）；
+- **私有客户端两步出题验证**：针对 Antigravity / Cursor / CodeBuddy 提供标准 5 题测试包，一键复制发给模型后自动读取回复评分；
+- **中转站 / 自定义 API 真伪指纹**：支持添加 OpenAI / Anthropic 兼容端点（API Key 仅存本机 `config.json`），结合 8 题确定性能力探针与单 Token 概率分布指纹（Jensen-Shannon 散度 + 自录参考基线）识别偷换模型与静默量化。
 
 ---
 
@@ -115,7 +136,7 @@ npm run release:dmg -- --repo=shadow-qw/AI-Turn-Meter
 收到 `.dmg` 的用户（Apple Silicon Mac，无需装 Node）：
 1. 打开 `.dmg`，将 **AI Turn Meter.app** 拖入 `Applications`（应用程序）。
 2. 如经浏览器/聊天工具下载触发 macOS 未公证拦截，可在「系统设置 -> 隐私与安全性」点击「仍要打开」（或终端执行 `xattr -dr com.apple.quarantine "/Applications/AI Turn Meter.app"`）。
-3. 双击打开 `AI Turn Meter.app`：软件会自动完成首次本地安装并拉起后台服务（不占顶栏、无刘海），之后可在界面内查看 4 家实时状态、一键开启 Codex / Cursor / CodeBuddy 底栏胶囊、生成 Cursor Remote-SSH 配置或检查更新。
+3. 双击打开 `AI Turn Meter.app`：软件会自动完成首次本地安装并拉起后台服务，可在界面内查看 4 家实时状态与配额、切换菜单栏样式、生成每日 AI 账单小票、一键运行降智检测、生成 Cursor Remote-SSH 配置或检查更新。
 
 ### 方式二：通过 Homebrew Tap 分发 CLI
 
@@ -144,6 +165,9 @@ npm run release:dmg -- --repo=shadow-qw/AI-Turn-Meter
 
 ```bash
 ai-turn-meter status                 # 查看守护进程与四家 CDP / 最新轮次状态
+ai-turn-meter cost [--days=7]        # 查看今日/本周/历史 Token 用量与 API 等效费用估算
+ai-turn-meter receipt [--date=...]   # 打印每日 AI 账单小票（支持 --scope=day|week|month --currency=both|usd|cny --rate=7 --theme=paper|dark --svg=out.svg）
+ai-turn-meter fingerprint [--mode=.] # 手动运行降智检测（passive|codex_protocol|quick|deep，支持 --target=codex|<id> --record-baseline）
 ai-turn-meter doctor                 # 诊断 Node、LaunchAgent、Cursor Hooks、VSIX 与 CDP 状态
 ai-turn-meter install                # 注册 LaunchAgent、合并 Cursor Hooks、装入 VSIX 与 CLI 软链
 ai-turn-meter uninstall              # 清理 LaunchAgent、VSIX、Cursor Hooks 与 CLI 软链
@@ -161,9 +185,14 @@ npm run uninstall:all                # 等价于本地仓库运行 ai-turn-meter
 
 ### Daemon HTTP / SSE 接口（默认 `http://127.0.0.1:47831`）
 
-- `GET /health`：健康检查（返回 `ok`、`pid`、`port`）
+- `GET /health`：健康检查（返回 `ok`、`pid`、`port`、`version`）
 - `GET /v1/state?limit=20`：最新全局状态与 `byTool` 摘要
 - `GET /v1/turns?limit=30&tool=`：按时间倒序的最近轮次列表
+- `GET /v1/usage?days=7&tool=`：多维度用量统计、费用估算与各软件剩余配额卡片
+- `GET /v1/receipt?date=&scope=day&groupBy=model&format=json|ascii|svg`：每日/周期 AI 账单数据、文本小票与矢量 SVG
+- `GET /v1/fingerprint/overview`：被动降智诊断、Codex 配置、自定义端点、基线与历史体检记录
+- `POST /v1/fingerprint/run`：手动触发一键体检（`one_click`）、被动诊断、Codex 路由核验、能力探针或单 Token 分布指纹
+- `POST / DELETE /v1/fingerprint/endpoints` & `DELETE /v1/fingerprint/baselines`：自定义检测端点与参考基线管理
 - `GET /v1/match?tool=&workspace=&workspaceHash=`：IDE 窗口匹配查询（传 `tool` 时严格隔离）
 - `GET /events`：SSE 实时推送（`state` / `turn` 事件）
 - `POST /v1/ingest`：直接写入已归一化 Turn 对象
