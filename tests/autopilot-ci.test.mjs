@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 
 const workflow = () => readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
 
-test('baseline CI tests the exact event SHA with read-only permission', () => {
+test('wiring contract: CI declares exact event SHA and read-only permission', () => {
   const s = workflow();
   assert.match(s, /pull_request:/);
   assert.match(s, /push:\s*\n\s+branches: \[main\]/);
@@ -14,7 +14,7 @@ test('baseline CI tests the exact event SHA with read-only permission', () => {
   assert.doesNotMatch(s, /pull_request_target|workflow_run|issues:|secrets\.|: write|continue-on-error/);
 });
 
-test('CI actions are SHA pinned and checkout does not persist credentials', () => {
+test('wiring contract: CI action pins and checkout credential options', () => {
   const s = workflow();
   const uses = [...s.matchAll(/uses: ([^\s#]+)/g)].map((m) => m[1]);
   assert.ok(uses.length >= 2);
@@ -24,7 +24,7 @@ test('CI actions are SHA pinned and checkout does not persist credentials', () =
   assert.doesNotMatch(s, /cache:|registry-url:|token:|ssh-key:/);
 });
 
-test('CI isolates fixture data without publishing', () => {
+test('wiring contract: CI declares fixture isolation and no publishing', () => {
   const s = workflow();
   assert.match(s, /npm run test:all/);
   assert.match(s, /env -i PATH="\$PATH" HOME="\$scratch"/);

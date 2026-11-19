@@ -1,96 +1,25 @@
-name: Release
+name: Release disabled pending independently reviewed Task E
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to release
-        required: true
+        description: No effect - all publication is hard disabled
+        required: false
         type: string
       confirm_stable_tag:
-        description: Stable only - type the exact tag to confirm production release
+        description: Reserved for future exact-object human approval; cannot unlock this workflow
         required: false
         type: string
 permissions:
   contents: read
 jobs:
-  classify:
+  release-disabled:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      prerelease: ${{ steps.channel.outputs.prerelease }}
-      make_latest: ${{ steps.channel.outputs.make_latest }}
-      source_sha: ${{ steps.channel.outputs.source_sha }}
-      tag: ${{ steps.channel.outputs.tag }}
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: main
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '24'
-      - id: channel
-        name: Classify using trusted main before executing tag code
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
-          CONFIRM_STABLE_TAG: ${{ inputs.confirm_stable_tag }}
-          RC_CHANNEL_PROOF_SHA: ${{ vars.RC_CHANNEL_PROOF_SHA }}
-        run: node scripts/release-channel.mjs
-  build:
-    needs: classify
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ needs.classify.outputs.source_sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '24'
-      - name: Verify source SHA
-        env:
-          SOURCE_SHA: ${{ needs.classify.outputs.source_sha }}
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - name: Test and build isolated release packages
-        run: |
-          scratch=$(mktemp -d)
-          env -i PATH="$PATH" HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" XDG_DATA_HOME="$scratch/data" CODEX_HOME="$scratch/codex" AI_TURN_METER_DB="$scratch/db" TMPDIR="$scratch" npm run test:all
-          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" npm run release:tarball
-          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" npm run release:dmg
-          (cd dist && shasum -a 256 *.dmg *.tar.gz *.vsix > SHA256SUMS.txt)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-packages
-          path: |
-            dist/*.dmg
-            dist/*.dmg.sha256
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/*.vsix
-            dist/SHA256SUMS.txt
-          if-no-files-found: error
-          retention-days: 3
-  publish:
-    needs: [classify, build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 1
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-packages
-          path: packages
-      - uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
-        with:
-          tag_name: ${{ needs.classify.outputs.tag }}
-          target_commitish: ${{ needs.classify.outputs.source_sha }}
-          prerelease: ${{ needs.classify.outputs.prerelease }}
-          make_latest: ${{ needs.classify.outputs.make_latest }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: packages/*
+      - name: Publication hard stop - trusted provenance, immutable source and artifacts await Task E
+        run: exit 1

@@ -75,12 +75,16 @@ public enum UpdateChecker {
     }
 
     if let raw = json["sha256Url"] {
-      guard let text = raw as? String, UpdatePolicy.secureURL(text) != nil else {
+      guard let text = raw as? String, UpdatePolicy.artifactURL(text, version: remoteVer) != nil else {
         return .invalidResponse(message: "校验文件地址无效。")
       }
     }
-    if let url = sha256Url, UpdatePolicy.secureURL(url) == nil {
-      return .invalidResponse(message: "校验文件地址无效。")
+    if let url = sha256Url {
+      let assets = json["assets"] as? [[String: Any]] ?? []
+      let assetName = assets.first(where: { ($0["browser_download_url"] as? String) == url })?["name"] as? String
+      guard UpdatePolicy.artifactURL(url, version: remoteVer, assetName: assetName) != nil else {
+        return .invalidResponse(message: "校验文件身份无效。")
+      }
     }
     if json["sha256"] != nil {
       guard let hash = expectedSha256, hash.count == 64,
@@ -98,6 +102,14 @@ public enum UpdateChecker {
         expectedSha256: (expectedSha256?.count == 64) ? expectedSha256 : nil
       )
     )
+  }
+
+  public static func matchesChecksum(expected: String, actual: String) -> Bool {
+    let left = expected.lowercased(), right = actual.lowercased()
+    let valid: (String) -> Bool = { value in
+      value.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+    return valid(left) && valid(right) && left == right
   }
 
   public static func parseSha256Checksum(from text: String, filename: String) -> String? {

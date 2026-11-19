@@ -1354,95 +1354,28 @@ final class MeterViewModel: ObservableObject {
     }
     updateChecking = true
     updateStatusText = "正在检查更新…"
-    let curVersion = self.version
-
-    if let ghApiUrl = UpdateChecker.githubApiLatestUrl(from: url) {
-      var apiReq = URLRequest(url: ghApiUrl, timeoutInterval: 10)
-      apiReq.setValue("AI-Turn-Meter/\(curVersion)", forHTTPHeaderField: "User-Agent")
-      apiReq.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-      URLSession.shared.dataTask(with: apiReq) { [weak self] data, resp, _ in
-        DispatchQueue.main.async { [weak self] in
-          guard let self = self else { return }
-          if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
-             let data = data {
-            switch UpdateChecker.parseReleaseJson(data, currentVersion: curVersion) {
-            case .updateAvailable(let info):
-              self.updateChecking = false
-              self.availableUpdate = info
-              self.updateStatusText = "发现新版本 v\(info.version)（当前 v\(curVersion)）"
-              return
-            case .upToDate(let v):
-              self.updateChecking = false
-              self.updateStatusText = "当前已是最新版本（v\(v)）。"
-              return
-            case .invalidResponse:
-              break
-            }
-          }
-          self.checkUpdateFallback(url: url, curVersion: curVersion)
-        }
-      }.resume()
-      return
-    }
-
-    checkUpdateFallback(url: url, curVersion: curVersion)
-  }
-
-  private func checkUpdateFallback(url: URL, curVersion: String) {
-    var req = URLRequest(url: url, timeoutInterval: 10)
-    req.setValue("AI-Turn-Meter/\(curVersion)", forHTTPHeaderField: "User-Agent")
-    req.setValue("application/json", forHTTPHeaderField: "Accept")
-    let isGithubReleasesLatest = UpdatePolicy.isGitHubLatest(url)
-    if isGithubReleasesLatest {
-      req.httpMethod = "HEAD"
-    }
-
-    URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
-        self.updateChecking = false
-        if let err = err {
-          self.updateStatusText = "检查更新失败：\(err.localizedDescription)"
-          return
-        }
-
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-          self.updateStatusText = "检查更新失败：更新源未返回成功响应。"
-          return
-        }
-        if isGithubReleasesLatest {
-          if let finalURL = http.url,
-             let update = UpdatePolicy.githubCandidate(feed: url, finalURL: finalURL,
-               statusCode: http.statusCode, currentVersion: curVersion) {
-            self.availableUpdate = UpdateReleaseInfo(version: update.version,
-              downloadUrl: update.downloadURL.absoluteString, notes: update.notes)
-            self.updateStatusText = "发现新稳定版本 v\(update.version)（当前 v\(curVersion)）"
-          } else {
-            self.updateStatusText = "未发现有效的新稳定版本（当前 v\(curVersion)）。"
-          }
-          return
-        }
-
-        guard let data = data else {
-          self.updateStatusText = "更新源未返回数据。"
-          return
-        }
-        switch UpdateChecker.parseReleaseJson(data, currentVersion: curVersion) {
-        case .updateAvailable(let info):
-          self.availableUpdate = info
-          self.updateStatusText = "发现新版本 v\(info.version)（当前 v\(curVersion)）"
-        case .upToDate(let v):
-          self.updateStatusText = "当前已是最新版本（v\(v)）。"
-        case .invalidResponse(let msg):
-          self.updateStatusText = msg
-        }
+    let current = self.version
+    Task { [weak self] in
+      let result = await UpdateLookup.check(feed: url, currentVersion: current,
+        transport: URLSessionUpdateTransport())
+      guard let self = self else { return }
+      self.updateChecking = false
+      switch result {
+      case .available(let info):
+        self.availableUpdate = info
+        self.updateStatusText = "发现新稳定版本 v\(info.version)（当前 v\(current)）"
+      case .upToDate(let version):
+        self.updateStatusText = "当前已是最新版本（v\(version)）。"
+      case .failed(.transport): self.updateStatusText = "检查更新失败：网络或更新服务不可用。"
+      case .failed(.noRelease): self.updateStatusText = "当前仓库没有可用稳定Release。"
+      case .failed(.rejected(let message)): self.updateStatusText = "更新已拒绝：\(message)"
       }
-    }.resume()
+    }
   }
 
   func downloadAndOpenUpdate(_ info: UpdateReleaseInfo) {
     guard !updateDownloading, UpdatePolicy.isStable(info.version),
-          let url = UpdatePolicy.secureURL(info.downloadUrl) else { return }
+          let url = UpdatePolicy.artifactURL(info.downloadUrl, version: info.version) else { return }
     updateDownloading = true
     updateStatusText = "正在下载 v\(info.version) 更新包…"
 
@@ -1465,6 +1398,14 @@ final class MeterViewModel: ObservableObject {
         DispatchQueue.main.async {
           self.updateDownloading = false
           self.updateStatusText = "下载失败：HTTP \(http.statusCode)"
+        }
+        return
+      }
+      guard let finalURL = (resp as? HTTPURLResponse)?.url,
+            UpdatePolicy.artifactURL(finalURL.absoluteString, version: info.version) != nil else {
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "安装包重定向身份无效，已中止更新。"
         }
         return
       }
@@ -1559,6 +1500,8 @@ final class MeterViewModel: ObservableObject {
       req.setValue("AI-Turn-Meter/\(info.version)", forHTTPHeaderField: "User-Agent")
       URLSession.shared.dataTask(with: req) { data, resp, _ in
         if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+           let finalURL = http.url,
+           UpdatePolicy.artifactURL(finalURL.absoluteString, version: info.version) != nil,
            let data = data {
           fetchedText = String(data: data, encoding: .utf8)
         }
@@ -1575,7 +1518,7 @@ final class MeterViewModel: ObservableObject {
     guard let actualHash = try? UpdateChecker.sha256Hex(ofFileAt: dest) else {
       return "无法计算安装包 SHA-256 校验值，已中止更新。"
     }
-    if actualHash.lowercased() != expectedHash.lowercased() {
+    if !UpdateChecker.matchesChecksum(expected: expectedHash, actual: actualHash) {
       return "安装包 SHA-256 校验不匹配，已中止更新。"
     }
     return nil

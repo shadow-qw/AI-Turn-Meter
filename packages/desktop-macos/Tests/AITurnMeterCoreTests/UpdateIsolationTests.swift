@@ -52,4 +52,31 @@ struct UpdateIsolationTests {
       Issue.record("RC current silently used stable updater")
     }
   }
+
+  @Test("Stable metadata cannot disguise RC or mismatched package/checksum identities")
+  func rejectsContradictoryArtifactIdentity() throws {
+    let root = "https://github.com/shadow-qw/AI-Turn-Meter/releases/download/"
+    let rc = root + "v0.3.0-rc.1/AI-Turn-Meter-0.3.0-rc.1-arm64.dmg"
+    let stable = root + "v0.3.0/AI-Turn-Meter-0.3.0-arm64.dmg"
+    let payloads: [[String: Any]] = [
+      ["version":"0.3.0", "dmgUrl":rc],
+      ["version":"0.3.0", "dmgUrl":root + "v0.4.0/AI-Turn-Meter-0.4.0-arm64.dmg"],
+      ["version":"0.3.0", "dmgUrl":"https://updates.example.com/AI-Turn-Meter-0.3.0-rc.1-arm64.dmg?signature=abc"],
+      ["version":"0.3.0", "assets":[["name":"AI-Turn-Meter-0.3.0-rc.1-arm64.dmg", "browser_download_url":"https://updates.example.com/download?sig=opaque"]]],
+      ["version":"0.3.0", "dmgUrl":stable, "sha256Url":rc + ".sha256"],
+      ["version":"0.3.0", "dmgUrl":stable, "sha256Url":"https://updates.example.com/AI-Turn-Meter-0.4.0-arm64.dmg.sha256"],
+      ["version":"0.3.0", "dmgUrl":stable, "assets":[["name":"AI-Turn-Meter-0.3.0-rc.1-arm64.dmg.sha256", "browser_download_url":"https://updates.example.com/opaque-checksum"]]],
+    ]
+    for payload in payloads {
+      let data = try JSONSerialization.data(withJSONObject: payload)
+      if case .updateAvailable = UpdateChecker.parseReleaseJson(data, currentVersion: "0.2.26") {
+        Issue.record("Contradictory package offered: \(payload)")
+      }
+    }
+    let valid: [String:Any] = ["version":"0.3.0", "dmgUrl":stable + "?signature=abc-rc.1",
+      "sha256Url":stable + ".sha256?signature=xyz"]
+    guard case .updateAvailable = UpdateChecker.parseReleaseJson(try JSONSerialization.data(withJSONObject: valid), currentVersion:"0.2.26") else {
+      Issue.record("Valid signed stable URL disabled"); return
+    }
+  }
 }

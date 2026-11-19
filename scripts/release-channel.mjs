@@ -1,3 +1,5 @@
+// Simulation/classification helper only. No workflow invokes this as release authority.
+// Publication remains unconditionally disabled until independently reviewed Task E.
 import { execFileSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { resolve } from 'node:path';

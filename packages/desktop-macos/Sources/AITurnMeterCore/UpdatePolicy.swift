@@ -47,6 +47,38 @@ public enum UpdatePolicy {
     return url
   }
 
+  // Recognizable identities must agree. Opaque custom URLs remain a trusted-feed
+  // compatibility path, not cryptographic evidence about the downloaded bytes.
+  private static func filenameMatches(_ raw: String, version: String) -> Bool {
+    let name = raw.lowercased()
+    if name.range(of: #"(?:^|[-_.])(?:rc|alpha|beta|preview)(?:[-_.]|[0-9]|$)"#,
+                  options: .regularExpression) != nil { return false }
+    for pattern in [
+      #"^ai-turn-meter-(.+)-(?:arm64|x86_64)\.dmg(?:\.sha256)?$"#,
+      #"^ai-turn-meter-(.+)\.tar\.gz(?:\.sha256)?$"#,
+      #"^ai-turn-meter-(.+)\.vsix(?:\.sha256)?$"#
+    ] {
+      let regex = try! NSRegularExpression(pattern: pattern)
+      if let match = regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
+         let range = Range(match.range(at: 1), in: name) {
+        return compareStable(String(name[range]), version) == 0
+      }
+    }
+    return true
+  }
+
+  public static func artifactURL(_ raw: String, version: String, assetName: String? = nil) -> URL? {
+    guard isStable(version), let url = secureURL(raw),
+          filenameMatches(url.lastPathComponent, version: version),
+          assetName.map({ filenameMatches($0, version: version) }) ?? true else { return nil }
+    let parts = url.path.split(separator: "/").map(String.init)
+    if ["github.com", "www.github.com"].contains(url.host?.lowercased() ?? ""),
+       parts.count >= 4, parts[2] == "releases", parts[3] == "download" {
+      guard parts.count == 6, compareStable(parts[4], version) == 0 else { return nil }
+    }
+    return url
+  }
+
   public static func isGitHubLatest(_ url: URL) -> Bool {
     let parts = url.path.split(separator: "/", omittingEmptySubsequences: false)
     return secureURL(url.absoluteString) != nil &&
@@ -100,7 +132,7 @@ public enum UpdatePolicy {
     let downloadURL: URL?
     if let direct = json["dmgUrl"] {
       guard let text = direct as? String else { return nil }
-      downloadURL = secureURL(text)
+      downloadURL = artifactURL(text, version: version)
     } else if let assetsValue = json["assets"] {
       guard let assets = assetsValue as? [[String: Any]] else { return nil }
       let ordered = assets.filter { (($0["name"] as? String)?.lowercased().contains("arm64") ?? false) } +
@@ -108,12 +140,18 @@ public enum UpdatePolicy {
       downloadURL = ordered.lazy.compactMap { asset -> URL? in
         guard let name = asset["name"] as? String, name.lowercased().hasSuffix(".dmg"),
               let raw = asset["browser_download_url"] as? String else { return nil }
-        return secureURL(raw)
+        return artifactURL(raw, version: version, assetName: name)
       }.first
     } else {
-      downloadURL = (json["url"] as? String).flatMap(secureURL)
+      downloadURL = (json["url"] as? String).flatMap { artifactURL($0, version: version) }
     }
     guard let url = downloadURL else { return nil }
+    if let assets = json["assets"] as? [[String: Any]] {
+      for asset in assets where (asset["browser_download_url"] as? String) == url.absoluteString {
+        guard let name = asset["name"] as? String,
+              artifactURL(url.absoluteString, version: version, assetName: name) != nil else { return nil }
+      }
+    }
     return StableUpdate(version: version, downloadURL: url,
                         notes: (json["body"] as? String) ?? (json["notes"] as? String) ?? "")
   }

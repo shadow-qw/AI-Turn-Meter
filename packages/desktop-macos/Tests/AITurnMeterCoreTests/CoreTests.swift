@@ -137,4 +137,15 @@ struct AITurnMeterCoreTests {
     #expect(req.httpMethod == "POST")
     #expect(req.value(forHTTPHeaderField: DaemonAuth.tokenHeader) == "secret-test-token-123")
   }
+
+  @Test("Actual SHA256 bytes must match the declaration, never malformed or wrong hashes")
+  func actualChecksumDeclaration() {
+    let data = Data("stable artifact fixture".utf8)
+    let digest = UpdateChecker.sha256Hex(of: data)
+    #expect(digest == "c44d8ba60c20680ae3442e6a17a622775a0c1706a3b915cdaa05e4ee803db952")
+    #expect(UpdateChecker.matchesChecksum(expected: digest.uppercased(), actual: digest))
+    #expect(!UpdateChecker.matchesChecksum(expected: String(repeating:"0", count:64), actual: digest))
+    #expect(!UpdateChecker.matchesChecksum(expected: "", actual: digest))
+    #expect(!UpdateChecker.matchesChecksum(expected: String(repeating:"x", count:64), actual: digest))
+  }
 }
