@@ -1341,12 +1341,17 @@ final class MeterViewModel: ObservableObject {
     showUpdateSheet = true
     guard let rawUrl = updateFeedUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
           !rawUrl.isEmpty,
-          let url = URL(string: rawUrl) else {
+          let url = UpdatePolicy.secureURL(rawUrl) else {
       updateChecking = false
       updateStatusText = "当前是离线独立安装包。\n\n收到新版 .dmg 时直接拖入「应用程序」覆盖原软件并打开一次，后台与扩展就会自动完成更新。"
       return
     }
 
+    guard UpdatePolicy.isStable(self.version) else {
+      updateChecking = false
+      updateStatusText = "当前为预发布版本，请手动选择稳定通道。"
+      return
+    }
     updateChecking = true
     updateStatusText = "正在检查更新…"
     let curVersion = self.version
@@ -1387,8 +1392,7 @@ final class MeterViewModel: ObservableObject {
     var req = URLRequest(url: url, timeoutInterval: 10)
     req.setValue("AI-Turn-Meter/\(curVersion)", forHTTPHeaderField: "User-Agent")
     req.setValue("application/json", forHTTPHeaderField: "Accept")
-    let isGithubReleasesLatest =
-      (url.host == "github.com" || url.host == "www.github.com") && url.path.hasSuffix("/releases/latest")
+    let isGithubReleasesLatest = UpdatePolicy.isGitHubLatest(url)
     if isGithubReleasesLatest {
       req.httpMethod = "HEAD"
     }
@@ -1402,29 +1406,19 @@ final class MeterViewModel: ObservableObject {
           return
         }
 
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+          self.updateStatusText = "检查更新失败：更新源未返回成功响应。"
+          return
+        }
         if isGithubReleasesLatest {
-          guard let finalUrl = (resp as? HTTPURLResponse)?.url else {
-            self.updateStatusText = "无法解析最新版本页面。"
-            return
-          }
-          let abs = finalUrl.absoluteString
-          guard let range = abs.range(of: "/releases/tag/") else {
-            self.updateStatusText = "当前仓库尚未发布 GitHub Release（当前运行 v\(curVersion)）。"
-            return
-          }
-          let rawTag = String(abs[range.upperBound...]).split(separator: "?").first.map(String.init) ?? ""
-          let remoteVer = rawTag.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
-          let repoPrefix = String(abs[..<range.lowerBound])
-          if remoteVer.isEmpty {
-            self.updateStatusText = "当前仓库尚未发布版本标签。"
-            return
-          }
-          if UpdateChecker.compareSemver(remoteVer, curVersion) > 0 {
-            let dlUrl = "\(repoPrefix)/releases/download/\(rawTag)/AI-Turn-Meter-\(remoteVer)-arm64.dmg"
-            self.availableUpdate = UpdateReleaseInfo(version: remoteVer, downloadUrl: dlUrl, notes: "")
-            self.updateStatusText = "发现新版本 v\(remoteVer)（当前 v\(curVersion)）"
+          if let finalURL = http.url,
+             let update = UpdatePolicy.githubCandidate(feed: url, finalURL: finalURL,
+               statusCode: http.statusCode, currentVersion: curVersion) {
+            self.availableUpdate = UpdateReleaseInfo(version: update.version,
+              downloadUrl: update.downloadURL.absoluteString, notes: update.notes)
+            self.updateStatusText = "发现新稳定版本 v\(update.version)（当前 v\(curVersion)）"
           } else {
-            self.updateStatusText = "当前已是最新版本（v\(curVersion)）。"
+            self.updateStatusText = "未发现有效的新稳定版本（当前 v\(curVersion)）。"
           }
           return
         }
@@ -1447,7 +1441,8 @@ final class MeterViewModel: ObservableObject {
   }
 
   func downloadAndOpenUpdate(_ info: UpdateReleaseInfo) {
-    guard !updateDownloading, let url = URL(string: info.downloadUrl) else { return }
+    guard !updateDownloading, UpdatePolicy.isStable(info.version),
+          let url = UpdatePolicy.secureURL(info.downloadUrl) else { return }
     updateDownloading = true
     updateStatusText = "正在下载 v\(info.version) 更新包…"
 

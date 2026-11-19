@@ -26,9 +26,9 @@ test('CI actions are SHA pinned and checkout does not persist credentials', () =
 
 test('CI isolates fixture data without publishing', () => {
   const s = workflow();
-  assert.match(s, /npm test/);
+  assert.match(s, /npm run test:all/);
   assert.match(s, /env -i PATH="\$PATH" HOME="\$scratch"/);
   assert.match(s, /XDG_CONFIG_HOME="\$scratch\/config"/);
   assert.doesNotMatch(s, /release:dmg|release:tarball|install:all|uninstall:all|verify:local|gh release/);
-  assert.equal((s.match(/timeout-minutes: 10/g) || []).length, 2);
+  assert.equal((s.match(/timeout-minutes: 20/g) || []).length, 1);
 });

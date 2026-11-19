@@ -1,53 +1,96 @@
 name: Release
-
 on:
   push:
-    tags:
-      - 'v*'
-
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release
+        required: true
+        type: string
+      confirm_stable_tag:
+        description: Stable only - type the exact tag to confirm production release
+        required: false
+        type: string
 permissions:
-  contents: write
-
+  contents: read
 jobs:
-  release:
-    runs-on: macos-15
+  classify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      prerelease: ${{ steps.channel.outputs.prerelease }}
+      make_latest: ${{ steps.channel.outputs.make_latest }}
+      source_sha: ${{ steps.channel.outputs.source_sha }}
+      tag: ${{ steps.channel.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '24'
-
-      - name: Verify tag matches package.json version
-        run: |
-          node -e '
-            const pkg = require("./package.json");
-            const ext = require("./packages/vscode-extension/package.json");
-            const tagVer = process.env.GITHUB_REF_NAME.replace(/^v/, "");
-            if (pkg.version !== tagVer || ext.version !== tagVer) {
-              throw new Error(`Tag v${tagVer} mismatch: pkg=${pkg.version}, ext=${ext.version}`);
-            }
-          '
-
-      - name: Run test suite
-        run: npm run test:all
-
-      - name: Build release tarball & DMG
-        run: |
-          npm run release:tarball
-          npm run release:dmg
-
-      - name: Generate SHA256SUMS.txt
-        working-directory: dist
-        run: shasum -a 256 *.dmg *.tar.gz *.vsix > SHA256SUMS.txt
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+      - id: channel
+        name: Classify using trusted main before executing tag code
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          CONFIRM_STABLE_TAG: ${{ inputs.confirm_stable_tag }}
+          RC_CHANNEL_PROOF_SHA: ${{ vars.RC_CHANNEL_PROOF_SHA }}
+        run: node scripts/release-channel.mjs
+  build:
+    needs: classify
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          generate_release_notes: true
-          files: |
+          ref: ${{ needs.classify.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Verify source SHA
+        env:
+          SOURCE_SHA: ${{ needs.classify.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Test and build isolated release packages
+        run: |
+          scratch=$(mktemp -d)
+          env -i PATH="$PATH" HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" XDG_DATA_HOME="$scratch/data" CODEX_HOME="$scratch/codex" AI_TURN_METER_DB="$scratch/db" TMPDIR="$scratch" npm run test:all
+          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" npm run release:tarball
+          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" npm run release:dmg
+          (cd dist && shasum -a 256 *.dmg *.tar.gz *.vsix > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-packages
+          path: |
             dist/*.dmg
             dist/*.dmg.sha256
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/*.vsix
             dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 3
+  publish:
+    needs: [classify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-packages
+          path: packages
+      - uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
+        with:
+          tag_name: ${{ needs.classify.outputs.tag }}
+          target_commitish: ${{ needs.classify.outputs.source_sha }}
+          prerelease: ${{ needs.classify.outputs.prerelease }}
+          make_latest: ${{ needs.classify.outputs.make_latest }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: packages/*

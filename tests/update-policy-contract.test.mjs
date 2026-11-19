@@ -1,34 +1,29 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
-
-test('both update entry paths delegate to stable policy before offering a download', () => {
-  const s = read('packages/desktop-macos/main.swift');
-  assert.match(s, /UpdatePolicy\.secureURL\(rawUrl\)/);
-  assert.match(s, /UpdatePolicy\.isStable\(curVersion\)/);
-  assert.match(s, /UpdatePolicy\.githubCandidate\(/);
-  assert.match(s, /UpdatePolicy\.jsonCandidate\(/);
-  assert.match(s, /UpdatePolicy\.secureURL\(info\.downloadUrl\)/);
-  assert.doesNotMatch(s, /compareSemver|json\["tag_name"\]/);
+import { readFileSync, existsSync } from 'node:fs';
+const read = p => readFileSync(new URL(`../${p}`,import.meta.url),'utf8');
+test('GitHub API, HEAD fallback, custom JSON and download all use stable gates', () => {
+  const app=read('packages/desktop-macos/Sources/AITurnMeterApp/Runtime/MeterViewModel.swift');
+  const core=read('packages/desktop-macos/Sources/AITurnMeterCore/UpdateChecker.swift');
+  assert.match(app,/UpdatePolicy\.secureURL\(rawUrl\)/);
+  assert.match(app,/UpdatePolicy\.isStable\(self.version\)/);
+  assert.match(app,/UpdatePolicy\.githubCandidate\(/);
+  assert.match(app,/UpdatePolicy\.secureURL\(info.downloadUrl\)/);
+  assert.equal((app.match(/UpdateChecker\.parseReleaseJson\(/g)||[]).length,2);
+  assert.doesNotMatch(app,/compareSemver/);
+  assert.match(core,/UpdatePolicy\.jsonCandidate\(/);
+  assert.match(core,/UpdatePolicy\.stableVersion/);
+  assert.match(core,/expectedSha256:/); assert.match(app,/verifyDownloadedDmgSha256IfAvailable/);
 });
-
-test('DMG compilation includes the same pure policy source as the Swift test runner', () => {
-  const build = read('scripts/build-dmg.mjs');
-  const runner = read('scripts/test-update-policy.sh');
-  assert.match(build, /join\(ROOT, 'packages', 'desktop-macos', 'UpdatePolicy.swift'\)/);
-  assert.match(runner, /packages\/desktop-macos\/UpdatePolicy.swift/);
-  assert.match(runner, /tests\/swift\/UpdatePolicyTests.swift/);
-  assert.match(runner, /set -eu/);
-  assert.match(runner, /mktemp -d/);
-  assert.doesNotMatch(runner, /SKIP|exit 0|curl|sudo/);
+test('SwiftPM owns policy source and behavior tests; DMG retains SwiftPM build', () => {
+  assert.ok(existsSync(new URL('../packages/desktop-macos/Sources/AITurnMeterCore/UpdatePolicy.swift',import.meta.url)));
+  assert.match(read('scripts/build-dmg.mjs'),/swiftBinDir/);
+  assert.match(read('scripts/test-update-policy.sh'),/Sources\/AITurnMeterCore\/UpdatePolicy.swift/);
+  assert.match(read('packages/desktop-macos/Tests/AITurnMeterCoreTests/UpdateIsolationTests.swift'),/expectedSha256/);
+  assert.match(read('packages/desktop-macos/Tests/AITurnMeterCoreTests/UpdatePolicyTests.swift'),/policyCases/);
+  assert.ok(!existsSync(new URL('../packages/desktop-macos/main.swift',import.meta.url)));
 });
-
-test('CI includes real macOS policy execution and full application typechecking', () => {
-  const s = read('.github/workflows/ci.yml');
-  assert.match(s, /runs-on: macos-15/);
-  assert.match(s, /sh scripts\/test-update-policy.sh/);
-  assert.match(s, /swiftc -typecheck -swift-version 5/);
-  assert.match(s, /packages\/desktop-macos\/main.swift packages\/desktop-macos\/UpdatePolicy.swift/);
-  assert.match(s, /uname -sm/);
+test('strengthened CI retains all existing main validation steps on real macOS', () => {
+  const s=read('.github/workflows/ci.yml');
+  for (const value of ['runs-on: macos-15','Check version parity','npm run test:all','npm run build:macos','npm run package:vsix','sh scripts/test-update-policy.sh','uname -sm']) assert.ok(s.includes(value),value);
 });

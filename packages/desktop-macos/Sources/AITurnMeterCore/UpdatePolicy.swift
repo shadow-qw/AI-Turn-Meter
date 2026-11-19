@@ -1,13 +1,13 @@
 import Foundation
 import CoreFoundation
 
-struct StableUpdate {
-  let version: String
-  let downloadURL: URL
-  let notes: String
+public struct StableUpdate {
+  public let version: String
+  public let downloadURL: URL
+  public let notes: String
 }
 
-enum UpdatePolicy {
+public enum UpdatePolicy {
   private static func versionParts(_ raw: String) -> [Int]? {
     var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if text.hasPrefix("v") || text.hasPrefix("V") { text.removeFirst() }
@@ -24,11 +24,11 @@ enum UpdatePolicy {
     return result
   }
 
-  static func isStable(_ version: String, prerelease: Bool = false) -> Bool {
+  public static func isStable(_ version: String, prerelease: Bool = false) -> Bool {
     !prerelease && versionParts(version) != nil
   }
 
-  static func compareStable(_ a: String, _ b: String) -> Int? {
+  public static func compareStable(_ a: String, _ b: String) -> Int? {
     guard let left = versionParts(a), let right = versionParts(b) else { return nil }
     for i in 0..<3 {
       if left[i] != right[i] { return left[i] < right[i] ? -1 : 1 }
@@ -36,7 +36,7 @@ enum UpdatePolicy {
     return 0
   }
 
-  static func secureURL(_ raw: String) -> URL? {
+  public static func secureURL(_ raw: String) -> URL? {
     guard let decoded = raw.removingPercentEncoding,
           !decoded.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
           raw == raw.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -47,7 +47,7 @@ enum UpdatePolicy {
     return url
   }
 
-  static func isGitHubLatest(_ url: URL) -> Bool {
+  public static func isGitHubLatest(_ url: URL) -> Bool {
     let parts = url.path.split(separator: "/", omittingEmptySubsequences: false)
     return secureURL(url.absoluteString) != nil &&
       ["github.com", "www.github.com"].contains(url.host?.lowercased() ?? "") &&
@@ -56,7 +56,7 @@ enum UpdatePolicy {
       parts[3] == "releases" && parts[4] == "latest"
   }
 
-  static func githubCandidate(feed: URL, finalURL: URL, statusCode: Int, currentVersion: String) -> StableUpdate? {
+  public static func githubCandidate(feed: URL, finalURL: URL, statusCode: Int, currentVersion: String) -> StableUpdate? {
     guard (200..<300).contains(statusCode), isGitHubLatest(feed),
           secureURL(finalURL.absoluteString) != nil,
           ["github.com", "www.github.com"].contains(finalURL.host?.lowercased() ?? ""),
@@ -82,23 +82,31 @@ enum UpdatePolicy {
     return !number.boolValue
   }
 
-  static func jsonCandidate(data: Data, statusCode: Int, currentVersion: String) -> StableUpdate? {
-    guard (200..<300).contains(statusCode),
-          let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-          falseOrAbsent(json, "prerelease"), falseOrAbsent(json, "draft"),
+  static func stableVersion(in json: [String: Any]) -> String? {
+    guard falseOrAbsent(json, "prerelease"), falseOrAbsent(json, "draft"),
           let tag = (json["tag_name"] ?? json["version"]) as? String,
-          let parts = versionParts(tag), compareStable(tag, currentVersion) == 1 else { return nil }
+          let parts = versionParts(tag) else { return nil }
     if let other = json["version"] {
       guard let text = other as? String, compareStable(tag, text) == 0 else { return nil }
     }
+    return parts.map(String.init).joined(separator: ".")
+  }
+
+  public static func jsonCandidate(data: Data, statusCode: Int, currentVersion: String) -> StableUpdate? {
+    guard (200..<300).contains(statusCode),
+          let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let version = stableVersion(in: json),
+          compareStable(version, currentVersion) == 1 else { return nil }
     let downloadURL: URL?
     if let direct = json["dmgUrl"] {
       guard let text = direct as? String else { return nil }
       downloadURL = secureURL(text)
     } else if let assetsValue = json["assets"] {
       guard let assets = assetsValue as? [[String: Any]] else { return nil }
-      downloadURL = assets.lazy.compactMap { asset -> URL? in
-        guard let name = asset["name"] as? String, name.hasSuffix(".dmg"),
+      let ordered = assets.filter { (($0["name"] as? String)?.lowercased().contains("arm64") ?? false) } +
+        assets.filter { !(($0["name"] as? String)?.lowercased().contains("arm64") ?? false) }
+      downloadURL = ordered.lazy.compactMap { asset -> URL? in
+        guard let name = asset["name"] as? String, name.lowercased().hasSuffix(".dmg"),
               let raw = asset["browser_download_url"] as? String else { return nil }
         return secureURL(raw)
       }.first
@@ -106,7 +114,7 @@ enum UpdatePolicy {
       downloadURL = (json["url"] as? String).flatMap(secureURL)
     }
     guard let url = downloadURL else { return nil }
-    return StableUpdate(version: parts.map(String.init).joined(separator: "."), downloadURL: url,
+    return StableUpdate(version: version, downloadURL: url,
                         notes: (json["body"] as? String) ?? (json["notes"] as? String) ?? "")
   }
 }
