@@ -19,7 +19,7 @@
 - `baseline/macos-policy`使用真实标准`macos-15`标签，记录uname/ImageVersion/Xcode/Swift，执行纯策略和arm64/macOS13目标完整旧App源码typecheck；动作固定SHA、空HOME、无账号。尚未推送，**没有真实macOS run/typecheck/DMG通过证据**；此job也需随新SwiftPM布局调整。
 - 只在临时staging将扩展版本改为`0.2.26-rc.1`：现有打包脚本生成VSIX；官方VS Code1.147.0 Linux x64（8a14f0cc1b08d531eb83255ea3764ae22aa932b5）CLI安装成功，真实Extension Host发现同一版本、activate成功、isActive=true且注册refresh命令。临时空HOME/profile、禁遥测/自动更新、daemonUrl指向127.0.0.1:9，未连接真实daemon/账号；源码manifest未改。仅证明该VS Code版本兼容，不证明Marketplace、Cursor、旧VS Code或新main扩展兼容；没有臆测版本映射。
 - 只读检查默认latest：2026-11-19（Asia/Shanghai）实际HTTP200重定向至v0.2.26。官方GitHub latest定义排除draft/prerelease：https://docs.github.com/en/rest/releases/releases#get-the-latest-release 。没有创建测试RC；实际旧客户端对真实发布RC的隔离尚无演练证据。旧自定义JSON客户端已由上述真实旧代码证明会误选RC，无法被本补丁追溯修复；必须取得服务端稳定feed过滤证据，或用户明确接受受限支持范围，才能满足后续channelProof。
-- 本轮未推正式Homebrew、未改第三方app/签名、未执行安装卸载或verify:local、未改正式数据库/外部配置。更新策略只校验声明元数据/URL，不是二进制来源或签名证明。
+- 本轮未推正式Homebrew、未改第三方app/签名、未执行项目安装/卸载脚本或verify:local（仅上述临时profile的VSIX安装测试）、未改正式数据库/外部配置。更新策略只校验声明元数据/URL，不是二进制来源或签名证明。
 
 ## 不可越过的发布门
 
