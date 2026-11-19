@@ -30,5 +30,5 @@ test('CI isolates fixture data without publishing', () => {
   assert.match(s, /env -i PATH="\$PATH" HOME="\$scratch"/);
   assert.match(s, /XDG_CONFIG_HOME="\$scratch\/config"/);
   assert.doesNotMatch(s, /release:dmg|release:tarball|install:all|uninstall:all|verify:local|gh release/);
-  assert.equal((s.match(/timeout-minutes: 10/g) || []).length, 1);
+  assert.equal((s.match(/timeout-minutes: 10/g) || []).length, 2);
 });

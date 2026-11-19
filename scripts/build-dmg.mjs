@@ -205,6 +205,7 @@ execFileSync(
     '-target',
     'arm64-apple-macosx13.0',
     swiftSrc,
+    join(ROOT, 'packages', 'desktop-macos', 'UpdatePolicy.swift'),
     '-o',
     appExe,
     '-framework',

@@ -772,18 +772,6 @@ final class MeterRuntime: Sendable {
     return CommandResult(exitCode: proc.terminationStatus, stdout: stdout, stderr: stderr)
   }
 
-  static func compareSemver(_ a: String, _ b: String) -> Int {
-    let cleanA = a.trimmingCharacters(in: CharacterSet(charactersIn: "vV ")).split(separator: ".").map { Int($0) ?? 0 }
-    let cleanB = b.trimmingCharacters(in: CharacterSet(charactersIn: "vV ")).split(separator: ".").map { Int($0) ?? 0 }
-    let count = max(cleanA.count, cleanB.count)
-    for i in 0..<count {
-      let va = i < cleanA.count ? cleanA[i] : 0
-      let vb = i < cleanB.count ? cleanB[i] : 0
-      if va != vb { return va < vb ? -1 : 1 }
-    }
-    return 0
-  }
-
   static func readSshConfigHosts() -> [String] {
     let path = (NSHomeDirectory() as NSString).appendingPathComponent(".ssh/config")
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
@@ -2057,25 +2045,30 @@ final class MeterViewModel: ObservableObject {
     availableUpdate = nil
     showUpdateSheet = true
     guard let rawUrl = updateFeedUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
-          !rawUrl.isEmpty,
-          let url = URL(string: rawUrl) else {
+          !rawUrl.isEmpty else {
       updateChecking = false
       updateStatusText = "当前是离线独立安装包。\n\n收到新版 .dmg 时直接拖入「应用程序」覆盖原软件并打开一次，后台与扩展就会自动完成更新。"
+      return
+    }
+    guard let url = UpdatePolicy.secureURL(rawUrl) else {
+      updateChecking = false
+      updateStatusText = "更新源无效：请使用不含凭据的 HTTPS 地址。"
+      return
+    }
+    let curVersion = self.version
+    guard UpdatePolicy.isStable(curVersion) else {
+      updateChecking = false
+      updateStatusText = "当前是预发布或未知版本，请手动选择稳定版。"
       return
     }
 
     updateChecking = true
     updateStatusText = "正在检查更新…"
-    let curVersion = self.version
-
     var req = URLRequest(url: url, timeoutInterval: 10)
     req.setValue("AI-Turn-Meter/\(curVersion)", forHTTPHeaderField: "User-Agent")
     req.setValue("application/json", forHTTPHeaderField: "Accept")
-    let isGithubReleasesLatest =
-      (url.host == "github.com" || url.host == "www.github.com") && url.path.hasSuffix("/releases/latest")
-    if isGithubReleasesLatest {
-      req.httpMethod = "HEAD"
-    }
+    let isGithubReleasesLatest = UpdatePolicy.isGitHubLatest(url)
+    if isGithubReleasesLatest { req.httpMethod = "HEAD" }
 
     URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
@@ -2085,70 +2078,35 @@ final class MeterViewModel: ObservableObject {
           self.updateStatusText = "检查更新失败：\(err.localizedDescription)"
           return
         }
-
-        if isGithubReleasesLatest {
-          guard let finalUrl = (resp as? HTTPURLResponse)?.url else {
-            self.updateStatusText = "无法解析最新版本页面。"
-            return
-          }
-          let abs = finalUrl.absoluteString
-          guard let range = abs.range(of: "/releases/tag/") else {
-            self.updateStatusText = "当前仓库尚未发布 GitHub Release（当前运行 v\(curVersion)）。"
-            return
-          }
-          let rawTag = String(abs[range.upperBound...]).split(separator: "?").first.map(String.init) ?? ""
-          let remoteVer = rawTag.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
-          let repoPrefix = String(abs[..<range.lowerBound])
-          if remoteVer.isEmpty {
-            self.updateStatusText = "当前仓库尚未发布版本标签。"
-            return
-          }
-          if MeterRuntime.compareSemver(remoteVer, curVersion) > 0 {
-            let dlUrl = "\(repoPrefix)/releases/download/\(rawTag)/AI-Turn-Meter-\(remoteVer)-arm64.dmg"
-            self.availableUpdate = UpdateReleaseInfo(version: remoteVer, downloadUrl: dlUrl, notes: "")
-            self.updateStatusText = "发现新版本 v\(remoteVer)（当前 v\(curVersion)）"
-          } else {
-            self.updateStatusText = "当前已是最新版本（v\(curVersion)）。"
-          }
+        guard let response = resp as? HTTPURLResponse,
+              (200..<300).contains(response.statusCode) else {
+          self.updateStatusText = "检查更新失败：更新源未返回成功响应。"
           return
         }
-
-        guard let data = data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-          self.updateStatusText = "更新源返回格式无效。"
-          return
-        }
-
-        let remoteTag = (json["tag_name"] as? String) ?? (json["version"] as? String) ?? ""
-        let remoteVer = remoteTag.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
-        var dmgUrl = (json["dmgUrl"] as? String) ?? (json["url"] as? String)
-        if dmgUrl == nil, let assets = json["assets"] as? [[String: Any]] {
-          for asset in assets {
-            if let name = asset["name"] as? String, name.hasSuffix(".dmg"),
-               let dl = asset["browser_download_url"] as? String {
-              dmgUrl = dl
-              break
-            }
-          }
-        }
-        let notes = (json["body"] as? String) ?? (json["notes"] as? String) ?? ""
-
-        if remoteVer.isEmpty {
-          self.updateStatusText = "未能在更新源中解析到版本号。"
-          return
-        }
-        if MeterRuntime.compareSemver(remoteVer, curVersion) > 0, let dlUrl = dmgUrl {
-          self.availableUpdate = UpdateReleaseInfo(version: remoteVer, downloadUrl: dlUrl, notes: notes)
-          self.updateStatusText = "发现新版本 v\(remoteVer)（当前 v\(curVersion)）"
+        let candidate: StableUpdate?
+        if isGithubReleasesLatest, let finalURL = response.url {
+          candidate = UpdatePolicy.githubCandidate(feed: url, finalURL: finalURL,
+            statusCode: response.statusCode, currentVersion: curVersion)
+        } else if !isGithubReleasesLatest, let data = data {
+          candidate = UpdatePolicy.jsonCandidate(data: data,
+            statusCode: response.statusCode, currentVersion: curVersion)
         } else {
-          self.updateStatusText = "当前已是最新版本（v\(curVersion)）。"
+          candidate = nil
+        }
+        if let update = candidate {
+          self.availableUpdate = UpdateReleaseInfo(version: update.version,
+            downloadUrl: update.downloadURL.absoluteString, notes: update.notes)
+          self.updateStatusText = "发现新稳定版本 v\(update.version)（当前 v\(curVersion)）"
+        } else {
+          self.updateStatusText = "未发现有效的新稳定版本（当前 v\(curVersion)）。"
         }
       }
     }.resume()
   }
 
   func downloadAndOpenUpdate(_ info: UpdateReleaseInfo) {
-    guard !updateDownloading, let url = URL(string: info.downloadUrl) else { return }
+    guard !updateDownloading, UpdatePolicy.isStable(info.version),
+          let url = UpdatePolicy.secureURL(info.downloadUrl) else { return }
     updateDownloading = true
     updateStatusText = "正在下载 v\(info.version) 更新包…"
 
