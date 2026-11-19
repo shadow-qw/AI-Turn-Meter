@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { isCodexOpenAiModel } from './adapters/codex.mjs';
 import { formatCacheRate, formatInlineSummary, formatTps, normalizeTurn, TOOL_LABELS } from './format.mjs';
 import { defaultCustomPricingPath, estimateTurnCost, loadCustomPricing } from './pricing.mjs';
+import { buildReceiptPunchlines, parseLocalDateRange } from './receipt.mjs';
 
 function startOfLocalDayMs(nowMs = Date.now()) {
   const d = new Date(nowMs);
@@ -213,6 +214,34 @@ export class TurnStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS fingerprint_runs (
+        id TEXT PRIMARY KEY,
+        created_at_ms INTEGER NOT NULL,
+        target_type TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        tool TEXT,
+        requested_model TEXT,
+        response_model TEXT,
+        mode TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        score INTEGER,
+        js_distance REAL,
+        summary TEXT,
+        details_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_fp_runs_created ON fingerprint_runs(created_at_ms DESC);
+
+      CREATE TABLE IF NOT EXISTS fingerprint_baselines (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        model TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        sample_count INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        distribution_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_fp_baselines_model ON fingerprint_baselines(model, created_at_ms DESC);
     `);
 
     try {
@@ -975,6 +1004,329 @@ export class TurnStore {
       todaySummary: this.getTodaySummary(Date.now(), null, enabledTools),
       recent,
     };
+  }
+
+  /**
+   * Build structured daily/range thermal-receipt payload ("Day Card").
+   */
+  getReceiptData({
+    date = null,
+    scope = 'day',
+    tool = null,
+    groupBy = 'model',
+    enabledTools = null,
+    nowMs = Date.now(),
+  } = {}) {
+    const range = parseLocalDateRange(date, scope, nowMs);
+    const normalizedGroup = groupBy === 'tool' || groupBy === 'project' ? groupBy : 'model';
+    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+
+    const rawRows = tool
+      ? this.db
+          .prepare(
+            `SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ? AND completed_at_ms < ? ORDER BY completed_at_ms ASC`
+          )
+          .all(tool, range.startMs, range.endMs)
+      : this.db
+          .prepare(
+            `SELECT * FROM turns WHERE completed_at_ms >= ? AND completed_at_ms < ? ORDER BY completed_at_ms ASC`
+          )
+          .all(range.startMs, range.endMs);
+    const rows =
+      !tool && enabledTools ? rawRows.filter((r) => enabledTools[r.tool] !== false) : rawRows;
+
+    const totalsAcc = createUsageAccumulator();
+    const itemMap = new Map();
+    const projectMap = new Map();
+    const modelCostMap = new Map();
+    const toolSet = new Set();
+    const hourlyCounts = new Array(24).fill(0);
+    let firstTurnAtMs = null;
+    let lastTurnAtMs = null;
+
+    for (const row of rows) {
+      addTurnToAccumulator(totalsAcc, row, customRates);
+      toolSet.add(row.tool);
+      const ts = Number(row.completed_at_ms) || 0;
+      if (ts > 0) {
+        if (firstTurnAtMs === null || ts < firstTurnAtMs) firstTurnAtMs = ts;
+        if (lastTurnAtMs === null || ts > lastTurnAtMs) lastTurnAtMs = ts;
+        hourlyCounts[new Date(ts).getHours()] += 1;
+      }
+
+      const rawWs = typeof row.workspace_path === 'string' ? row.workspace_path.trim() : '';
+      const projName = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : 'Independent chats';
+      const projKey = rawWs || '__independent__';
+      if (!projectMap.has(projKey)) {
+        projectMap.set(projKey, { name: projName, path: rawWs || '未绑定工作区目录', acc: createUsageAccumulator() });
+      }
+      addTurnToAccumulator(projectMap.get(projKey).acc, row, customRates);
+
+      const mName = row.model || 'unknown';
+      if (!modelCostMap.has(mName)) modelCostMap.set(mName, createUsageAccumulator());
+      addTurnToAccumulator(modelCostMap.get(mName), row, customRates);
+
+      let gKey;
+      let gLabel;
+      let gSublabel;
+      let gTool = row.tool;
+      if (normalizedGroup === 'tool') {
+        gKey = row.tool;
+        gLabel = TOOL_LABELS[row.tool] || row.tool;
+        gSublabel = row.tool;
+      } else if (normalizedGroup === 'project') {
+        gKey = projKey;
+        gLabel = projName;
+        gSublabel = rawWs || '独立对话';
+        gTool = null;
+      } else {
+        gKey = `${row.tool}\0${mName}`;
+        gLabel = mName;
+        gSublabel = TOOL_LABELS[row.tool] || row.tool;
+      }
+      if (!itemMap.has(gKey)) {
+        itemMap.set(gKey, { id: gKey, label: gLabel, sublabel: gSublabel, tool: gTool, acc: createUsageAccumulator() });
+      }
+      addTurnToAccumulator(itemMap.get(gKey).acc, row, customRates);
+    }
+
+    const totalsBase = finalizeAccumulator(totalsAcc);
+    const grossCostUsd =
+      totalsBase.estimatedCostUsd !== null
+        ? Number(((totalsBase.estimatedCostUsd || 0) + (totalsBase.cacheSavingsUsd || 0)).toFixed(4))
+        : null;
+    const totals = { ...totalsBase, grossCostUsd };
+
+    const items = Array.from(itemMap.values())
+      .map(({ id, label, sublabel, tool: itemTool, acc }) => {
+        const stats = finalizeAccumulator(acc);
+        const gross =
+          stats.estimatedCostUsd !== null
+            ? Number(((stats.estimatedCostUsd || 0) + (stats.cacheSavingsUsd || 0)).toFixed(4))
+            : null;
+        return {
+          id,
+          label,
+          sublabel,
+          tool: itemTool,
+          priced: stats.pricedTurnCount > 0,
+          sharePct:
+            totals.totalTokens > 0
+              ? Number(((stats.totalTokens / totals.totalTokens) * 100).toFixed(1))
+              : 0,
+          grossCostUsd: gross,
+          ...stats,
+        };
+      })
+      .sort(
+        (a, b) =>
+          (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
+      );
+
+    let peakHour = null;
+    let peakCount = 0;
+    for (let h = 0; h < 24; h += 1) {
+      if (hourlyCounts[h] > peakCount) {
+        peakCount = hourlyCounts[h];
+        peakHour = `${String(h).padStart(2, '0')}:00`;
+      }
+    }
+
+    const topProjEntry = Array.from(projectMap.values())
+      .map((p) => ({ name: p.name, path: p.path, stats: finalizeAccumulator(p.acc) }))
+      .sort((a, b) => (b.stats.estimatedCostUsd ?? -1) - (a.stats.estimatedCostUsd ?? -1) || b.stats.totalTokens - a.stats.totalTokens)[0];
+    const topModelEntry = Array.from(modelCostMap.entries())
+      .map(([m, acc]) => ({ model: m, stats: finalizeAccumulator(acc) }))
+      .sort((a, b) => (b.stats.estimatedCostUsd ?? -1) - (a.stats.estimatedCostUsd ?? -1) || b.stats.totalTokens - a.stats.totalTokens)[0];
+
+    // Also provide recent 90 days of active dates for Day Card navigation
+    const since90Ms = nowMs - 90 * 86_400_000;
+    const histRows = tool
+      ? this.db
+          .prepare(`SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, thinking_tokens, call_count, tps, model, explicit_cost_usd, tool FROM turns WHERE tool = ? AND completed_at_ms >= ? ORDER BY completed_at_ms DESC`)
+          .all(tool, since90Ms)
+      : this.db
+          .prepare(`SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, thinking_tokens, call_count, tps, model, explicit_cost_usd, tool FROM turns WHERE completed_at_ms >= ? ORDER BY completed_at_ms DESC`)
+          .all(since90Ms);
+    const filteredHist =
+      !tool && enabledTools ? histRows.filter((r) => enabledTools[r.tool] !== false) : histRows;
+    const availMap = new Map();
+    for (const r of filteredHist) {
+      const dk = toLocalDateKey(r.completed_at_ms);
+      if (!availMap.has(dk)) availMap.set(dk, createUsageAccumulator());
+      addTurnToAccumulator(availMap.get(dk), r, customRates);
+    }
+    const availableDates = Array.from(availMap.entries())
+      .sort(([a], [b]) => b.localeCompare(a))
+      .map(([d, acc]) => {
+        const s = finalizeAccumulator(acc);
+        return {
+          date: d,
+          turnCount: s.turnCount,
+          totalInputTokens: s.totalInputTokens,
+          outputTokens: s.outputTokens,
+          totalTokens: s.totalTokens,
+          estimatedCostUsd: s.estimatedCostUsd,
+          cacheSavingsUsd: s.cacheSavingsUsd,
+        };
+      });
+
+    const compactDate = range.date.replace(/-/g, '');
+    const receiptNo = `ATM-${compactDate}-${String(totals.turnCount).padStart(3, '0')}`;
+    const receipt = {
+      receiptNo,
+      scope: range.scope,
+      date: range.date,
+      startDate: range.startDate,
+      weekdayLabel: range.weekdayLabel,
+      rangeLabel: range.rangeLabel,
+      groupBy: normalizedGroup,
+      toolFilter: tool || 'all',
+      generatedAtMs: nowMs,
+      activeTools: Array.from(toolSet),
+      totals,
+      items,
+      highlights: {
+        firstTurnAtMs,
+        lastTurnAtMs,
+        peakHour,
+        hourlyCounts,
+        topProject: topProjEntry
+          ? {
+              name: topProjEntry.name,
+              path: topProjEntry.path,
+              costUsd: topProjEntry.stats.estimatedCostUsd,
+              totalTokens: topProjEntry.stats.totalTokens,
+            }
+          : null,
+        topModel: topModelEntry
+          ? {
+              model: topModelEntry.model,
+              costUsd: topModelEntry.stats.estimatedCostUsd,
+              totalTokens: topModelEntry.stats.totalTokens,
+            }
+          : null,
+      },
+      availableDates,
+      barcodeSeed: `${receiptNo}:${totals.totalTokens}:${totals.estimatedCostUsd ?? 0}`,
+    };
+    receipt.punchlines = buildReceiptPunchlines(receipt);
+    return receipt;
+  }
+
+  saveFingerprintRun(run) {
+    const id = run.id || `fp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const createdAtMs = Number(run.createdAtMs) || Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO fingerprint_runs (
+          id, created_at_ms, target_type, target_name, tool,
+          requested_model, response_model, mode, verdict, score,
+          js_distance, summary, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          verdict = excluded.verdict,
+          score = excluded.score,
+          js_distance = excluded.js_distance,
+          summary = excluded.summary,
+          details_json = excluded.details_json`
+      )
+      .run(
+        id,
+        createdAtMs,
+        run.targetType || 'endpoint',
+        run.targetName || 'unknown',
+        run.tool || null,
+        run.requestedModel || null,
+        run.responseModel || null,
+        run.mode || 'quick',
+        run.verdict || 'unknown',
+        typeof run.score === 'number' && Number.isFinite(run.score) ? Math.round(run.score) : null,
+        typeof run.jsDistance === 'number' && Number.isFinite(run.jsDistance) ? run.jsDistance : null,
+        run.summary || '',
+        JSON.stringify(run.details || {})
+      );
+    return { ...run, id, createdAtMs };
+  }
+
+  listFingerprintRuns(limit = 30) {
+    const rows = this.db
+      .prepare(`SELECT * FROM fingerprint_runs ORDER BY created_at_ms DESC LIMIT ?`)
+      .all(Math.min(100, Math.max(1, Number(limit) || 30)));
+    return rows.map((r) => {
+      let details = {};
+      try {
+        details = r.details_json ? JSON.parse(r.details_json) : {};
+      } catch {}
+      return {
+        id: r.id,
+        createdAtMs: r.created_at_ms,
+        targetType: r.target_type,
+        targetName: r.target_name,
+        tool: r.tool || null,
+        requestedModel: r.requested_model || null,
+        responseModel: r.response_model || null,
+        mode: r.mode,
+        verdict: r.verdict,
+        score: r.score !== null && r.score !== undefined ? Number(r.score) : null,
+        jsDistance: r.js_distance !== null && r.js_distance !== undefined ? Number(r.js_distance) : null,
+        summary: r.summary || '',
+        details,
+      };
+    });
+  }
+
+  saveFingerprintBaseline(baseline) {
+    const id = baseline.id || `bl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const createdAtMs = Number(baseline.createdAtMs) || Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO fingerprint_baselines (
+          id, name, model, target_name, sample_count, created_at_ms, distribution_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          sample_count = excluded.sample_count,
+          created_at_ms = excluded.created_at_ms,
+          distribution_json = excluded.distribution_json`
+      )
+      .run(
+        id,
+        baseline.name || baseline.model || '基线',
+        baseline.model || 'unknown',
+        baseline.targetName || 'endpoint',
+        Number(baseline.sampleCount) || 0,
+        createdAtMs,
+        JSON.stringify(baseline.distribution || {})
+      );
+    return { ...baseline, id, createdAtMs };
+  }
+
+  listFingerprintBaselines() {
+    const rows = this.db
+      .prepare(`SELECT * FROM fingerprint_baselines ORDER BY created_at_ms DESC`)
+      .all();
+    return rows.map((r) => {
+      let distribution = {};
+      try {
+        distribution = r.distribution_json ? JSON.parse(r.distribution_json) : {};
+      } catch {}
+      return {
+        id: r.id,
+        name: r.name,
+        model: r.model,
+        targetName: r.target_name,
+        sampleCount: r.sample_count,
+        createdAtMs: r.created_at_ms,
+        distribution,
+      };
+    });
+  }
+
+  deleteFingerprintBaseline(id) {
+    if (!id) return false;
+    const res = this.db.prepare(`DELETE FROM fingerprint_baselines WHERE id = ?`).run(id);
+    return (res?.changes || 0) > 0;
   }
 
   close() {

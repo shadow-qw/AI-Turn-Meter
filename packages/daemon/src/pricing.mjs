@@ -137,6 +137,13 @@ const MODEL_PRICING_PER_M = {
   'codex-auto-review': { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
 
   // Google / Antigravity
+  'gemini-4-neon': {
+    input: 2.0,
+    cacheRead: 0.2,
+    output: 12.0,
+    thresholdTokens: 200_000,
+    above: { input: 4.0, cacheRead: 0.4, output: 18.0 },
+  },
   'gemini-4-hydrogen': {
     input: 2.0,
     cacheRead: 0.2,
@@ -161,6 +168,7 @@ const MODEL_PRICING_PER_M = {
   'gemini-4-argon': { input: 0.3, cacheRead: 0.03, output: 2.5 },
   'gemini-4-argon-trial': { input: 0.3, cacheRead: 0.03, output: 2.5 },
   'gemini-3.8-flash-n': { input: 0.3, cacheRead: 0.03, output: 2.5 },
+  'gemini-3.8-flash': { input: 0.3, cacheRead: 0.03, output: 2.5 },
   'gemini-flash-worker-agy': { input: 0.3, cacheRead: 0.03, output: 2.5 },
   'gemini-3.1-pro': {
     input: 2.0,
@@ -188,10 +196,13 @@ const MODEL_PRICING_PER_M = {
   // Anthropic Claude
   'claude-opus-5.5': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
   'claude-opus-5-5-high': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
+  'claude-opus-5': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
   'claude-opus-4.8': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
   'claude-opus-4.7': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
   'claude-opus-4.6': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
   'claude-opus-4.5': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
+  'claude-sonnet-5.5': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
+  'claude-sonnet-5': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
   'claude-sonnet-4.6': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
   'claude-sonnet-4.5': {
     input: 3.0,
@@ -217,10 +228,13 @@ const MODEL_PRICING_PER_M = {
   'kimi-k3': { input: 0.6, cacheRead: 0.1, cacheWrite: 0.6, output: 2.5 },
   k3: { input: 0.6, cacheRead: 0.1, cacheWrite: 0.6, output: 2.5 },
   'deepseek-v4': { input: 0.27, cacheRead: 0.07, output: 1.1 },
+  'deepseek-v4-pro': { input: 0.55, cacheRead: 0.14, output: 2.19 },
   'deepseek-flash-cyber': { input: 0.27, cacheRead: 0.07, output: 1.1 },
   'deepseek-v3': { input: 0.27, cacheRead: 0.07, output: 1.1 },
   'deepseek-r1': { input: 0.55, cacheRead: 0.14, output: 2.19 },
   'grok-4.7': { input: 3.0, cacheRead: 0.75, output: 15.0 },
+  'grok-4.6': { input: 3.0, cacheRead: 0.75, output: 15.0 },
+  'grok-4.5': { input: 3.0, cacheRead: 0.75, output: 15.0 },
   'grok-4': { input: 3.0, cacheRead: 0.75, output: 15.0 },
   hy4: { input: 1.0, cacheRead: 0.25, output: 4.0 },
   hy4std: { input: 1.0, cacheRead: 0.25, output: 4.0 },
@@ -229,6 +243,10 @@ const MODEL_PRICING_PER_M = {
   'hy4-flash': { input: 0.2, cacheRead: 0.05, output: 0.8 },
   hy3: { input: 0.2, cacheRead: 0.05, output: 0.8 },
   'glm-5.3-flash': { input: 0.15, cacheRead: 0.03, output: 0.6 },
+  'glm-5.3': { input: 0.6, cacheRead: 0.12, output: 2.2 },
+  'glm-5.2': { input: 0.6, cacheRead: 0.12, output: 2.2 },
+  'glm-5.0': { input: 0.6, cacheRead: 0.12, output: 2.2 },
+  'glm-5v-turbo': { input: 0.2, cacheRead: 0.04, output: 0.8 },
 };
 
 const MODEL_ALIASES = {
@@ -280,23 +298,40 @@ function normalizeModelCandidates(rawModel) {
   }
 
   for (const c of Array.from(candidates)) {
-    const spaced = c.replace(/\s+/g, '-');
+    // Strip trailing parenthetical qualifiers like "(1M context)" or "(Auto Balanced)"
+    const noParens = c.replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+    const spaced = noParens.replace(/\s+/g, '-');
     candidates.add(spaced);
+    // Strip optional provider prefix like "cursor-"
+    const noPrefix = spaced.replace(/^cursor-/, '');
+    candidates.add(noPrefix);
     // Strip trailing YYYYMMDD snapshots (e.g. claude-opus-4-5-20251101)
-    const noDate = spaced.replace(/-\d{8}$/, '');
+    const noDate = noPrefix.replace(/-\d{8}$/, '');
     candidates.add(noDate);
-    // Strip reasoning-effort suffixes (e.g. gemini-4-carbon-high, grok-4.7-xhigh)
-    const noEffort = noDate.replace(/-(?:xhigh|high|medium|low|fast)$/, '');
+    // Strip context / reasoning-effort / speed suffixes (e.g. -1m, -thinking-high, -xhigh-fast, -max)
+    const noEffort = noDate
+      .replace(/-(?:1m|200k)$/, '')
+      .replace(/(?:-(?:thinking|xhigh|high|medium|low|fast|max))+$/, '');
     candidates.add(noEffort);
-    // Normalize claude-opus-5-5 -> claude-opus-5.5
-    const dotted = noEffort.replace(/(\d+)-(\d+)(?=-|$)/g, '$1.$2');
+    // Normalize claude-opus-5-5 -> claude-opus-5.5 and glm-5p3 -> glm-5.3
+    const dotted = noEffort
+      .replace(/(\d+)-(\d+)(?=-|$)/g, '$1.$2')
+      .replace(/(\d+)p(\d+)(?=-|$)/g, '$1.$2');
     candidates.add(dotted);
+    // Normalize inverted Claude ordering: claude-4.5-opus -> claude-opus-4.5, claude-4.0-sonnet -> claude-sonnet-4
+    const revClaude = dotted.match(/^claude-(\d+(?:\.\d+)?)-(opus|sonnet|haiku)$/);
+    if (revClaude) {
+      const ver = revClaude[1].replace(/\.0$/, '');
+      candidates.add(`claude-${revClaude[2]}-${ver}`);
+    }
     // Map newer gpt-6.<minor>-<tier> (e.g. gpt-6.2-astra, gpt-6.3-mini) to known rates
     const gpt6Match = dotted.match(/^gpt-6(?:\.\d+)?-([a-z]+)$/);
     if (gpt6Match) {
       candidates.add(`gpt-6.1-${gpt6Match[1]}`);
       candidates.add(`gpt-6-${gpt6Match[1]}`);
     }
+    // Map hy3-dev* variants to hy3
+    if (/^hy3-dev/.test(dotted)) candidates.add('hy3');
   }
 
   for (const c of Array.from(candidates)) {

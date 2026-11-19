@@ -13,7 +13,7 @@
  *   ai-turn-meter daemon [--port=47831]
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   APP_SPECS,
@@ -62,6 +62,8 @@ function printHelp() {
 Usage:
   ai-turn-meter [status]                查看后台守护进程、CDP 与 4 家最近一轮指标
   ai-turn-meter cost [--days=7]         查看今日/本周/历史 Token 用量与 API 等效费用估算
+  ai-turn-meter receipt [--date=...]    打印超市小票风每日账单（支持 --scope=day|week|month --group=model|tool|project --currency=both|usd|cny --rate=7 --svg=out.svg）
+  ai-turn-meter fingerprint [--mode=.]  运行模型指纹与降智检测（passive|codex_protocol|quick|deep，支持 --target=codex|<id> --record-baseline）
   ai-turn-meter doctor                  检查 Node、LaunchAgent、Cursor Hooks、VSIX 与 CDP 状态
   ai-turn-meter install                 安装或更新 LaunchAgent、Cursor Hooks、VSIX 与 CLI 软链
     --dry-run                           仅预览安装步骤，不写入文件
@@ -333,6 +335,173 @@ async function cmdCost(flags, jsonMode = false) {
   }
 }
 
+async function cmdReceipt(flags, jsonMode = false) {
+  const getVal = (prefix) => {
+    const f = flags.find((a) => a.startsWith(prefix));
+    return f ? f.slice(prefix.length).trim() : '';
+  };
+  const date = getVal('--date=') || null;
+  const scope = getVal('--scope=') || 'day';
+  const tool = getVal('--tool=') || null;
+  const groupBy = getVal('--group=') || getVal('--group-by=') || 'model';
+  const currency = getVal('--currency=') || 'both';
+  const rateRaw = Number(getVal('--rate='));
+  const usdToCny = Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 7;
+  const theme = getVal('--theme=') === 'dark' ? 'dark' : 'paper';
+  const svgPath = getVal('--svg=') || null;
+  const hideProjects = flags.includes('--hide-projects');
+
+  let receipt = null;
+  try {
+    const qs = new URLSearchParams({ scope, groupBy });
+    if (date) qs.set('date', date);
+    if (tool) qs.set('tool', tool);
+    const res = await fetch(`http://127.0.0.1:${PORT}/v1/receipt?${qs.toString()}`, {
+      signal: AbortSignal.timeout(2500),
+    });
+    if (res.ok) receipt = await res.json();
+  } catch {}
+
+  if (!receipt) {
+    const { TurnStore } = await import('../src/store.mjs');
+    const store = new TurnStore();
+    try {
+      receipt = store.getReceiptData({ date, scope, tool, groupBy });
+    } finally {
+      store.close();
+    }
+  }
+
+  const { renderReceiptAscii, renderReceiptSvg } = await import('../src/receipt.mjs');
+  if (svgPath) {
+    const svg = renderReceiptSvg(receipt, { theme, currency, usdToCny, hideProjects });
+    writeFileSync(svgPath, svg, 'utf8');
+    if (!jsonMode) {
+      console.log(`已导出热敏小票 SVG: ${svgPath}`);
+    }
+  }
+
+  if (jsonMode) {
+    console.log(JSON.stringify({ receipt, svgPath }));
+    return;
+  }
+  console.log(renderReceiptAscii(receipt, { currency, usdToCny, hideProjects }));
+}
+
+async function cmdFingerprint(flags, jsonMode = false) {
+  const getVal = (prefix) => {
+    const f = flags.find((a) => a.startsWith(prefix));
+    return f ? f.slice(prefix.length).trim() : '';
+  };
+  const mode = getVal('--mode=') || 'passive';
+  const target = getVal('--target=') || 'codex';
+  const days = Math.max(1, Number(getVal('--days=')) || 7);
+  const sampleCount = Math.max(10, Number(getVal('--samples=')) || 50);
+  const recordBaseline = flags.includes('--record-baseline');
+  const baselineName = getVal('--baseline-name=') || null;
+  const baselineId = getVal('--baseline-id=') || null;
+  const model = getVal('--model=') || null;
+
+  let out = null;
+  try {
+    const res = await fetch(`http://127.0.0.1:${PORT}/v1/fingerprint/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode,
+        target,
+        days,
+        sampleCount,
+        recordBaseline,
+        baselineName,
+        baselineId,
+        model,
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (res.ok) out = await res.json();
+  } catch {}
+
+  if (!out) {
+    const { TurnStore } = await import('../src/store.mjs');
+    const {
+      analyzePassiveTelemetry,
+      probeCodexProtocol,
+      runQuickCapabilityProbes,
+      runTokenDistributionFingerprint,
+    } = await import('../src/fingerprint.mjs');
+    const store = new TurnStore();
+    try {
+      if (mode === 'passive') {
+        const passive = analyzePassiveTelemetry(store, { days });
+        out = { ok: true, mode, passive };
+      } else if (mode === 'codex_protocol' || mode === 'protocol') {
+        const run = await probeCodexProtocol({ modelOverride: model });
+        out = { ok: run.ok, mode: 'codex_protocol', run: store.saveFingerprintRun(run) };
+      } else if (mode === 'quick') {
+        const run = await runQuickCapabilityProbes({
+          targetType: 'codex',
+          endpointConfig: model ? { model } : undefined,
+        });
+        out = { ok: run.ok, mode: 'quick', run: store.saveFingerprintRun(run) };
+      } else if (mode === 'deep') {
+        const run = await runTokenDistributionFingerprint({
+          targetType: 'codex',
+          endpointConfig: model ? { model } : undefined,
+          sampleCount,
+          recordBaseline,
+          baselineName,
+          baselineId,
+          store,
+        });
+        out = { ok: run.ok, mode: 'deep', run: store.saveFingerprintRun(run) };
+      } else {
+        out = { ok: false, error: `离线模式暂不支持 ${mode}` };
+      }
+    } finally {
+      store.close();
+    }
+  }
+
+  if (jsonMode) {
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  if (out.passive) {
+    const p = out.passive;
+    console.log(`模型降智被动诊断（近 ${p.days} 天 · 扫描 ${p.totalTurnsScanned} 轮 · 状态: ${p.overallStatus}）`);
+    for (const info of Object.values(p.byTool || {})) {
+      console.log(
+        `- ${info.toolLabel.padEnd(11)} [${info.status}]  ${info.turnCount} 轮 | 异常 ${info.anomalyCount} 条${info.latestModel ? ` | 最新模型: ${info.latestModel}` : ''}`
+      );
+    }
+    if (Array.isArray(p.anomalies) && p.anomalies.length > 0) {
+      console.log('\n可疑轮次:');
+      for (const a of p.anomalies.slice(0, 10)) {
+        console.log(`  ! [${a.toolLabel}/${a.model}] ${a.title} — ${a.detail}`);
+      }
+    }
+    return;
+  }
+
+  const r = out.run;
+  if (!r) {
+    console.error(out.error || '检测执行失败');
+    process.exit(1);
+  }
+  console.log(`[${r.mode}] ${r.targetName} | 结论: ${r.verdict}${r.score !== null && r.score !== undefined ? ` (${r.score}/100)` : ''}`);
+  console.log(`摘要: ${r.summary}`);
+  if (Array.isArray(r.details?.probes)) {
+    for (const p of r.details.probes) {
+      console.log(`  - [${p.passed ? 'PASS' : 'FAIL'}] ${p.name}: ${p.reason}`);
+    }
+  }
+  if (r.jsDistance !== null && r.jsDistance !== undefined) {
+    console.log(`JS 散度: ${r.jsDistance} (基线: ${r.details?.baselineName || '无'})`);
+  }
+}
+
 function cmdSshInfo(host = '<remote-host>', jsonMode = false) {
   const remoteHooks = buildRemoteHooksConfig(PORT);
   const oneLiner = buildRemoteSshOneLiner(host, { port: PORT });
@@ -422,6 +591,10 @@ if (flags.includes('--version') || flags.includes('-v')) {
   await cmdStatus(jsonMode);
 } else if (cmd === 'cost') {
   await cmdCost(flags, jsonMode);
+} else if (cmd === 'receipt') {
+  await cmdReceipt(flags, jsonMode);
+} else if (cmd === 'fingerprint') {
+  await cmdFingerprint(flags, jsonMode);
 } else if (cmd === 'doctor') {
   await cmdDoctor(jsonMode);
 } else if (cmd === 'install' || cmd === 'setup') {

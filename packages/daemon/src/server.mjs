@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { dirname, join } from 'node:path';
@@ -7,8 +8,19 @@ import { AntigravityAdapter } from './adapters/antigravity.mjs';
 import { CodeBuddyAdapter } from './adapters/codebuddy.mjs';
 import { drainCursorSpool, processCursorHookPayload, syncCursorHistoryEvents } from './adapters/cursor.mjs';
 import { CdpInlineInjector } from './cdp-injector.mjs';
+import {
+  analyzePassiveTelemetry,
+  buildManualProbePack,
+  inspectLocalCodexConfig,
+  probeCodexProtocol,
+  runQuickCapabilityProbes,
+  runTokenDistributionFingerprint,
+  sanitizeEndpoint,
+  scoreManualProbeResponse,
+} from './fingerprint.mjs';
 import { getPackageMeta } from './installer.mjs';
 import { fetchCursorQuota, getAllQuotas } from './quota.mjs';
+import { renderReceiptAscii, renderReceiptSvg } from './receipt.mjs';
 import { TurnStore } from './store.mjs';
 
 const TOOL_KEYS = ['antigravity', 'codex', 'cursor', 'codebuddy'];
@@ -20,6 +32,7 @@ function loadMeterConfig(configPath) {
     inlineEnabled: true,
     inlineTools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
     cursorCookie: null,
+    fingerprintEndpoints: [],
   };
   if (!configPath || !existsSync(configPath)) return defaults;
   try {
@@ -34,12 +47,26 @@ function loadMeterConfig(configPath) {
       typeof raw?.cursorCookie === 'string' && raw.cursorCookie.trim()
         ? raw.cursorCookie.trim()
         : null;
+    const fingerprintEndpoints = Array.isArray(raw?.fingerprintEndpoints)
+      ? raw.fingerprintEndpoints
+          .filter((ep) => ep && typeof ep === 'object' && typeof ep.baseUrl === 'string' && ep.baseUrl.trim())
+          .map((ep) => ({
+            id: typeof ep.id === 'string' && ep.id.trim() ? ep.id.trim() : `ep-${randomUUID().slice(0, 8)}`,
+            name: typeof ep.name === 'string' && ep.name.trim() ? ep.name.trim() : ep.model || '自定义端点',
+            protocol: ep.protocol === 'anthropic' ? 'anthropic' : 'openai',
+            baseUrl: ep.baseUrl.trim(),
+            model: typeof ep.model === 'string' ? ep.model.trim() : '',
+            apiKey: typeof ep.apiKey === 'string' ? ep.apiKey.trim() : '',
+            createdAtMs: Number(ep.createdAtMs) || Date.now(),
+          }))
+      : [];
     return {
       enabled: typeof raw?.enabled === 'boolean' ? raw.enabled : true,
       tools,
       inlineEnabled: typeof raw?.inlineEnabled === 'boolean' ? raw.inlineEnabled : true,
       inlineTools,
       cursorCookie,
+      fingerprintEndpoints,
     };
   } catch {
     return defaults;
@@ -238,6 +265,104 @@ export function createMeterServer({
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/v1/receipt') {
+      const date = url.searchParams.get('date') || null;
+      const scope = url.searchParams.get('scope') || 'day';
+      const tool = url.searchParams.get('tool') || null;
+      const groupBy = url.searchParams.get('groupBy') || 'model';
+      const format = (url.searchParams.get('format') || 'json').toLowerCase();
+      const theme = url.searchParams.get('theme') === 'dark' ? 'dark' : 'paper';
+      const currency = url.searchParams.get('currency') || 'both';
+      const rateRaw = Number(url.searchParams.get('rate'));
+      const usdToCny = Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 7;
+      const hideProjects = url.searchParams.get('hideProjects') === '1' || url.searchParams.get('hideProjects') === 'true';
+      const punchlineIndex = Number(url.searchParams.get('punchline')) || 0;
+
+      const receipt = store.getReceiptData({
+        date,
+        scope,
+        tool,
+        groupBy,
+        enabledTools: config.tools,
+      });
+
+      if (format === 'ascii' || format === 'text') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(renderReceiptAscii(receipt, { currency, usdToCny, hideProjects, punchlineIndex }));
+        return;
+      }
+      if (format === 'svg') {
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8' });
+        res.end(renderReceiptSvg(receipt, { theme, currency, usdToCny, hideProjects, punchlineIndex }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(receipt));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/fingerprint/overview') {
+      const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days')) || 7));
+      const passive = analyzePassiveTelemetry(store, { days });
+      const codexRaw = inspectLocalCodexConfig();
+      const codex = {
+        configured: codexRaw.configured,
+        authMode: codexRaw.authMode,
+        model: codexRaw.model,
+        modelProvider: codexRaw.modelProvider,
+        baseUrl: codexRaw.baseUrl,
+        wireApi: codexRaw.wireApi,
+        hasAccessToken: codexRaw.hasAccessToken,
+        hasApiKey: codexRaw.hasApiKey,
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          passive,
+          codex,
+          endpoints: (config.fingerprintEndpoints || []).map(sanitizeEndpoint),
+          baselines: store.listFingerprintBaselines(),
+          runs: store.listFingerprintRuns(25),
+          manualProbe: buildManualProbePack(),
+        })
+      );
+      return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/v1/fingerprint/endpoints') {
+      const id = url.searchParams.get('id');
+      if (!id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'missing id' }));
+        return;
+      }
+      const prevLen = (config.fingerprintEndpoints || []).length;
+      config.fingerprintEndpoints = (config.fingerprintEndpoints || []).filter((ep) => ep.id !== id);
+      persistConfig();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          deleted: config.fingerprintEndpoints.length < prevLen,
+          endpoints: config.fingerprintEndpoints.map(sanitizeEndpoint),
+        })
+      );
+      return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/v1/fingerprint/baselines') {
+      const id = url.searchParams.get('id');
+      if (!id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'missing id' }));
+        return;
+      }
+      const deleted = store.deleteFingerprintBaseline(id);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, deleted, baselines: store.listFingerprintBaselines() }));
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/v1/match') {
       const tool = url.searchParams.get('tool') || null;
       const workspacePath = url.searchParams.get('workspace') || null;
@@ -283,7 +408,9 @@ export function createMeterServer({
       (url.pathname === '/v1/ingest' ||
         url.pathname === '/v1/ingest/cursor-hook' ||
         url.pathname === '/v1/config' ||
-        url.pathname === '/v1/cursor/sync-local')
+        url.pathname === '/v1/cursor/sync-local' ||
+        url.pathname === '/v1/fingerprint/endpoints' ||
+        url.pathname === '/v1/fingerprint/run')
     ) {
       let body = '';
       req.setEncoding('utf8');
@@ -298,6 +425,174 @@ export function createMeterServer({
       req.on('end', () => {
         try {
           const payload = body.trim() ? JSON.parse(body) : {};
+          if (url.pathname === '/v1/fingerprint/endpoints') {
+            const baseUrl = typeof payload?.baseUrl === 'string' ? payload.baseUrl.trim() : '';
+            const model = typeof payload?.model === 'string' ? payload.model.trim() : '';
+            if (!baseUrl || !model) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: '请填写 Base URL 和模型名称' }));
+              return;
+            }
+            const id =
+              typeof payload?.id === 'string' && payload.id.trim()
+                ? payload.id.trim()
+                : `ep-${randomUUID().slice(0, 8)}`;
+            const existing = (config.fingerprintEndpoints || []).find((e) => e.id === id);
+            const nextEp = {
+              id,
+              name:
+                typeof payload?.name === 'string' && payload.name.trim()
+                  ? payload.name.trim()
+                  : model,
+              protocol: payload?.protocol === 'anthropic' ? 'anthropic' : 'openai',
+              baseUrl,
+              model,
+              apiKey:
+                typeof payload?.apiKey === 'string' && payload.apiKey.trim()
+                  ? payload.apiKey.trim()
+                  : existing?.apiKey || '',
+              createdAtMs: existing?.createdAtMs || Date.now(),
+            };
+            config.fingerprintEndpoints = [
+              ...(config.fingerprintEndpoints || []).filter((e) => e.id !== id),
+              nextEp,
+            ];
+            persistConfig();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                endpoint: sanitizeEndpoint(nextEp),
+                endpoints: config.fingerprintEndpoints.map(sanitizeEndpoint),
+              })
+            );
+            return;
+          }
+
+          if (url.pathname === '/v1/fingerprint/run') {
+            const mode = String(payload?.mode || 'passive').trim();
+            const handleRun = async () => {
+              if (mode === 'passive') {
+                const days = Math.max(1, Math.min(90, Number(payload?.days) || 7));
+                const passive = analyzePassiveTelemetry(store, { days, tool: payload?.tool || null });
+                const saved = store.saveFingerprintRun({
+                  targetType: 'passive',
+                  targetName: payload?.tool ? `被动诊断 (${payload.tool})` : '全客户端被动诊断',
+                  tool: payload?.tool || null,
+                  mode: 'passive',
+                  verdict: passive.overallStatus,
+                  score:
+                    passive.overallStatus === 'healthy'
+                      ? 100
+                      : passive.overallStatus === 'warning'
+                        ? 75
+                        : passive.overallStatus === 'degraded'
+                          ? 40
+                          : null,
+                  summary: `扫描 ${passive.totalTurnsScanned} 轮，发现 ${passive.anomalies.length} 条异常信号`,
+                  details: {
+                    days: passive.days,
+                    anomalyCount: passive.anomalies.length,
+                    anomalies: passive.anomalies.slice(0, 10),
+                  },
+                });
+                return { ok: true, mode, passive, run: saved };
+              }
+
+              if (mode === 'codex_protocol') {
+                const result = await probeCodexProtocol({
+                  modelOverride: typeof payload?.model === 'string' && payload.model.trim() ? payload.model.trim() : null,
+                });
+                const saved = store.saveFingerprintRun(result);
+                return { ok: result.ok, mode, run: saved };
+              }
+
+              if (mode === 'manual_score') {
+                const tool = typeof payload?.tool === 'string' && payload.tool.trim() ? payload.tool.trim() : 'antigravity';
+                let replyText = typeof payload?.replyText === 'string' ? payload.replyText.trim() : '';
+                let model = typeof payload?.model === 'string' && payload.model.trim() ? payload.model.trim() : 'unknown';
+                if (!replyText) {
+                  const latest = store.getRecentTurns(5, tool).find((t) => t.replyPreview);
+                  if (latest) {
+                    replyText = latest.replyPreview || '';
+                    if (model === 'unknown' && latest.model) model = latest.model;
+                  }
+                }
+                const result = scoreManualProbeResponse(replyText, { tool, model });
+                const saved = result.ok ? store.saveFingerprintRun(result) : result;
+                return { ok: result.ok, mode, run: saved };
+              }
+
+              // L1 quick or L2 deep
+              const target = payload?.target || 'codex';
+              let targetType = 'endpoint';
+              let targetName = null;
+              let endpointConfig = null;
+              if (target === 'codex') {
+                targetType = 'codex';
+                endpointConfig =
+                  typeof payload?.model === 'string' && payload.model.trim()
+                    ? { model: payload.model.trim() }
+                    : undefined;
+              } else {
+                const savedEp = (config.fingerprintEndpoints || []).find(
+                  (e) => e.id === target || e.id === payload?.endpointId
+                );
+                if (savedEp) {
+                  endpointConfig = savedEp;
+                  targetName = savedEp.name;
+                } else if (payload?.endpoint && typeof payload.endpoint === 'object') {
+                  endpointConfig = payload.endpoint;
+                  targetName = payload.endpoint.name || payload.endpoint.model || '临时端点';
+                } else {
+                  return { ok: false, error: '未找到指定端点配置' };
+                }
+              }
+
+              if (mode === 'quick') {
+                const result = await runQuickCapabilityProbes({
+                  targetType,
+                  targetName,
+                  endpointConfig,
+                });
+                const saved = store.saveFingerprintRun(result);
+                return { ok: result.ok, mode, run: saved };
+              }
+
+              if (mode === 'deep') {
+                const result = await runTokenDistributionFingerprint({
+                  targetType,
+                  targetName,
+                  endpointConfig,
+                  sampleCount: Number(payload?.sampleCount) || 50,
+                  recordBaseline: Boolean(payload?.recordBaseline),
+                  baselineName: typeof payload?.baselineName === 'string' ? payload.baselineName.trim() : null,
+                  baselineId: typeof payload?.baselineId === 'string' ? payload.baselineId.trim() : null,
+                  store,
+                });
+                const saved = store.saveFingerprintRun(result);
+                return { ok: result.ok, mode, run: saved, baselines: store.listFingerprintBaselines() };
+              }
+
+              return { ok: false, error: `不支持的检测模式: ${mode}` };
+            };
+
+            handleRun()
+              .then((out) => {
+                if (!res.headersSent) {
+                  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                  res.end(JSON.stringify(out));
+                }
+              })
+              .catch((err) => {
+                if (!res.headersSent) {
+                  res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+                  res.end(JSON.stringify({ ok: false, error: err?.message || '检测执行失败' }));
+                }
+              });
+            return;
+          }
+
           if (url.pathname === '/v1/cursor/sync-local') {
             const safeStoragePasswords = Array.isArray(payload?.passwords)
               ? payload.passwords.filter((p) => typeof p === 'string' && p.length > 0)
