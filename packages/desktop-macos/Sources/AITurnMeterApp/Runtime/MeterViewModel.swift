@@ -1,0 +1,1684 @@
+import AITurnMeterCore
+import AppKit
+import SwiftUI
+import UniformTypeIdentifiers
+import WebKit
+
+@MainActor
+final class MeterViewModel: ObservableObject {
+  let runtime = MeterRuntime()
+
+  private enum PrefKey {
+    static let showMenuBarExtra = "aiTurnMeter.showMenuBarExtra"
+    static let showMenuBarSummary = "aiTurnMeter.showMenuBarSummary"
+    static let menuBarDisplayMode = "atm.menuBarDisplayMode.v3"
+    static let menuBarIconStyle = "atm.menuBarIconStyle.v1"
+    static let menuBarProvider = "atm.menuBarProvider.v1"
+    static let menuBarUsageScope = "atm.menuBarUsageScope.v1"
+    static let quotaDisplayMode = "atm.quotaDisplayMode.v1"
+    static let hideDockIcon = "aiTurnMeter.hideDockIcon"
+    static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
+    static let receiptCurrencyMode = "atm.receiptCurrencyMode.v1"
+    static let receiptUsdToCny = "atm.receiptUsdToCny.v1"
+    static let receiptTheme = "atm.receiptTheme.v1"
+    static let receiptHideProjects = "atm.receiptHideProjects.v1"
+  }
+
+  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.26"
+  @Published var daemonVersion: String? = nil
+  @Published var updateFeedUrl: String? = nil
+  @Published var daemonOnline: Bool = false
+  @Published var daemonPort: Int = 47831
+  @Published var launchAgentExists: Bool = false
+  @Published var launchAgentLoaded: Bool = false
+
+  @Published var masterEnabled: Bool = true
+  @Published var toolToggles: [String: Bool] = [
+    "antigravity": true,
+    "codex": true,
+    "cursor": true,
+    "codebuddy": true,
+  ]
+  @Published var inlineMasterEnabled: Bool = true
+  @Published var inlineToolToggles: [String: Bool] = [
+    "antigravity": true,
+    "codex": true,
+    "cursor": true,
+    "codebuddy": true,
+  ]
+  @Published var hasCursorCookie: Bool = false
+  @Published var showCursorCookieSheet: Bool = false
+  @Published var showCursorLoginSheet: Bool = false
+  @Published var cursorCookieDraft: String = ""
+
+  @Published var showMenuBarExtra: Bool = UserDefaults.standard.object(forKey: PrefKey.showMenuBarExtra) as? Bool ?? true
+  @Published var menuBarDisplayMode: MenuBarDisplayMode = {
+    if let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarDisplayMode),
+       let mode = MenuBarDisplayMode(rawValue: raw) {
+      return mode
+    }
+    return .iconOnly
+  }()
+  @Published var menuBarIconStyle: MenuBarIconStyle = {
+    if let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarIconStyle),
+       let style = MenuBarIconStyle(rawValue: raw) {
+      return style
+    }
+    return .dualBar
+  }()
+  @Published var menuBarProvider: String = {
+    let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarProvider) ?? "auto"
+    let allowed: Set<String> = ["auto", "codex", "cursor", "antigravity", "codebuddy"]
+    return allowed.contains(raw) ? raw : "auto"
+  }()
+  @Published var menuBarUsageScope: MenuBarUsageScope = {
+    if let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarUsageScope),
+       let scope = MenuBarUsageScope(rawValue: raw) {
+      return scope
+    }
+    return .all
+  }()
+  @Published var quotaDisplayMode: QuotaDisplayMode = {
+    if let raw = UserDefaults.standard.string(forKey: PrefKey.quotaDisplayMode),
+       let mode = QuotaDisplayMode(rawValue: raw) {
+      return mode
+    }
+    return .remaining
+  }()
+  @Published var hideDockIcon: Bool = UserDefaults.standard.bool(forKey: PrefKey.hideDockIcon)
+  @Published var showRecentWindowsInMenu: Bool = UserDefaults.standard.bool(forKey: PrefKey.showRecentWindowsInMenu)
+  @Published var launchAtLogin: Bool = FileManager.default.fileExists(
+    atPath: (NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents/com.local.ai-turn-meter.app.plist")
+  )
+
+  @Published var settingsPane: SettingsPane = .provider("antigravity")
+  @Published var activeTab: MainTab = .control
+  @Published var popoverSelection: String = "all" {
+    didSet {
+      if oldValue != popoverSelection {
+        onStateUpdated?()
+      }
+    }
+  }
+  @Published var lastSyncedAt: Date? = nil
+  @Published var todaySummary: UsageTotals? = nil
+  @Published var usageDays: Int = 7
+  @Published var usageToolFilter: String = "all"
+  @Published var usageGroupMode: String = "model"
+  @Published var usageData: UsageSummaryResponse? = nil
+  @Published var usageLoading: Bool = false
+
+  // Daily Receipt (Day Card) state
+  @Published var receiptData: ReceiptDataResponse? = nil
+  @Published var receiptLoading: Bool = false
+  @Published var receiptError: String? = nil
+  @Published var receiptDate: String = MeterFormat.makeIsoDayFormatter().string(from: Date())
+  @Published var receiptScope: String = "day"
+  @Published var receiptGroupBy: String = "model"
+  @Published var receiptCurrencyMode: String = UserDefaults.standard.string(forKey: PrefKey.receiptCurrencyMode) ?? "both"
+  @Published var receiptUsdToCny: Double = {
+    let v = UserDefaults.standard.double(forKey: PrefKey.receiptUsdToCny)
+    return v > 0 ? v : 7.0
+  }()
+  @Published var receiptTheme: String = UserDefaults.standard.string(forKey: PrefKey.receiptTheme) ?? "paper"
+  @Published var receiptHideProjects: Bool = UserDefaults.standard.bool(forKey: PrefKey.receiptHideProjects)
+  @Published var receiptPunchlineIndex: Int = 0
+
+  // Model Fingerprint / Degradation Detection state
+  @Published var fingerprintOverview: FingerprintOverviewResponse? = nil
+  @Published var fingerprintLoading: Bool = false
+  @Published var fingerprintRunningAction: String? = nil
+
+  @Published var recentTurns: [TurnSummary] = []
+  @Published var recentTurnsFilterTool: String = "all"
+  @Published var recentTurnsSearch: String = ""
+  @Published var recentTurnsLoading: Bool = false
+  @Published var recentTurnsByTool: [String: [TurnSummary]] = [:]
+
+  @Published var apps: [String: StatusAppEntry] = [:]
+  @Published var vsixVersions: [String: String] = [:]
+
+  @Published var busy: Bool = false
+  @Published var statusBanner: String? = nil
+  @Published var bannerIsError: Bool = false
+  @Published var showUninstallAlert: Bool = false
+  @Published var showSshSheet: Bool = false
+  @Published var sshHost: String = ""
+  @Published var sshPreview: String = ""
+  @Published var sshOneLiner: String = ""
+  @Published var sshApplyStatus: String? = nil
+  @Published var sshApplyIsError: Bool = false
+  @Published var sshApplying: Bool = false
+  @Published var knownSshHosts: [String] = []
+
+  @Published var showUpdateSheet: Bool = false
+  @Published var updateChecking: Bool = false
+  @Published var updateDownloading: Bool = false
+  @Published var availableUpdate: UpdateReleaseInfo? = nil
+  @Published var updateStatusText: String = ""
+
+  var onStateUpdated: (() -> Void)?
+  var onPreferencesChanged: (() -> Void)?
+
+  private var pollTimer: Timer?
+  private let sseClient = DaemonSSEClient()
+  private var sseConnected: Bool = false
+  private var sseTurnRefreshWorkItem: DispatchWorkItem?
+  private var didBootstrap = false
+  private var didTryRestoreWebCookie = false
+  private var hasStarted = false
+  private var lastUsageRefreshAt: Date = .distantPast
+
+  let orderedKeys = ["antigravity", "codex", "cursor", "codebuddy"]
+
+  var isActiveOverall: Bool {
+    daemonOnline && masterEnabled
+  }
+
+  var appsNeedingInlineCdp: [String] {
+    ["antigravity", "codex", "cursor", "codebuddy"].filter { key in
+      guard isToolEnabled(key), let entry = apps[key] else { return false }
+      return entry.installed && entry.cdpPort == nil
+    }
+  }
+
+  func isToolEnabled(_ key: String) -> Bool {
+    toolToggles[key] ?? true
+  }
+
+  func isInlineToolEnabled(_ key: String) -> Bool {
+    inlineToolToggles[key] ?? true
+  }
+
+  func setShowMenuBarExtra(_ value: Bool) {
+    if !value && hideDockIcon {
+      hideDockIcon = false
+      UserDefaults.standard.set(false, forKey: PrefKey.hideDockIcon)
+      bannerIsError = false
+      statusBanner = "关闭菜单栏图标后已自动恢复程序坞图标，以保留打开控制面板的入口"
+    }
+    showMenuBarExtra = value
+    UserDefaults.standard.set(value, forKey: PrefKey.showMenuBarExtra)
+    onPreferencesChanged?()
+  }
+
+  func setMenuBarDisplayMode(_ mode: MenuBarDisplayMode) {
+    menuBarDisplayMode = mode
+    UserDefaults.standard.set(mode.rawValue, forKey: PrefKey.menuBarDisplayMode)
+    UserDefaults.standard.set(mode != .iconOnly, forKey: PrefKey.showMenuBarSummary)
+    if mode == .iconOnly && menuBarIconStyle == .none {
+      menuBarIconStyle = .dualBar
+      UserDefaults.standard.set(MenuBarIconStyle.dualBar.rawValue, forKey: PrefKey.menuBarIconStyle)
+    }
+    onPreferencesChanged?()
+  }
+
+  func setMenuBarIconStyle(_ style: MenuBarIconStyle) {
+    menuBarIconStyle = style
+    UserDefaults.standard.set(style.rawValue, forKey: PrefKey.menuBarIconStyle)
+    if style == .none && menuBarDisplayMode == .iconOnly {
+      menuBarDisplayMode = .todayTokensAndCost
+      UserDefaults.standard.set(MenuBarDisplayMode.todayTokensAndCost.rawValue, forKey: PrefKey.menuBarDisplayMode)
+      UserDefaults.standard.set(true, forKey: PrefKey.showMenuBarSummary)
+    }
+    onPreferencesChanged?()
+  }
+
+  func setMenuBarProvider(_ provider: String) {
+    menuBarProvider = provider
+    UserDefaults.standard.set(provider, forKey: PrefKey.menuBarProvider)
+    onPreferencesChanged?()
+  }
+
+  func setMenuBarUsageScope(_ scope: MenuBarUsageScope) {
+    menuBarUsageScope = scope
+    UserDefaults.standard.set(scope.rawValue, forKey: PrefKey.menuBarUsageScope)
+    onPreferencesChanged?()
+  }
+
+  func setQuotaDisplayMode(_ mode: QuotaDisplayMode) {
+    quotaDisplayMode = mode
+    UserDefaults.standard.set(mode.rawValue, forKey: PrefKey.quotaDisplayMode)
+    onPreferencesChanged?()
+  }
+
+  func setLaunchAtLogin(_ enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let bundlePath = Bundle.main.bundlePath
+    let rt = runtime
+    busy = true
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      var args = ["app-autostart", enabled ? "enable" : "disable", "--json"]
+      if bundlePath.hasSuffix(".app") {
+        args.append("--app=\(bundlePath)")
+      }
+      let res = rt.runCli(args, timeoutSec: 8)
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.busy = false
+        if res.exitCode == 0 {
+          self.launchAtLogin = enabled
+          self.bannerIsError = false
+          self.statusBanner = enabled ? "已开启开机自动驻留顶部菜单栏" : "已关闭开机自动启动菜单栏"
+        } else {
+          self.bannerIsError = true
+          let msg = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+          self.statusBanner = msg.isEmpty ? "设置开机自启失败" : msg
+        }
+      }
+    }
+  }
+
+  func setHideDockIcon(_ value: Bool) {
+    hideDockIcon = value
+    UserDefaults.standard.set(value, forKey: PrefKey.hideDockIcon)
+    if value && !showMenuBarExtra {
+      showMenuBarExtra = true
+      UserDefaults.standard.set(true, forKey: PrefKey.showMenuBarExtra)
+    }
+    onPreferencesChanged?()
+  }
+
+  func setShowRecentWindowsInMenu(_ value: Bool) {
+    showRecentWindowsInMenu = value
+    UserDefaults.standard.set(value, forKey: PrefKey.showRecentWindowsInMenu)
+  }
+
+  func openSettingsPane(_ pane: SettingsPane) {
+    settingsPane = pane
+    switch pane {
+    case .usage:
+      activeTab = .usage
+      fetchUsageSummary()
+    case .turns:
+      activeTab = .turns
+      fetchRecentTurns()
+    default:
+      activeTab = .control
+    }
+  }
+
+  func ensureStarted() {
+    if !hasStarted {
+      start()
+    }
+  }
+
+  func start() {
+    guard !hasStarted else { return }
+    hasStarted = true
+    knownSshHosts = MeterRuntime.readSshConfigHosts()
+    configureSSE()
+    sseClient.start(port: daemonPort)
+    refreshDoctorAndBootstrap()
+    fetchUsageSummary(silent: true)
+    pollTimer?.invalidate()
+    pollTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        self?.pollTick()
+      }
+    }
+  }
+
+  func stopPolling() {
+    pollTimer?.invalidate()
+    pollTimer = nil
+    sseTurnRefreshWorkItem?.cancel()
+    sseTurnRefreshWorkItem = nil
+    sseClient.stop()
+    sseConnected = false
+    hasStarted = false
+  }
+
+  private func configureSSE() {
+    sseClient.onConnected = { [weak self] in
+      self?.sseConnected = true
+    }
+    sseClient.onDisconnected = { [weak self] in
+      self?.sseConnected = false
+    }
+    sseClient.onEvent = { [weak self] ev in
+      guard let self = self else { return }
+      if ev.event == "state",
+         let data = ev.data.data(using: .utf8),
+         let parsed = try? JSONDecoder().decode(DaemonStateResponse.self, from: data) {
+        self.daemonOnline = true
+        self.applyDaemonState(parsed)
+        self.onStateUpdated?()
+      } else if ev.event == "turn" {
+        self.daemonOnline = true
+        self.scheduleSseTurnRefresh()
+      }
+    }
+  }
+
+  private func scheduleSseTurnRefresh() {
+    sseTurnRefreshWorkItem?.cancel()
+    let item = DispatchWorkItem { [weak self] in
+      MainActor.assumeIsolated {
+        guard let self = self else { return }
+        if NSApp.windows.contains(where: { $0.isVisible }) || self.showMenuBarExtra {
+          self.fetchUsageSummary(silent: true)
+        }
+        if self.activeTab == .turns && NSApp.windows.contains(where: { $0.isVisible }) {
+          self.fetchRecentTurns(silent: true)
+        }
+      }
+    }
+    sseTurnRefreshWorkItem = item
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+  }
+
+  func pollTick() {
+    guard !busy else { return }
+    if NSApp.windows.contains(where: { $0.isVisible }) {
+      fetchAppsStatusHttp()
+      if Date().timeIntervalSince(lastUsageRefreshAt) >= 30 {
+        fetchUsageSummary(silent: true)
+      }
+      if activeTab == .turns && !sseConnected {
+        fetchRecentTurns(silent: true)
+      }
+    } else if showMenuBarExtra {
+      if !sseConnected {
+        fetchDaemonStateLight()
+      }
+      if Date().timeIntervalSince(lastUsageRefreshAt) >= 45 {
+        fetchUsageSummary(silent: true)
+      }
+    }
+  }
+
+  func toolAccentColor(for key: String) -> Color {
+    switch key {
+    case "antigravity": return Color(red: 0.15, green: 0.45, blue: 0.96)
+    case "codex": return Color(red: 0.06, green: 0.72, blue: 0.50)
+    case "cursor": return Color(red: 0.96, green: 0.52, blue: 0.14)
+    case "codebuddy": return Color(red: 0.56, green: 0.36, blue: 0.96)
+    default: return Color(red: 0.05, green: 0.38, blue: 0.92)
+    }
+  }
+
+  func toolShortTitle(for key: String) -> String {
+    switch key {
+    case "all": return "概览"
+    case "antigravity": return "Antigravity"
+    case "codex": return "Codex"
+    case "cursor": return "Cursor"
+    case "codebuddy": return "CodeBuddy"
+    default: return key
+    }
+  }
+
+  func relativeUpdateLabel() -> String {
+    guard let d = lastSyncedAt else { return "同步中…" }
+    let sec = Int(Date().timeIntervalSince(d))
+    if sec < 15 { return "刚刚更新" }
+    if sec < 60 { return "\(sec) 秒前更新" }
+    return "\(sec / 60) 分钟前更新"
+  }
+
+  func displayTitle(for key: String) -> String {
+    switch key {
+    case "antigravity": return "Antigravity"
+    case "codex": return "Codex Desktop"
+    case "cursor": return "Cursor"
+    case "codebuddy": return "CodeBuddy CN"
+    default: return key
+    }
+  }
+
+  func appSubtitle(for key: String) -> String {
+    guard let entry = apps[key], entry.installed else { return "未安装" }
+    if !masterEnabled { return "全局已暂停显示" }
+    if !isToolEnabled(key) { return "已关闭此软件显示" }
+
+    if let turn = entry.latestTurn, let inline = turn.inlineText {
+      let modelStr = (turn.model != nil && turn.model != "unknown") ? "\(turn.model!) · " : ""
+      return "\(modelStr)\(inline)"
+    }
+    if key == "cursor" || key == "codebuddy" {
+      return entry.cdpPort != nil ? "已开启状态栏与消息旁胶囊，等待首轮对话" : "已在右下角状态栏就绪，等待首轮对话"
+    }
+    if key == "codex" && entry.cdpPort == nil {
+      return (entry.running ?? false) ? "正在运行（需点右侧按钮重启一次以显示胶囊）" : "未启动（点右侧按钮即可带统计启动）"
+    }
+    return "等待新对话记录"
+  }
+
+  func inlineBtnLabel(for key: String) -> String {
+    let isRunning = apps[key]?.running ?? false
+    return isRunning ? "重启并显示在消息旁" : "启动并显示在消息旁"
+  }
+
+  func fetchAppsStatusHttp(forceRefresh: Bool = false) {
+    guard !busy else { return }
+    let qs = forceRefresh ? "?refresh=1" : ""
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/apps\(qs)") else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 4)
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if err != nil {
+          self.daemonOnline = false
+          self.onStateUpdated?()
+          return
+        }
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data,
+              let parsed = try? JSONDecoder().decode(StatusResponse.self, from: data) else {
+          return
+        }
+        self.applyStatus(parsed)
+      }
+    }.resume()
+  }
+
+  func fetchDaemonStateLight() {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/state?limit=30") else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 2)
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if err != nil {
+          self.daemonOnline = false
+          self.onStateUpdated?()
+          return
+        }
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data,
+              let parsed = try? JSONDecoder().decode(DaemonStateResponse.self, from: data) else {
+          return
+        }
+        self.daemonOnline = true
+        self.applyDaemonState(parsed)
+        self.onStateUpdated?()
+      }
+    }.resume()
+  }
+
+  private func updateRecentTurnsCache(_ recent: [TurnSummary]?) {
+    guard let recent = recent else { return }
+    var grouped: [String: [TurnSummary]] = [:]
+    for t in recent {
+      guard let tool = t.tool else { continue }
+      var arr = grouped[tool] ?? []
+      if arr.count < 3 {
+        arr.append(t)
+        grouped[tool] = arr
+      }
+    }
+    self.recentTurnsByTool = grouped
+  }
+
+  private func applyDaemonConfig(_ cfg: MeterConfigPayload) {
+    self.masterEnabled = cfg.enabled
+    for (k, v) in cfg.tools { self.toolToggles[k] = v }
+    if self.popoverSelection != "all" && !self.isToolEnabled(self.popoverSelection) {
+      self.popoverSelection = "all"
+    }
+    if let ie = cfg.inlineEnabled { self.inlineMasterEnabled = ie }
+    if let it = cfg.inlineTools {
+      for (k, v) in it { self.inlineToolToggles[k] = v }
+    }
+    if let hasCookie = cfg.hasCursorCookie {
+      self.hasCursorCookie = hasCookie
+      if !hasCookie && !didTryRestoreWebCookie && !busy && !runtime.runningFromDmg {
+        didTryRestoreWebCookie = true
+        restoreCursorWebCookieIfPresent()
+      }
+    }
+  }
+
+  private func applyDaemonState(_ parsed: DaemonStateResponse) {
+    self.lastSyncedAt = Date()
+    if let cfg = parsed.config {
+      applyDaemonConfig(cfg)
+    }
+    if let today = parsed.todaySummary {
+      let prevTurns = self.todaySummary?.turnCount ?? -1
+      self.todaySummary = today
+      if today.turnCount != prevTurns || self.usageData == nil {
+        self.fetchUsageSummary(silent: true)
+      }
+    }
+    updateRecentTurnsCache(parsed.recent)
+    if let byTool = parsed.byTool {
+      var nextApps = self.apps
+      for (k, maybeTurn) in byTool {
+        if let existing = nextApps[k] {
+          nextApps[k] = StatusAppEntry(
+            name: existing.name,
+            appPath: existing.appPath,
+            installed: existing.installed,
+            running: existing.running,
+            cdpPort: existing.cdpPort,
+            latestTurn: maybeTurn
+          )
+        } else {
+          nextApps[k] = StatusAppEntry(
+            name: self.displayTitle(for: k),
+            appPath: nil,
+            installed: maybeTurn != nil,
+            running: nil,
+            cdpPort: nil,
+            latestTurn: maybeTurn
+          )
+        }
+      }
+      self.apps = nextApps
+    }
+  }
+
+  func fetchUsageSummary(silent: Bool = false, forceRefresh: Bool = false) {
+    let toolQs = usageToolFilter == "all" ? "" : "&tool=\(usageToolFilter)"
+    let refreshQs = forceRefresh ? "&refresh=1" : ""
+    guard let url = URL(
+      string: "http://127.0.0.1:\(daemonPort)/v1/usage?days=\(usageDays)\(toolQs)\(refreshQs)"
+    ) else { return }
+    if !silent { usageLoading = true }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 20)
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.usageLoading = false
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data,
+              let parsed = try? JSONDecoder().decode(UsageSummaryResponse.self, from: data) else {
+          return
+        }
+        self.usageData = parsed
+        self.lastSyncedAt = Date()
+        self.lastUsageRefreshAt = Date()
+        if self.usageToolFilter == "all" {
+          self.todaySummary = parsed.today
+        }
+        self.onStateUpdated?()
+      }
+    }.resume()
+  }
+
+  func fetchRecentTurns(silent: Bool = false) {
+    let qs = recentTurnsFilterTool == "all" ? "limit=80" : "limit=80&tool=\(recentTurnsFilterTool)"
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/turns?\(qs)") else { return }
+    if !silent { recentTurnsLoading = true }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 4)
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.recentTurnsLoading = false
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data,
+              let parsed = try? JSONDecoder().decode(TurnsListResponse.self, from: data) else {
+          return
+        }
+        self.recentTurns = parsed.turns
+      }
+    }.resume()
+  }
+
+  private func applyStatus(_ st: StatusResponse) {
+    if let v = st.version { self.version = v }
+    self.daemonOnline = st.online
+    if self.daemonPort != st.port {
+      self.daemonPort = st.port
+      if self.hasStarted {
+        self.sseClient.reconnect(port: st.port)
+      }
+    }
+    self.apps = st.apps
+    self.lastSyncedAt = Date()
+    if let cfg = st.config {
+      applyDaemonConfig(cfg)
+    }
+    if let state = st.state {
+      if let today = state.todaySummary {
+        let prevTurns = self.todaySummary?.turnCount ?? -1
+        self.todaySummary = today
+        if today.turnCount != prevTurns || self.usageData == nil {
+          self.fetchUsageSummary(silent: true)
+        }
+      }
+      updateRecentTurnsCache(state.recent)
+    }
+    self.onStateUpdated?()
+  }
+
+  private func applyDoctor(_ doc: DoctorResponse) {
+    if let v = doc.version { self.version = v }
+    self.daemonVersion = doc.daemon.version
+    self.updateFeedUrl = doc.updateFeedUrl
+    self.daemonOnline = doc.daemon.ok
+    if self.daemonPort != doc.daemon.port {
+      self.daemonPort = doc.daemon.port
+      if self.hasStarted {
+        self.sseClient.reconnect(port: doc.daemon.port)
+      }
+    }
+    self.launchAgentExists = doc.launchAgent.plistExists
+    self.launchAgentLoaded = doc.launchAgent.launchAgentLoaded
+    var map: [String: String] = [:]
+    for (k, v) in doc.apps {
+      if let vv = v.vsixVersion { map[k] = vv }
+    }
+    self.vsixVersions = map
+    self.onStateUpdated?()
+  }
+
+  func refreshDoctorAndBootstrap() {
+    guard !busy else { return }
+    let rt = runtime
+    let shouldAutoBootstrap = !didBootstrap
+    didBootstrap = true
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let docRes = rt.runCli(["doctor", "--json"], timeoutSec: 12)
+      let stRes = rt.runCli(["status", "--json"], timeoutSec: 6)
+
+      let doc = docRes.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(DoctorResponse.self, from: $0) }
+      let st = stRes.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(StatusResponse.self, from: $0) }
+
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if let doc = doc { self.applyDoctor(doc) }
+        if let st = st { self.applyStatus(st) }
+
+        if shouldAutoBootstrap, !rt.runningFromDmg, let doc = doc {
+          let targetVersion = doc.version ?? self.version
+          let isBundledApp = Bundle.main.bundlePath.hasSuffix(".app")
+          let daemonVersionMismatch = doc.daemon.ok && doc.daemon.version != targetVersion
+          let needsAppUpgrade =
+            (isBundledApp && doc.launchAgent.pointsToCurrentRoot == false) ||
+            daemonVersionMismatch
+
+          if !doc.launchAgent.plistExists {
+            self.runAction(args: ["install"], successText: "已完成首次安装并开启") { [weak self] in
+              self?.fetchUsageSummary(silent: true)
+              self?.fetchReceipt(silent: true)
+              if let p = self?.daemonPort { self?.sseClient.reconnect(port: p) }
+            }
+          } else if needsAppUpgrade {
+            self.runAction(args: ["install"], successText: "已自动更新到 v\(targetVersion)") { [weak self] in
+              self?.fetchUsageSummary(silent: true)
+              self?.fetchReceipt(silent: true)
+              if let p = self?.daemonPort { self?.sseClient.reconnect(port: p) }
+            }
+          } else if !doc.daemon.ok && self.masterEnabled {
+            self.runAction(args: ["start-daemon"], successText: "已开启后台统计") { [weak self] in
+              self?.fetchUsageSummary(silent: true)
+              self?.fetchReceipt(silent: true)
+              if let p = self?.daemonPort { self?.sseClient.reconnect(port: p) }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  func setMasterEnabled(_ enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    masterEnabled = enabled
+    if enabled && (!launchAgentExists || !daemonOnline) {
+      let args = launchAgentExists ? ["start-daemon"] : ["install"]
+      runAction(args: args, successText: "已一键开启") { [weak self] in
+        self?.postConfig(["enabled": true], quietBanner: true)
+      }
+      return
+    }
+    postConfig(["enabled": enabled], quietBanner: false, bannerText: enabled ? "已一键开启全部显示" : "已一键关闭全部显示")
+  }
+
+  func setToolEnabled(_ key: String, enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    toolToggles[key] = enabled
+    if !enabled && popoverSelection == key {
+      popoverSelection = "all"
+    }
+    if enabled && (!launchAgentExists || !daemonOnline) {
+      masterEnabled = true
+      let args = launchAgentExists ? ["start-daemon"] : ["install"]
+      runAction(args: args, successText: "\(displayTitle(for: key)) 已开启") { [weak self] in
+        self?.postConfig(["enabled": true, "tools": [key: true]], quietBanner: true)
+      }
+      return
+    }
+    var body: [String: Any] = ["tools": [key: enabled]]
+    if enabled && !masterEnabled {
+      masterEnabled = true
+      body["enabled"] = true
+    }
+    postConfig(body, quietBanner: false, bannerText: "\(displayTitle(for: key)) 已\(enabled ? "开启" : "关闭")")
+  }
+
+  func setInlineMasterEnabled(_ enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    inlineMasterEnabled = enabled
+    postConfig(
+      ["inlineEnabled": enabled],
+      quietBanner: false,
+      bannerText: enabled ? "已开启软件内置 TPS 显示" : "已关闭软件内置 TPS 显示"
+    )
+  }
+
+  func setInlineToolEnabled(_ key: String, enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    inlineToolToggles[key] = enabled
+    var body: [String: Any] = ["inlineTools": [key: enabled]]
+    if enabled && !inlineMasterEnabled {
+      inlineMasterEnabled = true
+      body["inlineEnabled"] = true
+    }
+    let needsRestart = enabled && (apps[key]?.cdpPort == nil)
+    let banner = needsRestart
+      ? "\(displayTitle(for: key)) 内置显示开关已开启，请点击「重启并开启」以激活调试口"
+      : "\(displayTitle(for: key)) 内置 TPS 已\(enabled ? "开启" : "关闭")"
+    postConfig(
+      body,
+      quietBanner: false,
+      bannerText: banner
+    )
+  }
+
+  func openAppWithInlineCdp(_ key: String) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let title = displayTitle(for: key)
+    terminateRunningAppGently(for: key)
+    runAction(args: ["open", key], successText: "已为 \(title) 开启消息旁显示")
+  }
+
+  func openAllAppsWithInlineCdp() {
+    guard !busy, !runtime.runningFromDmg else { return }
+    for key in appsNeedingInlineCdp {
+      terminateRunningAppGently(for: key)
+    }
+    runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
+  }
+
+  private func terminateRunningAppGently(for key: String) {
+    guard let targetPath = apps[key]?.appPath else { return }
+    let targetStd = (targetPath as NSString).standardizingPath
+    for runningApp in NSWorkspace.shared.runningApplications {
+      if let bundlePath = runningApp.bundleURL?.path,
+         (bundlePath as NSString).standardizingPath == targetStd {
+        runningApp.terminate()
+      }
+    }
+  }
+
+  func saveCursorCookie(_ raw: String?) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    didTryRestoreWebCookie = true
+    hasCursorCookie = !trimmed.isEmpty
+    if trimmed.isEmpty {
+      let cookieStore = WKWebsiteDataStore.default().httpCookieStore
+      cookieStore.getAllCookies { cookies in
+        for c in cookies where c.domain.lowercased().contains("cursor.com") && c.name == "WorkosCursorSessionToken" {
+          cookieStore.delete(c, completionHandler: nil)
+        }
+      }
+    }
+    postConfig(
+      ["cursorCookie": trimmed],
+      quietBanner: false,
+      bannerText: trimmed.isEmpty ? "已清除 Cursor 会话 Cookie" : "已保存 Cursor 会话 Cookie，正在同步额度…"
+    )
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+      self?.fetchUsageSummary(silent: false, forceRefresh: true)
+    }
+  }
+
+  func syncCursorFromLocalApp() {
+    guard !busy, !runtime.runningFromDmg else { return }
+    busy = true
+    bannerIsError = false
+    statusBanner = "正在读取本机 Cursor 登录凭证…"
+    let port = daemonPort
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let passwords = HeadlessCliHelper.readCursorSafeStoragePasswords(allowPrompt: true)
+      var syncOk = false
+      var email: String? = nil
+      var errorMsg: String? = nil
+
+      if let url = URL(string: "http://127.0.0.1:\(port)/v1/cursor/sync-local"),
+         let jsonData = try? JSONSerialization.data(withJSONObject: ["passwords": passwords]) {
+        var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 15)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = jsonData
+        let sem = DispatchSemaphore(value: 0)
+        DaemonAuth.localSession.dataTask(with: req) { data, _, _ in
+          if let data = data,
+             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            syncOk = (obj["ok"] as? Bool) == true
+            email = obj["email"] as? String
+            errorMsg = obj["error"] as? String
+          }
+          sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 16)
+      } else {
+        errorMsg = "无法连接本地统计服务"
+      }
+
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.busy = false
+        if syncOk {
+          self.hasCursorCookie = true
+          self.bannerIsError = false
+          self.statusBanner = email != nil ? "已从本机 Cursor 同步账号（\(email!)）" : "已从本机 Cursor 同步套餐额度"
+          self.fetchAppsStatusHttp()
+          self.fetchUsageSummary(silent: false, forceRefresh: true)
+        } else {
+          self.bannerIsError = true
+          self.statusBanner = errorMsg ?? "未检测到本机 Cursor 登录态，请使用「登录同步…」"
+        }
+      }
+    }
+  }
+
+  private func restoreCursorWebCookieIfPresent() {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
+      let cursorCookies = cookies.filter { $0.domain.lowercased().contains("cursor.com") && !$0.value.isEmpty }
+      guard cursorCookies.contains(where: { $0.name == "WorkosCursorSessionToken" }) else { return }
+      let header = cursorCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+      DispatchQueue.main.async {
+        guard let self = self, !self.hasCursorCookie else { return }
+        self.hasCursorCookie = true
+        self.postConfig(["cursorCookie": header], quietBanner: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+          self?.fetchUsageSummary(silent: true, forceRefresh: true)
+        }
+      }
+    }
+  }
+
+  func exportUsageCsv() {
+    guard let data = usageData else { return }
+    var lines = ["date,turns,total_input_tokens,output_tokens,total_tokens,estimated_cost_usd,cache_savings_usd"]
+    for pt in data.daily where pt.totalTokens > 0 || pt.turnCount > 0 {
+      let usdStr = pt.estimatedCostUsd.map { String(format: "%.6f", $0) } ?? ""
+      let savStr = pt.cacheSavingsUsd.map { String(format: "%.6f", $0) } ?? ""
+      lines.append("\(pt.date),\(pt.turnCount),\(pt.totalInputTokens),\(pt.outputTokens),\(pt.totalTokens),\(usdStr),\(savStr)")
+    }
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [.commaSeparatedText]
+    panel.nameFieldStringValue = "ai-turn-meter-usage-\(usageDays == 0 ? "all" : "\(usageDays)d").csv"
+    if panel.runModal() == .OK, let url = panel.url {
+      try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+      statusBanner = "已导出用量账单：\(url.lastPathComponent)"
+      bannerIsError = false
+    }
+  }
+
+  // MARK: - Daily Thermal Receipt Actions
+
+  func setReceiptCurrencyMode(_ mode: String) {
+    receiptCurrencyMode = mode
+    UserDefaults.standard.set(mode, forKey: PrefKey.receiptCurrencyMode)
+  }
+
+  func setReceiptUsdToCny(_ rate: Double) {
+    let clamped = max(0.01, min(1000.0, rate))
+    receiptUsdToCny = clamped
+    UserDefaults.standard.set(clamped, forKey: PrefKey.receiptUsdToCny)
+  }
+
+  func setReceiptTheme(_ theme: String) {
+    receiptTheme = theme
+    UserDefaults.standard.set(theme, forKey: PrefKey.receiptTheme)
+  }
+
+  func setReceiptHideProjects(_ hide: Bool) {
+    receiptHideProjects = hide
+    UserDefaults.standard.set(hide, forKey: PrefKey.receiptHideProjects)
+  }
+
+  func formatReceiptMoney(_ usd: Double?) -> String {
+    guard let usd = usd, usd.isFinite else { return "N/A" }
+    let rate = receiptUsdToCny > 0 ? receiptUsdToCny : 7.0
+    func fmt(_ n: Double) -> String {
+      let a = abs(n)
+      if a == 0 { return "0.00" }
+      if a < 0.01 { return String(format: "%.4f", a) }
+      return String(format: "%.2f", a)
+    }
+    let sign = usd < 0 ? "-" : ""
+    let u = "\(sign)$\(fmt(usd))"
+    let c = "\(sign)¥\(fmt(usd * rate))"
+    switch receiptCurrencyMode {
+    case "usd": return u
+    case "cny": return c
+    default: return "\(u) (\(c))"
+    }
+  }
+
+  func shiftReceiptDate(byDays delta: Int) {
+    let f = MeterFormat.makeIsoDayFormatter()
+    let cal = Calendar(identifier: .gregorian)
+    let base = f.date(from: receiptDate) ?? Date()
+    if let next = cal.date(byAdding: .day, value: delta, to: base) {
+      let today = cal.startOfDay(for: Date())
+      let clamped = min(cal.startOfDay(for: next), today)
+      receiptDate = f.string(from: clamped)
+      receiptPunchlineIndex = 0
+      fetchReceipt()
+    }
+  }
+
+  func selectReceiptToday() {
+    let f = MeterFormat.makeIsoDayFormatter()
+    receiptDate = f.string(from: Date())
+    receiptPunchlineIndex = 0
+    fetchReceipt()
+  }
+
+  func fetchReceipt(silent: Bool = false) {
+    var comps = URLComponents(string: "http://127.0.0.1:\(daemonPort)/v1/receipt")
+    var q: [URLQueryItem] = [
+      URLQueryItem(name: "date", value: receiptDate),
+      URLQueryItem(name: "scope", value: receiptScope),
+      URLQueryItem(name: "groupBy", value: receiptGroupBy),
+    ]
+    if usageToolFilter != "all" {
+      q.append(URLQueryItem(name: "tool", value: usageToolFilter))
+    }
+    comps?.queryItems = q
+    guard let url = comps?.url else { return }
+    if !silent {
+      receiptLoading = true
+      receiptError = nil
+    }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 20)
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.receiptLoading = false
+        if let err = err {
+          self.receiptError = "无法连接本地统计服务（\(err.localizedDescription)）"
+          return
+        }
+        guard let http = resp as? HTTPURLResponse else {
+          self.receiptError = "本地统计服务无响应"
+          return
+        }
+        if http.statusCode == 404 {
+          self.receiptError = "后台守护进程版本过旧，不支持每日账单接口，请点击「同步并重启后台」"
+          return
+        }
+        guard http.statusCode == 200, let data = data else {
+          self.receiptError = "获取账单失败（HTTP \(http.statusCode)）"
+          return
+        }
+        do {
+          let parsed = try JSONDecoder().decode(ReceiptDataResponse.self, from: data)
+          self.receiptData = parsed
+          self.receiptError = nil
+        } catch {
+          self.receiptError = "账单数据解析失败（\(error.localizedDescription)）"
+        }
+      }
+    }.resume()
+  }
+
+  private func buildReceiptExportUrl(format: String) -> URL? {
+    var comps = URLComponents(string: "http://127.0.0.1:\(daemonPort)/v1/receipt")
+    var q: [URLQueryItem] = [
+      URLQueryItem(name: "date", value: receiptDate),
+      URLQueryItem(name: "scope", value: receiptScope),
+      URLQueryItem(name: "groupBy", value: receiptGroupBy),
+      URLQueryItem(name: "format", value: format),
+      URLQueryItem(name: "theme", value: receiptTheme),
+      URLQueryItem(name: "currency", value: receiptCurrencyMode),
+      URLQueryItem(name: "rate", value: String(format: "%.4g", receiptUsdToCny)),
+      URLQueryItem(name: "punchline", value: String(receiptPunchlineIndex)),
+    ]
+    if receiptHideProjects {
+      q.append(URLQueryItem(name: "hideProjects", value: "1"))
+    }
+    if usageToolFilter != "all" {
+      q.append(URLQueryItem(name: "tool", value: usageToolFilter))
+    }
+    comps?.queryItems = q
+    return comps?.url
+  }
+
+  func copyReceiptAsciiToClipboard() {
+    guard let url = buildReceiptExportUrl(format: "ascii") else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 15)
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self,
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data, let text = String(data: data, encoding: .utf8) else {
+          self?.bannerIsError = true
+          self?.statusBanner = "获取文本小票失败"
+          return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        self.bannerIsError = false
+        self.statusBanner = "已复制文本小票到剪贴板"
+      }
+    }.resume()
+  }
+
+  func exportReceiptSvg() {
+    guard let url = buildReceiptExportUrl(format: "svg") else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 15)
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self,
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data else {
+          self?.bannerIsError = true
+          self?.statusBanner = "生成 SVG 小票失败"
+          return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.svg]
+        panel.nameFieldStringValue = "ai-turn-meter-receipt-\(self.receiptDate).svg"
+        if panel.runModal() == .OK, let outUrl = panel.url {
+          try? data.write(to: outUrl, options: .atomic)
+          self.bannerIsError = false
+          self.statusBanner = "已导出小票 SVG：\(outUrl.lastPathComponent)"
+        }
+      }
+    }.resume()
+  }
+
+  // MARK: - Model Fingerprint & Degradation Detection Actions
+
+  func fetchFingerprintOverview(silent: Bool = false) {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/overview?days=7") else { return }
+    if !silent { fingerprintLoading = true }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 10)
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.fingerprintLoading = false
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data,
+              let parsed = try? JSONDecoder().decode(FingerprintOverviewResponse.self, from: data) else {
+          return
+        }
+        self.fingerprintOverview = parsed
+      }
+    }.resume()
+  }
+
+  func runFingerprintCheck(actionId: String, payload: [String: Any], timeout: TimeInterval = 120) {
+    guard fingerprintRunningAction == nil,
+          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/run"),
+          let jsonData = try? JSONSerialization.data(withJSONObject: payload) else {
+      return
+    }
+    fingerprintRunningAction = actionId
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: timeout)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jsonData
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.fingerprintRunningAction = nil
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "检测请求失败：\(err.localizedDescription)"
+          return
+        }
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data,
+              let parsed = try? JSONDecoder().decode(FingerprintRunResponse.self, from: data) else {
+          self.bannerIsError = true
+          self.statusBanner = "检测响应解析失败"
+          return
+        }
+        if let run = parsed.run {
+          self.bannerIsError = !parsed.ok
+          self.statusBanner = run.summary
+        } else if let errMsg = parsed.error {
+          self.bannerIsError = true
+          self.statusBanner = errMsg
+        } else {
+          self.bannerIsError = false
+          self.statusBanner = "检测完成"
+        }
+        self.fetchFingerprintOverview(silent: true)
+      }
+    }.resume()
+  }
+
+  func saveFingerprintEndpoint(name: String, protocolType: String, baseUrl: String, model: String, apiKey: String) {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/endpoints"),
+          let jsonData = try? JSONSerialization.data(withJSONObject: [
+            "name": name,
+            "protocol": protocolType,
+            "baseUrl": baseUrl,
+            "model": model,
+            "apiKey": apiKey,
+          ]) else {
+      return
+    }
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 8)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jsonData
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "保存端点失败：\(err.localizedDescription)"
+          return
+        }
+        if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+          self.bannerIsError = false
+          self.statusBanner = "已保存检测端点：\(name.isEmpty ? model : name)"
+          self.fetchFingerprintOverview(silent: true)
+        } else {
+          self.bannerIsError = true
+          self.statusBanner = "保存端点失败，请检查 Base URL 与模型名"
+        }
+      }
+    }.resume()
+  }
+
+  func deleteFingerprintEndpoint(id: String) {
+    guard let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/endpoints?id=\(encoded)") else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 6)
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, _, _ in
+      DispatchQueue.main.async { [weak self] in
+        self?.bannerIsError = false
+        self?.statusBanner = "已删除检测端点"
+        self?.fetchFingerprintOverview(silent: true)
+      }
+    }.resume()
+  }
+
+  func deleteFingerprintBaseline(id: String) {
+    guard let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/baselines?id=\(encoded)") else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 6)
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, _, _ in
+      DispatchQueue.main.async { [weak self] in
+        self?.bannerIsError = false
+        self?.statusBanner = "已删除参考基线"
+        self?.fetchFingerprintOverview(silent: true)
+      }
+    }.resume()
+  }
+
+  private func postConfig(_ bodyObj: [String: Any], quietBanner: Bool, bannerText: String = "") {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/config"),
+          let jsonData = try? JSONSerialization.data(withJSONObject: bodyObj) else {
+      return
+    }
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 4)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jsonData
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "设置同步失败：\(err.localizedDescription)"
+          return
+        }
+        if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+          if !quietBanner && !bannerText.isEmpty {
+            self.bannerIsError = false
+            self.statusBanner = bannerText
+          }
+          self.fetchAppsStatusHttp()
+          self.fetchUsageSummary(silent: true)
+          self.onStateUpdated?()
+        }
+      }
+    }.resume()
+  }
+
+  func runAction(args: [String], successText: String, onSuccess: (() -> Void)? = nil) {
+    guard !busy else { return }
+    busy = true
+    statusBanner = "正在处理…"
+    bannerIsError = false
+    let rt = runtime
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let cliTimeout = args.first == "open" ? 45.0 : 30.0
+      let res = rt.runCli(args, timeoutSec: cliTimeout)
+      if res.exitCode == 0 {
+        Thread.sleep(forTimeInterval: 0.5)
+      }
+      let docRes = rt.runCli(["doctor", "--json"], timeoutSec: 12)
+      let stRes = rt.runCli(["status", "--json"], timeoutSec: 6)
+      let doc = docRes.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(DoctorResponse.self, from: $0) }
+      let st = stRes.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(StatusResponse.self, from: $0) }
+
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.busy = false
+        if let doc = doc { self.applyDoctor(doc) }
+        if let st = st { self.applyStatus(st) }
+        if res.exitCode == 0 {
+          self.bannerIsError = false
+          self.statusBanner = successText
+          onSuccess?()
+        } else {
+          self.bannerIsError = true
+          let msg = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+          self.statusBanner = msg.isEmpty ? "操作失败（退出码 \(res.exitCode)）" : msg
+        }
+      }
+    }
+  }
+
+  func generateSshSnippet() {
+    let targetHost = sshHost.trimmingCharacters(in: .whitespacesAndNewlines)
+    let args = targetHost.isEmpty ? ["ssh-info"] : ["ssh-info", targetHost]
+    let res = runtime.runCli(args, timeoutSec: 5)
+    let out = res.exitCode == 0 ? res.stdout : res.stderr
+    sshPreview = out
+    let lines = out.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+    sshOneLiner = lines.last(where: { $0.hasPrefix("ssh ") }) ?? ""
+  }
+
+  func applySshConfig(includeRemote: Bool) {
+    let targetHost = sshHost.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !targetHost.isEmpty else {
+      sshApplyIsError = true
+      sshApplyStatus = "请先输入或选择一个远端 Host"
+      return
+    }
+    guard !sshApplying else { return }
+    sshApplying = true
+    sshApplyStatus = includeRemote ? "正在写入本机 ~/.ssh/config 并通过 SSH 配置远端…" : "正在写入本机 ~/.ssh/config…"
+    sshApplyIsError = false
+    let rt = runtime
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      var args = ["ssh-apply", targetHost, "--json"]
+      if includeRemote { args.insert("--remote", at: 2) }
+      let res = rt.runCli(args, timeoutSec: 18)
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.sshApplying = false
+        if res.exitCode == 0 {
+          self.sshApplyIsError = false
+          self.knownSshHosts = MeterRuntime.readSshConfigHosts()
+          self.sshApplyStatus = includeRemote
+            ? "已完成：本机 ~/.ssh/config 与远端 \(targetHost) 的 ~/.cursor/hooks.json 均已自动配置"
+            : "已安全写入本机 ~/.ssh/config（Host \(targetHost)），已自动保留原文件备份"
+        } else {
+          self.sshApplyIsError = true
+          let errText = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+          if includeRemote && !errText.isEmpty {
+            self.sshApplyStatus = "远端免密 SSH 写入失败（可能需要交互登录或密码），请点击下方「复制远端单行命令」在终端执行。详情：\(errText)"
+          } else {
+            self.sshApplyStatus = errText.isEmpty ? "配置写入失败（退出码 \(res.exitCode)）" : errText
+          }
+        }
+      }
+    }
+  }
+
+  func openApplicationsFolder() {
+    NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications"))
+  }
+
+  func checkForUpdates() {
+    availableUpdate = nil
+    showUpdateSheet = true
+    guard let rawUrl = updateFeedUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !rawUrl.isEmpty,
+          let url = URL(string: rawUrl) else {
+      updateChecking = false
+      updateStatusText = "当前是离线独立安装包。\n\n收到新版 .dmg 时直接拖入「应用程序」覆盖原软件并打开一次，后台与扩展就会自动完成更新。"
+      return
+    }
+
+    updateChecking = true
+    updateStatusText = "正在检查更新…"
+    let curVersion = self.version
+
+    if let ghApiUrl = UpdateChecker.githubApiLatestUrl(from: url) {
+      var apiReq = URLRequest(url: ghApiUrl, timeoutInterval: 10)
+      apiReq.setValue("AI-Turn-Meter/\(curVersion)", forHTTPHeaderField: "User-Agent")
+      apiReq.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+      URLSession.shared.dataTask(with: apiReq) { [weak self] data, resp, _ in
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self else { return }
+          if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+             let data = data {
+            switch UpdateChecker.parseReleaseJson(data, currentVersion: curVersion) {
+            case .updateAvailable(let info):
+              self.updateChecking = false
+              self.availableUpdate = info
+              self.updateStatusText = "发现新版本 v\(info.version)（当前 v\(curVersion)）"
+              return
+            case .upToDate(let v):
+              self.updateChecking = false
+              self.updateStatusText = "当前已是最新版本（v\(v)）。"
+              return
+            case .invalidResponse:
+              break
+            }
+          }
+          self.checkUpdateFallback(url: url, curVersion: curVersion)
+        }
+      }.resume()
+      return
+    }
+
+    checkUpdateFallback(url: url, curVersion: curVersion)
+  }
+
+  private func checkUpdateFallback(url: URL, curVersion: String) {
+    var req = URLRequest(url: url, timeoutInterval: 10)
+    req.setValue("AI-Turn-Meter/\(curVersion)", forHTTPHeaderField: "User-Agent")
+    req.setValue("application/json", forHTTPHeaderField: "Accept")
+    let isGithubReleasesLatest =
+      (url.host == "github.com" || url.host == "www.github.com") && url.path.hasSuffix("/releases/latest")
+    if isGithubReleasesLatest {
+      req.httpMethod = "HEAD"
+    }
+
+    URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.updateChecking = false
+        if let err = err {
+          self.updateStatusText = "检查更新失败：\(err.localizedDescription)"
+          return
+        }
+
+        if isGithubReleasesLatest {
+          guard let finalUrl = (resp as? HTTPURLResponse)?.url else {
+            self.updateStatusText = "无法解析最新版本页面。"
+            return
+          }
+          let abs = finalUrl.absoluteString
+          guard let range = abs.range(of: "/releases/tag/") else {
+            self.updateStatusText = "当前仓库尚未发布 GitHub Release（当前运行 v\(curVersion)）。"
+            return
+          }
+          let rawTag = String(abs[range.upperBound...]).split(separator: "?").first.map(String.init) ?? ""
+          let remoteVer = rawTag.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+          let repoPrefix = String(abs[..<range.lowerBound])
+          if remoteVer.isEmpty {
+            self.updateStatusText = "当前仓库尚未发布版本标签。"
+            return
+          }
+          if UpdateChecker.compareSemver(remoteVer, curVersion) > 0 {
+            let dlUrl = "\(repoPrefix)/releases/download/\(rawTag)/AI-Turn-Meter-\(remoteVer)-arm64.dmg"
+            self.availableUpdate = UpdateReleaseInfo(version: remoteVer, downloadUrl: dlUrl, notes: "")
+            self.updateStatusText = "发现新版本 v\(remoteVer)（当前 v\(curVersion)）"
+          } else {
+            self.updateStatusText = "当前已是最新版本（v\(curVersion)）。"
+          }
+          return
+        }
+
+        guard let data = data else {
+          self.updateStatusText = "更新源未返回数据。"
+          return
+        }
+        switch UpdateChecker.parseReleaseJson(data, currentVersion: curVersion) {
+        case .updateAvailable(let info):
+          self.availableUpdate = info
+          self.updateStatusText = "发现新版本 v\(info.version)（当前 v\(curVersion)）"
+        case .upToDate(let v):
+          self.updateStatusText = "当前已是最新版本（v\(v)）。"
+        case .invalidResponse(let msg):
+          self.updateStatusText = msg
+        }
+      }
+    }.resume()
+  }
+
+  func downloadAndOpenUpdate(_ info: UpdateReleaseInfo) {
+    guard !updateDownloading, let url = URL(string: info.downloadUrl) else { return }
+    updateDownloading = true
+    updateStatusText = "正在下载 v\(info.version) 更新包…"
+
+    let bundleUrl = Bundle.main.bundleURL
+    let canSelfReplace =
+      !runtime.runningFromDmg &&
+      bundleUrl.path.hasSuffix(".app") &&
+      FileManager.default.isWritableFile(atPath: bundleUrl.deletingLastPathComponent().path)
+
+    URLSession.shared.downloadTask(with: url) { [weak self] tempUrl, resp, err in
+      guard let self = self else { return }
+      if let err = err {
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "下载失败：\(err.localizedDescription)"
+        }
+        return
+      }
+      if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "下载失败：HTTP \(http.statusCode)"
+        }
+        return
+      }
+      guard let tempUrl = tempUrl else {
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "下载未返回文件。"
+        }
+        return
+      }
+
+      let dmgFilename = "AI-Turn-Meter-\(info.version)-arm64.dmg"
+      let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+      let dest = downloadsDir.appendingPathComponent(dmgFilename)
+      let fm = FileManager.default
+      try? fm.removeItem(at: dest)
+      do {
+        try fm.moveItem(at: tempUrl, to: dest)
+      } catch {
+        let msg = error.localizedDescription
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "保存安装包失败：\(msg)"
+        }
+        return
+      }
+
+      let fileSize = (try? fm.attributesOfItem(atPath: dest.path)[.size] as? NSNumber)?.int64Value ?? 0
+      guard fileSize >= 1_000_000 else {
+        try? fm.removeItem(at: dest)
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "下载文件异常（大小不足 1 MB），已中止更新。"
+        }
+        return
+      }
+
+      let urlName = URL(string: info.downloadUrl)?.lastPathComponent ?? ""
+      let assetFilename = urlName.isEmpty ? dmgFilename : urlName
+      if let shaErr = Self.verifyDownloadedDmgSha256IfAvailable(dest: dest, filename: assetFilename, info: info) {
+        try? fm.removeItem(at: dest)
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = shaErr
+        }
+        return
+      }
+
+      if canSelfReplace {
+        DispatchQueue.main.async {
+          self.updateStatusText = "正在安装 v\(info.version) 并准备重启…"
+        }
+        if let errMsg = Self.installAppUpdateAndRelaunch(dmgUrl: dest, targetAppUrl: bundleUrl) {
+          DispatchQueue.main.async {
+            self.updateDownloading = false
+            self.updateStatusText = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
+            NSWorkspace.shared.open(dest)
+          }
+        } else {
+          DispatchQueue.main.async {
+            self.terminateForUpdateRelaunch()
+          }
+        }
+        return
+      }
+
+      DispatchQueue.main.async {
+        self.updateDownloading = false
+        self.updateStatusText = "已下载到「下载」文件夹并打开安装包，拖入「应用程序」覆盖即可。"
+        NSWorkspace.shared.open(dest)
+      }
+    }.resume()
+  }
+
+  private nonisolated static func verifyDownloadedDmgSha256IfAvailable(
+    dest: URL,
+    filename: String,
+    info: UpdateReleaseInfo
+  ) -> String? {
+    let hasDeclaredChecksum = (info.expectedSha256 != nil) || (info.sha256Url != nil)
+    if !hasDeclaredChecksum {
+      return nil
+    }
+    var expected = info.expectedSha256?.lowercased()
+    if expected == nil, let shaUrlStr = info.sha256Url {
+      guard let shaUrl = URL(string: shaUrlStr) else {
+        return "无法获取或解析安装包 SHA-256 校验文件，已中止更新。"
+      }
+      let sem = DispatchSemaphore(value: 0)
+      var fetchedText: String? = nil
+      var req = URLRequest(url: shaUrl, timeoutInterval: 10)
+      req.setValue("AI-Turn-Meter/\(info.version)", forHTTPHeaderField: "User-Agent")
+      URLSession.shared.dataTask(with: req) { data, resp, _ in
+        if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+           let data = data {
+          fetchedText = String(data: data, encoding: .utf8)
+        }
+        sem.signal()
+      }.resume()
+      _ = sem.wait(timeout: .now() + 12)
+      if let text = fetchedText {
+        expected = UpdateChecker.parseSha256Checksum(from: text, filename: filename)
+      }
+    }
+    guard let expectedHash = expected, expectedHash.count == 64 else {
+      return "无法获取或解析安装包 SHA-256 校验文件，已中止更新。"
+    }
+    guard let actualHash = try? UpdateChecker.sha256Hex(ofFileAt: dest) else {
+      return "无法计算安装包 SHA-256 校验值，已中止更新。"
+    }
+    if actualHash.lowercased() != expectedHash.lowercased() {
+      return "安装包 SHA-256 校验不匹配，已中止更新。"
+    }
+    return nil
+  }
+
+  private nonisolated static func runSync(_ launchPath: String, _ args: [String]) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: launchPath)
+    p.arguments = args
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do {
+      try p.run()
+      p.waitUntilExit()
+      return p.terminationStatus
+    } catch {
+      return -1
+    }
+  }
+
+  private nonisolated static func installAppUpdateAndRelaunch(dmgUrl: URL, targetAppUrl: URL) -> String? {
+    let fm = FileManager.default
+    let stageDir = fm.temporaryDirectory.appendingPathComponent("ai-turn-meter-upd-\(UUID().uuidString)", isDirectory: true)
+    let mntDir = stageDir.appendingPathComponent("mnt", isDirectory: true)
+    let stagedApp = stageDir.appendingPathComponent("AI Turn Meter.app", isDirectory: true)
+
+    do {
+      try fm.createDirectory(at: mntDir, withIntermediateDirectories: true)
+    } catch {
+      return "准备更新目录失败"
+    }
+
+    let attachRc = runSync("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-mountpoint", mntDir.path, dmgUrl.path])
+    guard attachRc == 0 else {
+      try? fm.removeItem(at: stageDir)
+      return "挂载镜像失败"
+    }
+
+    let srcApp = mntDir.appendingPathComponent("AI Turn Meter.app", isDirectory: true)
+    guard fm.fileExists(atPath: srcApp.appendingPathComponent("Contents/MacOS/AITurnMeter").path) else {
+      _ = runSync("/usr/bin/hdiutil", ["detach", mntDir.path, "-quiet"])
+      try? fm.removeItem(at: stageDir)
+      return "安装包内未找到应用文件"
+    }
+
+    let copyRc = runSync("/usr/bin/ditto", [srcApp.path, stagedApp.path])
+    _ = runSync("/usr/bin/hdiutil", ["detach", mntDir.path, "-quiet"])
+    try? fm.removeItem(at: mntDir)
+
+    guard copyRc == 0 else {
+      try? fm.removeItem(at: stageDir)
+      return "解压新版应用失败"
+    }
+    try? fm.removeItem(at: dmgUrl)
+
+    let pid = ProcessInfo.processInfo.processIdentifier
+    let script = """
+    i=0
+    while kill -0 "$1" 2>/dev/null && [ "$i" -lt 150 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    sleep 0.2
+    rm -rf "$3" && /usr/bin/ditto "$2" "$3" && (/usr/bin/xattr -dr com.apple.quarantine "$3" >/dev/null 2>&1 || true) && /usr/bin/open -n "$3"
+    rm -rf "$4"
+    """
+    let launcher = Process()
+    launcher.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+    launcher.arguments = ["/bin/zsh", "-c", script, "atm-updater", "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path]
+    launcher.standardInput = FileHandle.nullDevice
+    launcher.standardOutput = FileHandle.nullDevice
+    launcher.standardError = FileHandle.nullDevice
+    do {
+      try launcher.run()
+    } catch {
+      try? fm.removeItem(at: stageDir)
+      return "启动替换脚本失败"
+    }
+
+    return nil
+  }
+
+  private func terminateForUpdateRelaunch() {
+    showUpdateSheet = false
+    updateDownloading = false
+    CostHistoryFlyoutController.shared.hideImmediately()
+    for win in NSApp.windows {
+      while let sheet = win.attachedSheet {
+        win.endSheet(sheet)
+      }
+      win.orderOut(nil)
+    }
+    NSApp.stopModal()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+      NSApp.terminate(nil)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+      exit(0)
+    }
+  }
+}

@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Verify tag matches package.json version
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const ext = require("./packages/vscode-extension/package.json");
+            const tagVer = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            if (pkg.version !== tagVer || ext.version !== tagVer) {
+              throw new Error(`Tag v${tagVer} mismatch: pkg=${pkg.version}, ext=${ext.version}`);
+            }
+          '
+
+      - name: Run test suite
+        run: npm run test:all
+
+      - name: Build release tarball & DMG
+        run: |
+          npm run release:tarball
+          npm run release:dmg
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: shasum -a 256 *.dmg *.tar.gz *.vsix > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.vsix
+            dist/SHA256SUMS.txt

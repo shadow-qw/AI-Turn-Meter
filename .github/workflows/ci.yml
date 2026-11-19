@@ -1,52 +1,33 @@
-name: baseline
+name: CI
+
 on:
-  pull_request:
   push:
     branches: [main]
-permissions:
-  contents: read
+  pull_request:
+
 jobs:
-  node:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+  verify:
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Verify exact source SHA
-        env:
-          SOURCE_SHA: ${{ github.sha }}
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - name: Test with isolated environment
+
+      - name: Check version parity
         run: |
-          scratch=$(mktemp -d)
-          env -i PATH="$PATH" HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" \
-            XDG_DATA_HOME="$scratch/data" CODEX_HOME="$scratch/codex" \
-            AI_TURN_METER_DB="$scratch/meter.db" TMPDIR="$scratch" npm test
-  macos-policy:
-    runs-on: macos-15
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Verify exact source SHA
-        env:
-          SOURCE_SHA: ${{ github.sha }}
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - name: Test policy and typecheck native application
+          node -e '
+            const pkg = require("./package.json");
+            const ext = require("./packages/vscode-extension/package.json");
+            if (pkg.version !== ext.version) {
+              throw new Error(`Version mismatch: root=${pkg.version} vs vsix=${ext.version}`);
+            }
+          '
+
+      - name: Run Node & Swift tests
+        run: npm run test:all
+
+      - name: Build macOS release binary & package VSIX
         run: |
-          uname -sm
-          printf 'ImageVersion=%s\n' "$ImageVersion"
-          xcodebuild -version
-          swiftc --version
-          scratch=$(mktemp -d)
-          env -i PATH="$PATH" HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" \
-            TMPDIR="$scratch" sh scripts/test-update-policy.sh
-          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" \
-            swiftc -typecheck -swift-version 5 -target arm64-apple-macosx13.0 packages/desktop-macos/main.swift packages/desktop-macos/UpdatePolicy.swift
+          npm run build:macos
+          npm run package:vsix

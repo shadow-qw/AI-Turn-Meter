@@ -252,7 +252,7 @@ export function parseAntigravityTranscriptContent(
 /**
  * Discover local Antigravity LanguageServerService HTTP/HTTPS port + CSRF token from current user's processes.
  */
-async function discoverAntigravityLanguageServer() {
+export async function discoverAntigravityLanguageServers() {
   try {
     const uid = process.getuid?.();
     const { stdout: psOut } = await execFileAsync('ps', ['-axo', 'pid=,uid=,command='], {
@@ -398,14 +398,16 @@ function loadConversationMetaMap(geminiRoot) {
 }
 
 export class AntigravityAdapter {
-  constructor({ store, onTurns, geminiRoot = join(homedir(), '.gemini'), enableRpc = true }) {
+  constructor({ store, onTurns, geminiRoot = join(homedir(), '.gemini'), enableRpc = true, isEnabled = () => true }) {
     this.store = store;
     this.onTurns = onTurns;
     this.geminiRoot = geminiRoot;
     this.enableRpc = enableRpc;
+    this.isEnabled = isEnabled;
     this.fileMtimes = new Map();
     this.watchers = [];
     this.timer = null;
+    this.backfillTimer = null;
     this.lsServers = null;
     this.lsDiscoveredAt = 0;
   }
@@ -443,12 +445,13 @@ export class AntigravityAdapter {
   async getServers() {
     if (!this.enableRpc) return null;
     if (this.lsServers && Date.now() - this.lsDiscoveredAt < 15000) return this.lsServers;
-    this.lsServers = await discoverAntigravityLanguageServer();
+    this.lsServers = await discoverAntigravityLanguageServers();
     this.lsDiscoveredAt = Date.now();
     return this.lsServers;
   }
 
   async scan({ maxRecentFiles = 20 } = {}) {
+    if (this.isEnabled && !this.isEnabled()) return [];
     let listed = this.listTranscriptFiles();
     if (Number.isFinite(maxRecentFiles)) {
       listed = listed.slice(0, maxRecentFiles);
@@ -509,7 +512,12 @@ export class AntigravityAdapter {
   }
 
   async start() {
-    await this.scan({ maxRecentFiles: Infinity });
+    await this.scan({ maxRecentFiles: 12 });
+    this.backfillTimer = setTimeout(() => {
+      this.backfillTimer = null;
+      this.scan({ maxRecentFiles: Infinity }).catch(() => {});
+    }, 300);
+    this.backfillTimer.unref?.();
     for (const sub of ['antigravity', 'antigravity-ide', 'antigravity-cli']) {
       const brainDir = join(this.geminiRoot, sub, 'brain');
       if (!existsSync(brainDir)) continue;
@@ -542,6 +550,7 @@ export class AntigravityAdapter {
     for (const w of this.watchers) w.close();
     this.watchers = [];
     if (this.timer) clearInterval(this.timer);
+    if (this.backfillTimer) clearTimeout(this.backfillTimer);
     if (this.pending) clearTimeout(this.pending);
   }
 }

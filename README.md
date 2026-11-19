@@ -34,7 +34,7 @@
 - CDP 内嵌脚本注入器：[packages/daemon/src/cdp-injector.mjs](packages/daemon/src/cdp-injector.mjs)
 - 统一 CLI 与安装器：[packages/daemon/bin/cli.mjs](packages/daemon/bin/cli.mjs)、[packages/daemon/src/installer.mjs](packages/daemon/src/installer.mjs)、[packages/daemon/src/apps.mjs](packages/daemon/src/apps.mjs)
 - IDE 状态栏扩展：[packages/vscode-extension/package.json](packages/vscode-extension/package.json)、[packages/vscode-extension/extension.js](packages/vscode-extension/extension.js)
-- 原生 macOS 控制台与菜单栏软件：[packages/desktop-macos/main.swift](packages/desktop-macos/main.swift)
+- 原生 macOS 控制台与菜单栏软件（SwiftPM）：[packages/desktop-macos/](packages/desktop-macos/)（`AITurnMeterCore` + `AITurnMeterApp` + `AITurnMeterCoreTests`）
 - 安装、发布打包与 Homebrew Formula：[scripts/](scripts/)（`install.mjs`、`package-vsix.mjs`、`build-dmg.mjs`、`build-release.mjs`、`verify-local.mjs`、`uninstall.mjs`）、[packaging/homebrew/ai-turn-meter.rb](packaging/homebrew/ai-turn-meter.rb)
 
 ---
@@ -132,7 +132,7 @@
 npm run release:dmg -- --repo=shadow-qw/AI-Turn-Meter
 ```
 
-会编译原生 Swift 应用（[packages/desktop-macos/main.swift](packages/desktop-macos/main.swift)），并把独立 Node 24 运行时、`packages/` 与 `dist/ai-turn-meter.vsix` 一起打入 `dist/AI-Turn-Meter-<version>-arm64.dmg`。
+会通过 SwiftPM 编译原生 Swift 应用（[packages/desktop-macos/Package.swift](packages/desktop-macos/Package.swift)），并把独立 Node 24 运行时、`packages/` 与 `dist/ai-turn-meter.vsix` 一起打入 `dist/AI-Turn-Meter-<version>-arm64.dmg`（同步生成 `.dmg.sha256` 校验文件）。
 
 收到 `.dmg` 的用户（Apple Silicon Mac，无需装 Node）：
 1. 打开 `.dmg`，将 **AI Turn Meter.app** 拖入 `Applications`（应用程序）。
@@ -175,7 +175,10 @@ ai-turn-meter uninstall              # 清理 LaunchAgent、VSIX、Cursor Hooks 
 ai-turn-meter open <app|all>         # 带调试口拉起 codex | cursor | codebuddy | antigravity | all
 ai-turn-meter ssh-info [host]        # 输出 Remote-SSH 所需 RemoteForward 与远端 hooks.json 配置
 
-npm test                             # 运行全部单元测试（node --test tests/*.test.mjs）
+npm test                             # 运行 Node 单元测试（node --test tests/*.test.mjs）
+npm run test:swift                   # 运行 macOS Swift Core 单元测试（swift test）
+npm run test:all                     # 同时运行 Node 与 Swift 全部测试
+npm run build:macos                  # 使用 SwiftPM 编译 Release arm64 macOS 应用
 npm run verify:local                 # 只读扫描本机历史日志并在内存库验证口径（不写正式库/外部配置）
 npm run package:vsix                 # 打包 dist/ai-turn-meter.vsix
 npm run release:dmg                  # 编译原生 AI Turn Meter.app 并生成免 Node 的 arm64 DMG
@@ -186,7 +189,10 @@ npm run uninstall:all                # 等价于本地仓库运行 ai-turn-meter
 
 ### Daemon HTTP / SSE 接口（默认 `http://127.0.0.1:47831`）
 
+> 安全模型：守护进程仅监听回环地址，所有接口均校验 `Host` 并拒绝浏览器 `Origin` / 跨站 `Sec-Fetch-Site`；写入与敏感接口（`POST /v1/config`、`POST /v1/cursor/sync-local`、`/v1/fingerprint/*`、`POST /v1/ingest`）额外要求请求头携带 `~/.local/share/ai-turn-meter/daemon.token`（`X-ATM-Token`）；`POST /v1/ingest/cursor-hook` 豁免 Token 以便 Remote-SSH 转发上报，仍执行回环与事件白名单校验。
+
 - `GET /health`：健康检查（返回 `ok`、`pid`、`port`、`version`）
+- `GET /v1/apps`：各客户端安装状态、调试端口（5s 异步缓存）与最新轮次状态
 - `GET /v1/state?limit=20`：最新全局状态与 `byTool` 摘要
 - `GET /v1/turns?limit=30&tool=`：按时间倒序的最近轮次列表
 - `GET /v1/usage?days=7&tool=`：多维度用量统计、费用估算与各软件剩余配额卡片

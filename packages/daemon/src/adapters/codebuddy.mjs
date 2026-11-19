@@ -341,11 +341,13 @@ export class CodeBuddyAdapter {
     onTurns,
     extDataDir = join(homedir(), 'Library', 'Application Support', 'CodeBuddyExtension', 'Data'),
     cliProjectsDir = join(homedir(), '.codebuddy', 'projects'),
+    isEnabled = () => true,
   }) {
     this.store = store;
     this.onTurns = onTurns;
     this.extDataDir = extDataDir;
     this.cliProjectsDir = cliProjectsDir;
+    this.isEnabled = isEnabled;
     this.indexMtimes = new Map();
     this.cliMtimes = new Map();
     this.watchers = [];
@@ -437,6 +439,7 @@ export class CodeBuddyAdapter {
   }
 
   scan({ maxRecent = 25 } = {}) {
+    if (this.isEnabled && !this.isEnabled()) return [];
     const changed = [];
 
     let ideSessions = this.findIdeSessions();

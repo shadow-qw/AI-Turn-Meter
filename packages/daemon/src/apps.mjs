@@ -1,7 +1,10 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.AI_TURN_METER_PORT || 47831);
 
@@ -98,6 +101,16 @@ export function resolveAppPaths(spec, opts = {}) {
   };
 }
 
+function parseListeningTcpPortsOutput(out) {
+  const ports = new Set();
+  for (const line of String(out || '').split(/\r?\n/)) {
+    if (!line.startsWith('n')) continue;
+    const m = line.match(/:(\d+)(?:\s|$)/);
+    if (m) ports.add(Number(m[1]));
+  }
+  return ports;
+}
+
 /**
  * Collect all currently listening TCP ports in a single `lsof` invocation.
  * @returns {Set<number> | null}
@@ -108,13 +121,19 @@ export function readListeningTcpPorts() {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const ports = new Set();
-    for (const line of out.split(/\r?\n/)) {
-      if (!line.startsWith('n')) continue;
-      const m = line.match(/:(\d+)(?:\s|$)/);
-      if (m) ports.add(Number(m[1]));
-    }
-    return ports;
+    return parseListeningTcpPortsOutput(out);
+  } catch {
+    return null;
+  }
+}
+
+export async function readListeningTcpPortsAsync() {
+  try {
+    const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-Fn'], {
+      encoding: 'utf8',
+      timeout: 2500,
+    });
+    return parseListeningTcpPortsOutput(stdout);
   } catch {
     return null;
   }
@@ -131,6 +150,18 @@ export function readProcessCommandLines() {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     return out.split(/\r?\n/);
+  } catch {
+    return null;
+  }
+}
+
+export async function readProcessCommandLinesAsync() {
+  try {
+    const { stdout } = await execFileAsync('/bin/ps', ['-axo', 'command='], {
+      encoding: 'utf8',
+      timeout: 2500,
+    });
+    return String(stdout || '').split(/\r?\n/);
   } catch {
     return null;
   }
@@ -261,4 +292,34 @@ export async function isCdpHttpReady(port, timeoutMs = 800) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Probe installed status, running state, and active CDP ports across all 4 client apps asynchronously.
+ */
+export async function inspectAppsStatusAsync({
+  byTool = {},
+  homeDir = homedir(),
+  allowMdfind = true,
+} = {}) {
+  const [listeningPorts, processLines] = await Promise.all([
+    readListeningTcpPortsAsync(),
+    readProcessCommandLinesAsync(),
+  ]);
+  const safePorts = listeningPorts ?? new Set();
+  const safeLines = processLines ?? [];
+  const apps = {};
+  for (const [key, spec] of Object.entries(APP_SPECS)) {
+    const resolved = resolveAppPaths(spec, { homeDir, allowMdfind });
+    const cdpPort = resolved.installed ? readActivePort(resolved, homeDir, safePorts) : null;
+    apps[key] = {
+      name: resolved.name,
+      appPath: resolved.appPath,
+      installed: resolved.installed,
+      running: isAppRunning(resolved, safeLines),
+      cdpPort,
+      latestTurn: byTool?.[key] || null,
+    };
+  }
+  return apps;
 }

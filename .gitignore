@@ -1,6 +1,10 @@
 .DS_Store
+packages/desktop-macos/.build
+packages/desktop-macos/.swiftpm
 dist/*.dmg
 dist/*.tar.gz
+dist/*.sha256
+dist/SHA256SUMS.txt
 dist/.vsix-stage
 dist/.dmg-stage
 dist/.release-stage

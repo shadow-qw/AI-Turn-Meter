@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { TOOL_LABELS } from './format.mjs';
+import { httpRequestRaw } from './net.mjs';
 import { resolveCodexUsageUrl } from './quota.mjs';
 
 const LIGHTWEIGHT_MODEL_RE = /(mini|nano|haiku|flash|lite|luna|small|instant|8b|7b|3b)/i;
@@ -406,7 +407,6 @@ async function callModelOnce(
   { protocol = 'openai', baseUrl, apiKey, accessToken, accountId, model, prompt, maxTokens = 160, temperature = 0, wireApi = 'chat', timeoutMs = 20000 },
   fetchImpl = globalThis.fetch
 ) {
-  const startedAt = Date.now();
   const cleanBase = String(baseUrl || '').replace(/\/+$/, '');
   const token = apiKey || accessToken || '';
   if (!cleanBase || !token) {
@@ -473,34 +473,31 @@ async function callModelOnce(
     };
   }
 
-  const res = await fetchImpl(url, {
+  const raw = await httpRequestRaw(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
+    timeoutMs,
+    fetchImpl: fetchImpl !== globalThis.fetch ? fetchImpl : null,
   });
-  const latencyMs = Date.now() - startedAt;
-  const rawHeaders = {};
-  if (res.headers && typeof res.headers.forEach === 'function') {
-    res.headers.forEach((v, k) => {
-      rawHeaders[k.toLowerCase()] = v;
-    });
-  } else if (res.headers && typeof res.headers === 'object') {
-    for (const [k, v] of Object.entries(res.headers)) {
-      rawHeaders[k.toLowerCase()] = String(v);
-    }
+  if (raw.status === null) {
+    const err = new Error(raw.errorMessage || 'fetch failed');
+    err.latencyMs = raw.latencyMs;
+    throw err;
   }
 
-  const textBody = await res.text();
+  const latencyMs = raw.latencyMs;
+  const rawHeaders = raw.headers || {};
+  const textBody = raw.text || '';
   let json = null;
   try {
     json = JSON.parse(textBody);
   } catch {}
 
-  if (!res.ok) {
-    const errMsg = json?.error?.message || json?.detail || textBody.slice(0, 180) || `HTTP ${res.status}`;
-    const err = new Error(`HTTP ${res.status}: ${errMsg}`);
-    err.status = res.status;
+  if (!raw.ok) {
+    const errMsg = json?.error?.message || json?.detail || textBody.slice(0, 180) || `HTTP ${raw.status}`;
+    const err = new Error(`HTTP ${raw.status}: ${errMsg}`);
+    err.status = raw.status;
     err.headers = rawHeaders;
     err.data = json;
     err.latencyMs = latencyMs;
@@ -574,7 +571,7 @@ async function callModelOnce(
   }
 
   return {
-    status: res.status,
+    status: raw.status,
     latencyMs,
     responseModel,
     safetyBufferingActive,
