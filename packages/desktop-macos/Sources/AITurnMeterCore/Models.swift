@@ -170,6 +170,52 @@ public struct CardRecentWindow: Decodable, Identifiable {
   public let turnCount: Int
 }
 
+public struct ExternalProviderMeta: Decodable, Identifiable, Equatable, Sendable {
+  public var id: String { key }
+  public let key: String
+  public let providerId: String?
+  public let name: String
+  public let shortName: String
+  public let icon: String?
+  public let accentColor: String?
+  public let currency: String?
+  public let currencySymbol: String?
+  public let detailUrl: String?
+  public let fileName: String?
+  public let filePath: String?
+  public let enabled: Bool?
+  public let ok: Bool?
+  public let error: String?
+}
+
+public struct CardBillingSummary: Decodable {
+  public let todayCost: Double?
+  public let todayTokens: Int?
+  public let periodLabel: String?
+  public let periodCost: Double?
+  public let periodLimit: Double?
+  public let periodRemaining: Double?
+  public let periodTokens: Int?
+  public let updatedAtMs: Double?
+}
+
+public struct CardBreakdownItem: Decodable, Identifiable {
+  public let id: String
+  public let name: String
+  public let cost: Double?
+  public let limit: Double?
+  public let usagePct: Double?
+  public let sharePct: Double?
+  public let tokens: Int?
+  public let subtitle: String?
+}
+
+public struct CardBreakdownSection: Decodable, Identifiable {
+  public let id: String
+  public let title: String
+  public let items: [CardBreakdownItem]
+}
+
 public struct CardQuotaWindow: Decodable, Identifiable {
   public let id: String
   public let title: String
@@ -180,6 +226,17 @@ public struct CardQuotaWindow: Decodable, Identifiable {
 }
 
 public struct CodexBarCardSnapshot: Decodable {
+  public let isExternal: Bool?
+  public let providerName: String?
+  public let providerShortName: String?
+  public let providerIcon: String?
+  public let accentColor: String?
+  public let currencyCode: String?
+  public let currencySymbol: String?
+  public let detailUrl: String?
+  public let statusText: String?
+  public let footnote: String?
+  public let stale: Bool?
   public let accountEmail: String?
   public let planTitle: String?
   public let quotaWindows: [CardQuotaWindow]?
@@ -188,13 +245,21 @@ public struct CodexBarCardSnapshot: Decodable {
   public let latestTpsText: String?
   public let latestCacheText: String?
   public let latestTurnSubline: String?
+  public let billingSummary: CardBillingSummary?
   public let today: CardTodayMetrics
   public let currentWindow: CardWindowMetrics
   public let days30: CardWindowMetrics
   public let daily30: [CardDailyPoint]
   public let projects: [CardProjectBreakdown]?
   public let recentWindows: [CardRecentWindow]
+  public let breakdowns: [CardBreakdownSection]?
   public let topModel: String?
+
+  public var resolvedCurrencySymbol: String {
+    if let sym = currencySymbol, !sym.isEmpty { return sym }
+    if currencyCode?.uppercased() == "CNY" { return "¥" }
+    return "$"
+  }
 
   public init(
     accountEmail: String?,
@@ -211,8 +276,32 @@ public struct CodexBarCardSnapshot: Decodable {
     daily30: [CardDailyPoint],
     projects: [CardProjectBreakdown]?,
     recentWindows: [CardRecentWindow],
-    topModel: String?
+    topModel: String?,
+    isExternal: Bool? = nil,
+    providerName: String? = nil,
+    providerShortName: String? = nil,
+    providerIcon: String? = nil,
+    accentColor: String? = nil,
+    currencyCode: String? = nil,
+    currencySymbol: String? = nil,
+    detailUrl: String? = nil,
+    statusText: String? = nil,
+    footnote: String? = nil,
+    stale: Bool? = nil,
+    billingSummary: CardBillingSummary? = nil,
+    breakdowns: [CardBreakdownSection]? = nil
   ) {
+    self.isExternal = isExternal
+    self.providerName = providerName
+    self.providerShortName = providerShortName
+    self.providerIcon = providerIcon
+    self.accentColor = accentColor
+    self.currencyCode = currencyCode
+    self.currencySymbol = currencySymbol
+    self.detailUrl = detailUrl
+    self.statusText = statusText
+    self.footnote = footnote
+    self.stale = stale
     self.accountEmail = accountEmail
     self.planTitle = planTitle
     self.quotaWindows = quotaWindows
@@ -221,12 +310,14 @@ public struct CodexBarCardSnapshot: Decodable {
     self.latestTpsText = latestTpsText
     self.latestCacheText = latestCacheText
     self.latestTurnSubline = latestTurnSubline
+    self.billingSummary = billingSummary
     self.today = today
     self.currentWindow = currentWindow
     self.days30 = days30
     self.daily30 = daily30
     self.projects = projects
     self.recentWindows = recentWindows
+    self.breakdowns = breakdowns
     self.topModel = topModel
   }
 }
@@ -258,6 +349,8 @@ public struct UsageSummaryResponse: Decodable {
   public let byProject: [UsageProjectRow]?
   public let daily: [UsageDailyPoint]
   public let cards: [String: CodexBarCardSnapshot]?
+  public let externalProviders: [ExternalProviderMeta]?
+  public let providersDir: String?
 }
 
 public struct DaemonStateResponse: Decodable {
@@ -307,6 +400,8 @@ public struct StatusResponse: Decodable {
   public let online: Bool
   public let config: MeterConfigPayload?
   public let apps: [String: StatusAppEntry]
+  public let externalProviders: [ExternalProviderMeta]?
+  public let providersDir: String?
   public let state: DaemonStateResponse?
 }
 
@@ -316,6 +411,7 @@ public enum SettingsPane: Hashable {
   case menuBar
   case turns
   case fingerprint
+  case plugins
   case remote
   case about
   case provider(String)

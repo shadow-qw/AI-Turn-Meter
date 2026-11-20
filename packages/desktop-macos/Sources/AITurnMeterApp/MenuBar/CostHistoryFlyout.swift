@@ -128,7 +128,7 @@ final class CostHistoryFlyoutController: NSObject {
           let popWindow = pop.contentViewController?.view.window else {
       return
     }
-    guard !card.daily30.isEmpty || !(card.projects ?? []).isEmpty else { return }
+    guard !card.daily30.isEmpty || !(card.projects ?? []).isEmpty || !(card.breakdowns ?? []).isEmpty else { return }
 
     let view = CostHistoryDetailFlyoutView(
       selection: selection,
@@ -199,8 +199,20 @@ private struct CostHistoryDetailFlyoutView: View {
   @State private var metric: FlyoutChartMetric = .tokens
   @State private var hoveredDate: String? = nil
 
+  private var curSym: String {
+    card.resolvedCurrencySymbol
+  }
+
+  private var isBillingOnly: Bool {
+    (card.isExternal == true) && !card.daily30.contains(where: { $0.totalTokens > 0 })
+  }
+
+  private var activeMetric: FlyoutChartMetric {
+    isBillingOnly ? .cost : metric
+  }
+
   private func pointValue(_ pt: CardDailyPoint) -> Double {
-    switch metric {
+    switch activeMetric {
     case .tokens: return Double(max(0, pt.totalTokens))
     case .cost: return max(0, pt.costUsd ?? 0)
     }
@@ -208,12 +220,11 @@ private struct CostHistoryDetailFlyoutView: View {
 
   private func axisLabel(_ val: Double) -> String {
     if val <= 0 { return "0" }
-    switch metric {
+    switch activeMetric {
     case .tokens:
       return MeterFormat.tokens(Int(val.rounded()))
     case .cost:
-      if val >= 10 { return "$\(Int(val.rounded()))" }
-      return MeterFormat.usd(val)
+      return MeterFormat.compactMoney(val, symbol: curSym)
     }
   }
 
@@ -226,6 +237,7 @@ private struct CostHistoryDetailFlyoutView: View {
       ?? points.last(where: { $0.totalTokens > 0 || ($0.costUsd ?? 0) > 0 })
       ?? points.last
     let projects = Array((card.projects ?? []).prefix(5))
+    let breakdowns = card.breakdowns ?? []
 
     VStack(alignment: .leading, spacing: 10) {
       // 30-day vertical bar chart with Y-axis + yellow peak cap + continuous bar scrubbing
@@ -233,7 +245,7 @@ private struct CostHistoryDetailFlyoutView: View {
         VStack(alignment: .leading, spacing: 4) {
           HStack(alignment: .bottom, spacing: 6) {
             VStack(alignment: .leading) {
-              Text(maxVal > 0 ? axisLabel(maxVal) : (metric == .tokens ? "0" : "$0"))
+              Text(maxVal > 0 ? axisLabel(maxVal) : (activeMetric == .tokens ? "0" : "\(curSym)0"))
               Spacer()
               Text(maxVal > 0 ? axisLabel(maxVal / 2.0) : "")
               Spacer()
@@ -242,7 +254,7 @@ private struct CostHistoryDetailFlyoutView: View {
             .font(.system(size: 10))
             .monospacedDigit()
             .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-            .frame(width: 36, height: 102, alignment: .leading)
+            .frame(width: 40, height: 102, alignment: .leading)
 
             HStack(alignment: .bottom, spacing: 0) {
               ForEach(points, id: \.id) { pt in
@@ -287,29 +299,34 @@ private struct CostHistoryDetailFlyoutView: View {
           }
           .font(.system(size: 10))
           .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-          .padding(.leading, 42)
+          .padding(.leading, 46)
         }
 
         // token | 费用 segmented toggle
-        HStack {
-          Spacer()
-          Picker("", selection: $metric) {
-            Text("token").tag(FlyoutChartMetric.tokens)
-            Text("费用").tag(FlyoutChartMetric.cost)
+        if !isBillingOnly {
+          HStack {
+            Spacer()
+            Picker("", selection: $metric) {
+              Text("token").tag(FlyoutChartMetric.tokens)
+              Text("费用").tag(FlyoutChartMetric.cost)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            .frame(width: 112)
           }
-          .pickerStyle(.segmented)
-          .labelsHidden()
-          .controlSize(.small)
-          .frame(width: 112)
         }
       }
 
       // Selected day detail + per-model breakdown
       if let pt = selectedPt {
         let dayModels: [CardDailyModelItem] = Array((pt.models ?? []).prefix(4))
+        let daySummaryText = (isBillingOnly && pt.totalTokens == 0)
+          ? "\(pt.label): \(MeterFormat.money(pt.costUsd, symbol: curSym))"
+          : "\(pt.label): \(MeterFormat.money(pt.costUsd, symbol: curSym)) · \(MeterFormat.tokens(pt.totalTokens)) tokens"
 
         VStack(alignment: .leading, spacing: 6) {
-          Text("\(pt.label): \(MeterFormat.usd(pt.costUsd)) · \(MeterFormat.tokens(pt.totalTokens)) tokens")
+          Text(daySummaryText)
             .font(.system(size: 11.5))
             .monospacedDigit()
             .foregroundColor(.secondary)
@@ -326,7 +343,7 @@ private struct CostHistoryDetailFlyoutView: View {
                   .foregroundColor(.secondary)
                   .lineLimit(1)
                   .truncationMode(.middle)
-                Text("\(MeterFormat.usd(m.costUsd)) · \(MeterFormat.tokens(m.totalTokens))")
+                Text("\(MeterFormat.money(m.costUsd, symbol: curSym)) · \(MeterFormat.tokens(m.totalTokens))")
                   .font(.system(size: 10.5))
                   .monospacedDigit()
                   .foregroundColor(Color(nsColor: .tertiaryLabelColor))
@@ -336,15 +353,78 @@ private struct CostHistoryDetailFlyoutView: View {
         }
       }
 
-      // 30-day total estimate + disclaimer
+      // Period total + footnote
       VStack(alignment: .leading, spacing: 2) {
-        Text("估算总计 (近 30 天): \(MeterFormat.usd(card.days30.costUsd))")
-          .font(.system(size: 11.5))
-          .monospacedDigit()
-          .foregroundColor(.secondary)
-        Text("根据 Token 用量估算 · 不是订阅账单")
+        if card.isExternal == true {
+          let periodLabel = card.billingSummary?.periodLabel ?? "本月"
+          let totalCost = card.billingSummary?.periodCost ?? card.days30.costUsd
+          Text("\(periodLabel)总计: \(MeterFormat.money(totalCost, symbol: curSym))")
+            .font(.system(size: 11.5))
+            .monospacedDigit()
+            .foregroundColor(.secondary)
+        } else {
+          Text("估算总计 (近 30 天): \(MeterFormat.money(card.days30.costUsd, symbol: curSym))")
+            .font(.system(size: 11.5))
+            .monospacedDigit()
+            .foregroundColor(.secondary)
+        }
+        Text(card.footnote ?? "根据 Token 用量估算 · 不是订阅账单")
           .font(.system(size: 10))
           .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+      }
+
+      // External provider breakdowns (products / models)
+      if !breakdowns.isEmpty {
+        ForEach(breakdowns.prefix(2)) { sec in
+          VStack(alignment: .leading, spacing: 5) {
+            Text(sec.title)
+              .font(.system(size: 11.5, weight: .medium))
+              .foregroundColor(.secondary)
+
+            ForEach(sec.items.prefix(5)) { item in
+              VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                  Text(item.name)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                  Spacer(minLength: 4)
+                  if let share = item.sharePct {
+                    Text("\(String(format: "%.1f", share))%")
+                      .font(.system(size: 10))
+                      .monospacedDigit()
+                      .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+                  }
+                  if let limit = item.limit, limit > 0 {
+                    Text("\(MeterFormat.money(item.cost, symbol: curSym)) / \(MeterFormat.money(limit, symbol: curSym))")
+                      .font(.system(size: 10.5))
+                      .monospacedDigit()
+                      .foregroundColor(.secondary)
+                      .lineLimit(1)
+                  } else if let cost = item.cost {
+                    Text(MeterFormat.money(cost, symbol: curSym))
+                      .font(.system(size: 10.5))
+                      .monospacedDigit()
+                      .foregroundColor(.secondary)
+                      .lineLimit(1)
+                  }
+                }
+                if let pct = item.usagePct, item.limit != nil {
+                  GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                      Capsule().fill(Color.primary.opacity(0.10))
+                      Capsule()
+                        .fill(pct >= 90 ? Color.red.opacity(0.8) : CodexBarPalette.tealBar)
+                        .frame(width: max(3, geo.size.width * CGFloat(min(1.0, max(0.0, pct / 100.0)))))
+                    }
+                  }
+                  .frame(height: 3.5)
+                }
+              }
+            }
+          }
+        }
       }
 
       // Projects breakdown (项目)
@@ -362,7 +442,7 @@ private struct CostHistoryDetailFlyoutView: View {
                   .foregroundColor(.secondary)
                   .lineLimit(1)
                 Spacer(minLength: 4)
-                Text("\(MeterFormat.usd(proj.costUsd)) · \(MeterFormat.tokens(proj.totalTokens)) token 用量")
+                Text("\(MeterFormat.money(proj.costUsd, symbol: curSym)) · \(MeterFormat.tokens(proj.totalTokens)) token 用量")
                   .font(.system(size: 11))
                   .monospacedDigit()
                   .foregroundColor(.secondary)

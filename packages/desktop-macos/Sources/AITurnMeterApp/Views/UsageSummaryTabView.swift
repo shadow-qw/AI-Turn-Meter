@@ -308,6 +308,99 @@ struct UsageSummaryTabView: View {
               }
               .padding(14)
             }
+
+            // External Provider Plugin Cards (kept separate from local USD token estimates)
+            let activeExternal = vm.externalProviders.filter { vm.isToolEnabled($0.key) }
+            if !activeExternal.isEmpty {
+              SettingsGroupCard {
+                VStack(alignment: .leading, spacing: 10) {
+                  HStack {
+                    Text("外部插件额度与账单")
+                      .font(.system(size: 12.5, weight: .semibold))
+                      .foregroundColor(.secondary)
+                    Spacer()
+                    Text("独立结算口径 · 不计入本地估算")
+                      .font(.system(size: 10.5))
+                      .foregroundColor(.secondary)
+                  }
+
+                  ForEach(Array(activeExternal.enumerated()), id: \.element.id) { idx, meta in
+                    if idx > 0 { Divider() }
+                    let card = data.cards?[meta.key]
+                    let sym = card?.resolvedCurrencySymbol ?? meta.currencySymbol ?? "$"
+                    let periodLabel = card?.billingSummary?.periodLabel ?? "本月"
+                    let periodCost = card?.billingSummary?.periodCost ?? card?.days30.costUsd
+                    let periodLimit = card?.billingSummary?.periodLimit
+                    let todayCost = card?.billingSummary?.todayCost ?? card?.today.costUsd
+                    let firstWin = card?.quotaWindows?.first
+
+                    Button {
+                      vm.openSettingsPane(.provider(meta.key))
+                    } label: {
+                      VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                          ToolGlyph.iconView(for: meta.key, sfSymbolOverride: meta.icon, size: 15)
+                            .foregroundColor(vm.toolAccentColor(for: meta.key))
+                          Text(meta.name)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundColor(.primary)
+                          if let plan = card?.planTitle, !plan.isEmpty {
+                            Text(plan)
+                              .font(.system(size: 10.5))
+                              .foregroundColor(.secondary)
+                          }
+                          Spacer()
+                          if let limit = periodLimit, limit > 0 {
+                            Text("\(periodLabel) \(MeterFormat.money(periodCost, symbol: sym)) / \(MeterFormat.money(limit, symbol: sym))")
+                              .font(.system(size: 12, weight: .semibold))
+                              .monospacedDigit()
+                              .foregroundColor(.primary)
+                          } else if let cost = periodCost {
+                            Text("\(periodLabel) \(MeterFormat.money(cost, symbol: sym))")
+                              .font(.system(size: 12, weight: .semibold))
+                              .monospacedDigit()
+                              .foregroundColor(.primary)
+                          }
+                          Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.secondary)
+                        }
+
+                        if let win = firstWin {
+                          let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
+                          HStack(spacing: 8) {
+                            GeometryReader { geo in
+                              ZStack(alignment: .leading) {
+                                Capsule().fill(Color.primary.opacity(0.08))
+                                Capsule()
+                                  .fill(CodexBarPalette.tealBar)
+                                  .frame(width: max(4, geo.size.width * CGFloat(min(1, max(0, pct / 100.0)))))
+                              }
+                            }
+                            .frame(height: 4.5)
+
+                            Text("\(win.title) \(vm.quotaDisplayMode.verbLabel) \(Int(pct.rounded()))% · 今日 \(MeterFormat.money(todayCost, symbol: sym))")
+                              .font(.system(size: 10.5))
+                              .monospacedDigit()
+                              .foregroundColor(.secondary)
+                              .lineLimit(1)
+                          }
+                        } else if let hint = card?.quotaHint ?? meta.error {
+                          Text(hint)
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                        }
+                      }
+                      .contentShape(Rectangle())
+                      .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                  }
+                }
+                .padding(14)
+              }
+            }
           }
           .padding(.bottom, 8)
         }

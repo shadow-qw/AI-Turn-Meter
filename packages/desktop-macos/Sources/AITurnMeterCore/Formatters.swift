@@ -15,11 +15,23 @@ public enum MeterFormat {
     return "\(trimmed)M"
   }
 
-  public static func usd(_ val: Double?) -> String {
+  public static func money(_ val: Double?, symbol: String = "$") -> String {
     guard let val = val, val.isFinite else { return "--" }
-    if val <= 0 { return "$0.00" }
-    if val < 0.01 { return String(format: "$%.4f", val) }
-    return String(format: "$%.2f", val)
+    let sym = symbol.isEmpty ? "$" : symbol
+    if val <= 0 { return "\(sym)0.00" }
+    if val < 0.01 { return "\(sym)\(String(format: "%.4f", val))" }
+    return "\(sym)\(String(format: "%.2f", val))"
+  }
+
+  public static func compactMoney(_ val: Double?, symbol: String = "$") -> String {
+    guard let val = val, val.isFinite else { return "--" }
+    let sym = symbol.isEmpty ? "$" : symbol
+    if val >= 10 { return "\(sym)\(Int(val.rounded()))" }
+    return money(val, symbol: sym)
+  }
+
+  public static func usd(_ val: Double?) -> String {
+    money(val, symbol: "$")
   }
 
   public static func tps(_ val: Double?) -> String {

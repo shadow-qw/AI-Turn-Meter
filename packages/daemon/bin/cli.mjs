@@ -14,7 +14,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   APP_SPECS,
   DEFAULT_DAEMON_PORT,
@@ -30,6 +30,7 @@ import {
 } from '../src/apps.mjs';
 import { formatTokens, formatTps } from '../src/format.mjs';
 import { AUTH_TOKEN_HEADER, readDaemonToken } from '../src/auth.mjs';
+import { ExternalProviderRegistry } from '../src/external-providers.mjs';
 import {
   applyLocalSshConfig,
   applyRemoteCursorHooks,
@@ -62,6 +63,7 @@ function printHelp() {
 
 Usage:
   ai-turn-meter [status]                查看后台守护进程、CDP 与 4 家最近一轮指标
+  ai-turn-meter providers [import|remove] 管理本地外部数据源插件（列表、导入 .mjs 或移除）
   ai-turn-meter cost [--days=7]         查看今日/本周/历史 Token 用量与 API 等效费用估算
   ai-turn-meter receipt [--date=...]    打印超市小票风每日账单（支持 --scope=day|week|month --group=model|tool|project --currency=both|usd|cny --rate=7 --svg=out.svg）
   ai-turn-meter fingerprint [--mode=.]  运行模型指纹与降智检测（passive|codex_protocol|quick|deep，支持 --target=codex|<id> --record-baseline）
@@ -105,12 +107,31 @@ async function cmdStatus(jsonMode = false) {
     };
   }
 
+  let providersMeta = null;
+  if (online) {
+    try {
+      const pRes = await fetch(`http://127.0.0.1:${PORT}/v1/providers`, { signal: AbortSignal.timeout(1500) });
+      if (pRes.ok) providersMeta = await pRes.json();
+    } catch {}
+  }
+
   if (jsonMode) {
     const config = state?.config || {
       enabled: true,
       tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
     };
-    console.log(JSON.stringify({ version: getPkgVersion(), port: PORT, online, config, apps, state }));
+    console.log(
+      JSON.stringify({
+        version: getPkgVersion(),
+        port: PORT,
+        online,
+        config,
+        apps,
+        externalProviders: providersMeta?.providers || [],
+        providersDir: providersMeta?.providersDir || null,
+        state,
+      })
+    );
     return;
   }
 
@@ -576,6 +597,129 @@ function cmdAppAutostart(action = 'status', flags = [], dryRun = false, jsonMode
   }
 }
 
+async function cmdProviders(args = [], flags = [], jsonMode = false) {
+  const sub = args[0] || 'list';
+
+  if (sub === 'import') {
+    const srcPath = args[1];
+    if (!srcPath) {
+      console.error('Usage: ai-turn-meter providers import <path-to-plugin.mjs>');
+      process.exit(1);
+    }
+    const content = readFileSync(srcPath, 'utf8');
+    const fileName = basename(srcPath);
+    const token = readDaemonToken();
+    let result = null;
+    if (token) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${PORT}/v1/providers/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', [AUTH_TOKEN_HEADER]: token },
+          body: JSON.stringify({ fileName, content }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (res.status !== 404) {
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            console.error(data?.error || `导入失败 (HTTP ${res.status})`);
+            process.exit(1);
+          }
+          result = data;
+        }
+      } catch {}
+    }
+    if (!result) {
+      const reg = new ExternalProviderRegistry();
+      try {
+        const imp = await reg.importPluginSource({ fileName, content });
+        result = { ok: true, imported: imp.meta, providersDir: reg.providersDir };
+      } catch (err) {
+        console.error(err?.message || '导入失败');
+        process.exit(1);
+      }
+    }
+    if (jsonMode) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(`已导入外部插件: ${result.imported.name} (${result.imported.key}) -> ${result.imported.filePath}`);
+    }
+    return;
+  }
+
+  if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+    const target = args[1];
+    if (!target) {
+      console.error('Usage: ai-turn-meter providers remove <fileName.mjs|ext:id>');
+      process.exit(1);
+    }
+    const qs = target.startsWith('ext:')
+      ? `key=${encodeURIComponent(target)}`
+      : `fileName=${encodeURIComponent(target)}`;
+    const token = readDaemonToken();
+    let result = null;
+    if (token) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${PORT}/v1/providers?${qs}`, {
+          method: 'DELETE',
+          headers: { [AUTH_TOKEN_HEADER]: token },
+          signal: AbortSignal.timeout(6_000),
+        });
+        if (res.status !== 404) {
+          result = await res.json();
+        }
+      } catch {}
+    }
+    if (!result) {
+      const reg = new ExternalProviderRegistry();
+      const rmRes = await reg.removePlugin(target.startsWith('ext:') ? { key: target } : { fileName: target });
+      result = { ok: true, ...rmRes };
+    }
+    if (jsonMode) {
+      console.log(JSON.stringify(result, null, 2));
+    } else if (result.deleted) {
+      console.log(`已移除插件: ${result.fileName || target}`);
+    } else {
+      console.error(`未找到插件: ${target}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  const refresh = flags.includes('--refresh');
+  let payload = null;
+  try {
+    const qs = refresh ? '?refresh=1' : '';
+    const res = await fetch(`http://127.0.0.1:${PORT}/v1/providers${qs}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.ok) {
+      payload = await res.json();
+    }
+  } catch {}
+
+  if (!payload) {
+    const reg = new ExternalProviderRegistry();
+    const out = await reg.fetchAll({ forceRefresh: refresh });
+    payload = { providersDir: out.providersDir, providers: out.providers, cards: out.cards };
+  }
+
+  if (jsonMode) {
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+
+  console.log(`External providers directory: ${payload.providersDir}`);
+  const list = Array.isArray(payload.providers) ? payload.providers : [];
+  if (list.length === 0) {
+    console.log('未发现外部数据源插件（可执行 ai-turn-meter providers import <file.mjs> 导入）');
+    return;
+  }
+  for (const p of list) {
+    const status = !p.enabled ? 'DISABLED' : p.ok ? 'OK' : `ERR: ${p.error || 'unknown'}`;
+    console.log(`- ${p.key.padEnd(20)} ${p.name} [${p.currency || 'USD'}] (${status})  ${p.fileName}`);
+  }
+}
+
 async function cmdDaemon(flags) {
   const portFlag = flags.find((a) => a.startsWith('--port='));
   const port = portFlag ? Number(portFlag.split('=')[1]) : PORT;
@@ -603,6 +747,10 @@ if (flags.includes('--version') || flags.includes('-v')) {
   printHelp();
 } else if (cmd === 'status' || !cmd) {
   await cmdStatus(jsonMode);
+} else if (cmd === 'providers') {
+  const pIdx = argv.indexOf('providers');
+  const posArgs = argv.slice(pIdx + 1).filter((a) => !a.startsWith('-'));
+  await cmdProviders(posArgs, flags, jsonMode);
 } else if (cmd === 'cost') {
   await cmdCost(flags, jsonMode);
 } else if (cmd === 'receipt') {

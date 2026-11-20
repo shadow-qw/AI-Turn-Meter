@@ -8,6 +8,7 @@ private struct ProviderSwitcherBar: View {
   @State private var hoveredKey: String? = nil
 
   private func isToolAvailable(_ key: String) -> Bool {
+    if vm.isExternalProvider(key) { return vm.externalProviderMeta(for: key) != nil }
     if vm.apps[key]?.installed ?? false { return true }
     let card = vm.usageData?.cards?[key]
     return !(card?.quotaWindows?.isEmpty ?? true) || (card?.accountEmail != nil)
@@ -15,11 +16,14 @@ private struct ProviderSwitcherBar: View {
 
   private var switcherKeys: [String] {
     let useFallback = vm.apps.isEmpty
-    let tools = ["codex", "cursor", "antigravity", "codebuddy"].filter { key in
+    let builtIn = ["codex", "cursor", "antigravity", "codebuddy"].filter { key in
       let available = useFallback ? true : isToolAvailable(key)
       return available && vm.isToolEnabled(key)
     }
-    return ["all"] + tools
+    let external = vm.externalProviderKeys.filter { key in
+      vm.isToolEnabled(key)
+    }
+    return ["all"] + builtIn + external
   }
 
   private func indicatorFraction(for key: String, installed: Bool, active: Bool) -> Double {
@@ -31,71 +35,89 @@ private struct ProviderSwitcherBar: View {
     return 1.0
   }
 
-  var body: some View {
-    HStack(spacing: 4) {
-      ForEach(switcherKeys, id: \.self) { key in
-        let isSelected = selection == key
-        let isHovered = hoveredKey == key
-        let isAll = key == "all"
-        let installed = isAll || isToolAvailable(key)
-        let active = !isAll && installed && vm.isActiveOverall && vm.isToolEnabled(key)
-        let frac = indicatorFraction(for: key, installed: installed, active: active)
-        let fillColor: Color = {
-          if isSelected { return .white }
-          if active { return vm.toolAccentColor(for: key) }
-          return Color.gray.opacity(0.45)
-        }()
+  @ViewBuilder
+  private func tabButton(for key: String, compactWidth: Bool) -> some View {
+    let isSelected = selection == key
+    let isHovered = hoveredKey == key
+    let isAll = key == "all"
+    let installed = isAll || isToolAvailable(key)
+    let active = !isAll && installed && vm.isActiveOverall && vm.isToolEnabled(key)
+    let frac = indicatorFraction(for: key, installed: installed, active: active)
+    let fillColor: Color = {
+      if isSelected { return .white }
+      if active { return vm.toolAccentColor(for: key) }
+      return Color.gray.opacity(0.45)
+    }()
 
-        Button {
-          selection = key
-        } label: {
-          VStack(spacing: 3) {
-            ToolGlyph.iconView(for: key, size: 15)
-              .frame(height: 16)
-            Text(vm.toolShortTitle(for: key))
-              .font(.system(size: 9.5, weight: isSelected ? .semibold : .medium))
-              .lineLimit(1)
-              .minimumScaleFactor(0.72)
-              .padding(.horizontal, 2)
-
-            GeometryReader { geo in
-              ZStack(alignment: .leading) {
-                Capsule()
-                  .fill(isAll ? Color.clear : (isSelected ? Color.white.opacity(0.35) : Color.primary.opacity(0.12)))
-                if !isAll && frac > 0 {
-                  Capsule()
-                    .fill(fillColor)
-                    .frame(width: max(4, geo.size.width * CGFloat(frac)))
-                }
-              }
-            }
-            .frame(height: 2)
-            .padding(.horizontal, 6)
-          }
-          .foregroundColor(
-            isSelected
-              ? .white
-              : (isHovered
-                  ? .primary
-                  : (installed ? .secondary : .secondary.opacity(0.55)))
-          )
-          .frame(maxWidth: .infinity)
-          .padding(.vertical, 5)
+    Button {
+      selection = key
+    } label: {
+      VStack(spacing: 3) {
+        ToolGlyph.iconView(for: key, sfSymbolOverride: vm.toolIconSymbol(for: key), size: 15)
+          .frame(height: 16)
+        Text(vm.toolShortTitle(for: key))
+          .font(.system(size: 9.5, weight: isSelected ? .semibold : .medium))
+          .lineLimit(1)
+          .minimumScaleFactor(0.72)
           .padding(.horizontal, 2)
-          .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-              .fill(isSelected ? CodexBarPalette.accentBlue : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
-          )
-          .contentShape(Rectangle())
+
+        GeometryReader { geo in
+          ZStack(alignment: .leading) {
+            Capsule()
+              .fill(isAll ? Color.clear : (isSelected ? Color.white.opacity(0.35) : Color.primary.opacity(0.12)))
+            if !isAll && frac > 0 {
+              Capsule()
+                .fill(fillColor)
+                .frame(width: max(4, geo.size.width * CGFloat(frac)))
+            }
+          }
         }
-        .buttonStyle(.plain)
-        .onHover { inside in
-          if inside { hoveredKey = key }
-          else if hoveredKey == key { hoveredKey = nil }
+        .frame(height: 2)
+        .padding(.horizontal, 6)
+      }
+      .foregroundColor(
+        isSelected
+          ? .white
+          : (isHovered
+              ? .primary
+              : (installed ? .secondary : .secondary.opacity(0.55)))
+      )
+      .frame(minWidth: compactWidth ? 54 : nil, maxWidth: compactWidth ? nil : .infinity)
+      .padding(.vertical, 5)
+      .padding(.horizontal, compactWidth ? 4 : 2)
+      .background(
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+          .fill(isSelected ? CodexBarPalette.accentBlue : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
+      )
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .onHover { inside in
+      if inside { hoveredKey = key }
+      else if hoveredKey == key { hoveredKey = nil }
+    }
+  }
+
+  var body: some View {
+    Group {
+      if switcherKeys.count > 5 {
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 4) {
+            ForEach(switcherKeys, id: \.self) { key in
+              tabButton(for: key, compactWidth: true)
+            }
+          }
+          .padding(.horizontal, 10)
         }
+      } else {
+        HStack(spacing: 4) {
+          ForEach(switcherKeys, id: \.self) { key in
+            tabButton(for: key, compactWidth: false)
+          }
+        }
+        .padding(.horizontal, 10)
       }
     }
-    .padding(.horizontal, 10)
     .padding(.top, 7)
     .padding(.bottom, 5)
     .onChange(of: switcherKeys) { keys in
@@ -109,10 +131,12 @@ private struct ProviderSwitcherBar: View {
 private struct MiniUsageBarsView: View {
   let points: [CardDailyPoint]
   let cardHovered: Bool
+  var currencySymbol: String = "$"
+  var billingOnly: Bool = false
   @State private var hovered: CardDailyPoint? = nil
 
   private var useCostScale: Bool {
-    points.contains { ($0.costUsd ?? 0) > 0 }
+    billingOnly || points.contains { ($0.costUsd ?? 0) > 0 }
   }
 
   private func metricValue(_ pt: CardDailyPoint) -> Double {
@@ -123,9 +147,8 @@ private struct MiniUsageBarsView: View {
   private var peakLabel: String {
     if useCostScale {
       let peak = points.map { max(0, $0.costUsd ?? 0) }.max() ?? 0
-      if peak >= 10 { return "$\(Int(peak.rounded()))" }
-      if peak > 0 { return MeterFormat.usd(peak) }
-      return "$0"
+      if peak > 0 { return MeterFormat.compactMoney(peak, symbol: currencySymbol) }
+      return "\(currencySymbol)0"
     }
     let peakTok = points.map(\.totalTokens).max() ?? 0
     return peakTok > 0 ? MeterFormat.tokens(peakTok) : "0"
@@ -137,7 +160,10 @@ private struct MiniUsageBarsView: View {
     VStack(spacing: 3) {
       HStack {
         if let pt = hovered {
-          Text("\(pt.label) · \(MeterFormat.usd(pt.costUsd)) · \(MeterFormat.tokens(pt.totalTokens))")
+          let hoverText = (billingOnly && pt.totalTokens == 0)
+            ? "\(pt.label) · \(MeterFormat.money(pt.costUsd, symbol: currencySymbol))"
+            : "\(pt.label) · \(MeterFormat.money(pt.costUsd, symbol: currencySymbol)) · \(MeterFormat.tokens(pt.totalTokens))"
+          Text(hoverText)
             .font(.system(size: 10, weight: .medium))
             .monospacedDigit()
             .foregroundColor(cardHovered ? .white : .primary)
@@ -210,6 +236,20 @@ private struct CodexBarStyleCardView: View {
 
   private var isAll: Bool { selection == "all" }
 
+  private var isExternal: Bool {
+    (card.isExternal == true) || vm.isExternalProvider(selection)
+  }
+
+  private var curSym: String {
+    card.resolvedCurrencySymbol
+  }
+
+  private var isBillingOnlyExternal: Bool {
+    guard isExternal else { return false }
+    let b = card.billingSummary
+    return b?.todayTokens == nil && b?.periodTokens == nil && card.today.totalTokens == 0 && card.days30.totalTokens == 0
+  }
+
   private var headerTitle: String {
     isAll ? "全部客户端" : vm.toolShortTitle(for: selection)
   }
@@ -231,6 +271,11 @@ private struct CodexBarStyleCardView: View {
       if !vm.daemonOnline { return "后台未启动" }
       if !vm.masterEnabled { return "已暂停" }
       return "\(active)/\(installed) 监控中"
+    }
+    if isExternal {
+      if !vm.daemonOnline { return "后台未启动" }
+      if !vm.masterEnabled || !vm.isToolEnabled(selection) { return "已暂停" }
+      return card.statusText ?? "外部插件"
     }
     guard let entry = vm.apps[selection], entry.installed else { return "未安装" }
     if !vm.daemonOnline { return "后台未启动" }
@@ -293,7 +338,7 @@ private struct CodexBarStyleCardView: View {
             .font(.system(size: 11.5, weight: .semibold))
             .foregroundColor(primaryText)
             .lineLimit(1)
-          Text(card.planTitle ?? "本地监控")
+          Text(card.planTitle ?? (isExternal ? "外部插件" : "本地监控"))
             .font(.system(size: 10))
             .foregroundColor(secondaryText)
             .lineLimit(1)
@@ -315,22 +360,24 @@ private struct CodexBarStyleCardView: View {
           Text(
             isAll
               ? "正在同步客户端登录与额度信息…"
-              : ((vm.apps[selection]?.installed ?? false)
-                  ? (card.quotaHint ?? (
-                      selection == "cursor"
-                        ? (vm.hasCursorCookie
-                            ? "未读取到套餐限额 · 请重新登录"
-                            : "需在「设置 → Cursor」授权读取或网页登录")
-                        : (selection == "codex"
-                            ? (card.accountEmail != nil
-                                ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
-                                : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
-                            : "企业/团队按量模式 · 无固定个人会话限额")))
-                  : "未检测到该客户端安装")
+              : (isExternal
+                  ? (card.quotaHint ?? "等待外部插件返回配额数据")
+                  : ((vm.apps[selection]?.installed ?? false)
+                      ? (card.quotaHint ?? (
+                          selection == "cursor"
+                            ? (vm.hasCursorCookie
+                                ? "未读取到套餐限额 · 请重新登录"
+                                : "需在「设置 → Cursor」授权读取或网页登录")
+                            : (selection == "codex"
+                                ? (card.accountEmail != nil
+                                    ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
+                                    : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
+                                : "企业/团队按量模式 · 无固定个人会话限额")))
+                      : "未检测到该客户端安装"))
           )
           .font(.system(size: 10.5))
           .foregroundColor(secondaryText)
-          .lineLimit(1)
+          .lineLimit(2)
           Spacer(minLength: 4)
           Text(statusLabel)
             .font(.system(size: 10, weight: .medium))
@@ -375,31 +422,57 @@ private struct CodexBarStyleCardView: View {
 
       dividerLine
 
-      // Cost & Usage 3x2 Dual-Column Grid
-      VStack(alignment: .leading, spacing: 6) {
-        metricGridRow(
-          leftLabel: "今日",
-          leftVal: MeterFormat.usd(card.today.costUsd),
-          rightLabel: "估算：当前窗口",
-          rightVal: MeterFormat.usd(card.currentWindow.costUsd)
-        )
-        metricGridRow(
-          leftLabel: "今日 token 用量",
-          leftVal: MeterFormat.tokens(card.today.totalTokens),
-          rightLabel: "估算：当前窗口 token 用量",
-          rightVal: MeterFormat.tokens(card.currentWindow.totalTokens)
-        )
-        metricGridRow(
-          leftLabel: "近 30 天",
-          leftVal: MeterFormat.usd(card.days30.costUsd),
-          rightLabel: "近 30 天 token 用量",
-          rightVal: MeterFormat.tokens(card.days30.totalTokens)
-        )
+      // Cost & Usage Grid
+      if isBillingOnlyExternal {
+        let b = card.billingSummary
+        let periodLabel = b?.periodLabel ?? "本月"
+        VStack(alignment: .leading, spacing: 6) {
+          metricGridRow(
+            leftLabel: "今日消耗",
+            leftVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym),
+            rightLabel: "\(periodLabel)已用",
+            rightVal: MeterFormat.money(b?.periodCost ?? card.days30.costUsd, symbol: curSym)
+          )
+          if b?.periodLimit != nil || b?.periodRemaining != nil {
+            metricGridRow(
+              leftLabel: "\(periodLabel)限额",
+              leftVal: MeterFormat.money(b?.periodLimit, symbol: curSym),
+              rightLabel: "\(periodLabel)剩余",
+              rightVal: MeterFormat.money(b?.periodRemaining, symbol: curSym)
+            )
+          }
+        }
+      } else {
+        VStack(alignment: .leading, spacing: 6) {
+          metricGridRow(
+            leftLabel: "今日",
+            leftVal: MeterFormat.money(card.today.costUsd, symbol: curSym),
+            rightLabel: "估算：当前窗口",
+            rightVal: MeterFormat.money(card.currentWindow.costUsd, symbol: curSym)
+          )
+          metricGridRow(
+            leftLabel: "今日 token 用量",
+            leftVal: MeterFormat.tokens(card.today.totalTokens),
+            rightLabel: "估算：当前窗口 token 用量",
+            rightVal: MeterFormat.tokens(card.currentWindow.totalTokens)
+          )
+          metricGridRow(
+            leftLabel: "近 30 天",
+            leftVal: MeterFormat.money(card.days30.costUsd, symbol: curSym),
+            rightLabel: "近 30 天 token 用量",
+            rightVal: MeterFormat.tokens(card.days30.totalTokens)
+          )
+        }
       }
 
       // 30-day Mini Usage Chart
       if !card.daily30.isEmpty {
-        MiniUsageBarsView(points: card.daily30, cardHovered: isCardHovered)
+        MiniUsageBarsView(
+          points: card.daily30,
+          cardHovered: isCardHovered,
+          currencySymbol: curSym,
+          billingOnly: isBillingOnlyExternal
+        )
       }
 
       // Recent Rolling 7-day Windows
@@ -452,7 +525,7 @@ private struct CodexBarStyleCardView: View {
             .foregroundColor(secondaryText)
             .lineLimit(1)
         }
-        Text("根据 Token 用量估算 · 不是订阅账单")
+        Text(card.footnote ?? "根据 Token 用量估算 · 不是订阅账单")
           .font(.system(size: 10))
           .foregroundColor(secondaryText)
       }
@@ -639,6 +712,10 @@ struct MenuBarPopoverView: View {
   private var effectiveSelection: String {
     let candidate = vm.popoverSelection
     if candidate == "all" { return "all" }
+    if vm.isExternalProvider(candidate) {
+      let exists = vm.externalProviderMeta(for: candidate) != nil || vm.usageData?.cards?[candidate] != nil
+      return (exists && vm.isToolEnabled(candidate)) ? candidate : "all"
+    }
     let installed = vm.apps.isEmpty ? true : (vm.apps[candidate]?.installed ?? false)
     return (installed && vm.isToolEnabled(candidate)) ? candidate : "all"
   }
@@ -717,6 +794,14 @@ struct MenuBarPopoverView: View {
       Divider().padding(.horizontal, 10)
 
       VStack(spacing: 1) {
+        if let rawUrl = activeCard.detailUrl ?? vm.externalProviderMeta(for: effectiveSelection)?.detailUrl,
+           let url = URL(string: rawUrl) {
+          PopoverActionRow(title: "打开控制台", trailingSymbol: "arrow.up.right") {
+            onClosePopover()
+            NSWorkspace.shared.open(url)
+          }
+        }
+
         PopoverActionRow(title: "用量仪表盘") {
           onClosePopover()
           onOpenMainTab(.usage)

@@ -78,6 +78,42 @@
 - **私有客户端两步出题验证**：针对 Antigravity / Cursor / CodeBuddy 提供标准 5 题测试包，一键复制发给模型后自动读取回复评分；
 - **中转站 / 自定义 API 真伪指纹**：支持添加 OpenAI / Anthropic 兼容端点（API Key 仅存本机 `config.json`），结合 8 题确定性能力探针与单 Token 概率分布指纹（Jensen-Shannon 散度 + 自录参考基线）识别偷换模型与静默量化。
 
+### 2.5 外部数据源插件（External Provider Plugins）
+
+支持在不改动主仓源码的前提下，通过本地单文件 ESM 插件（默认位于 `~/.local/share/ai-turn-meter/providers/*.mjs`，也可通过 `AI_TURN_METER_PROVIDERS_DIR` 指定）接入任意外部配额与账单来源（如中转站余额、多云聚合网关或私有企业配额接口）：
+
+- **一键导入与管理**：在 macOS 应用左侧栏「**插件**」页支持**拖拽 `.mjs` 文件投放、文件选择器导入、粘贴代码导入**，导入前自动校验语法与 `fetch(ctx)` 导出，并支持一键替换、启用开关与移除；也支持命令行 `ai-turn-meter providers import <file.mjs>`；
+- **自动热加载与隔离**：Daemon 按文件 `mtime` 自动热加载插件，单插件超时（默认 8s）或异常不会影响内置客户端，并带 15 分钟缓存兜底；
+- **全端原生展示**：插件自动出现在顶部菜单栏切换栏（`ProviderSwitcherBar`）、悬浮详情 Flyout、菜单栏图标/文本数据源、「设置 → 外部插件」详情页以及「用量」页独立账单区，支持自定义币种（`USD`/`CNY`）、多条额度进度条、每日柱状图与产品/模型分组明细；
+- **最小插件示例**（保存为 `~/.local/share/ai-turn-meter/providers/my-gateway.mjs`，修改后在「设置 → 通用 → 外部数据源插件」点击「重新扫描」或等待缓存过期即可生效）：
+
+```js
+export default {
+  id: 'my-gateway',
+  name: 'Custom Token Gateway',
+  shortName: 'Gateway',
+  icon: 'building.2',          // 可选 SF Symbol 图标名
+  accentColor: '#1677FF',      // 可选主题色
+  currency: 'CNY',             // 'USD' | 'CNY'
+  detailUrl: 'https://gateway.example.com/dashboard',
+  async fetch({ nowMs, helpers }) {
+    const res = await helpers.httpRequestJson('https://gateway.example.com/v1/quota', {
+      headers: { Authorization: `Bearer ${process.env.MY_GATEWAY_KEY || ''}` },
+    });
+    const used = Number(res.data?.used || 0);
+    const limit = Number(res.data?.limit || 1000);
+    return {
+      account: res.data?.user || 'user',
+      planTitle: 'Monthly Plan',
+      quotaWindows: [{ id: 'monthly', title: '本月额度', used, limit }],
+      metrics: { todayCost: res.data?.todayUsed ?? 0, periodLabel: '本月', periodCost: used, periodLimit: limit },
+      daily: res.data?.daily || [],       // [{ date: 'YYYY-MM-DD', cost: 12.5 }]
+      breakdowns: res.data?.breakdowns || [],
+    };
+  },
+};
+```
+
 ---
 
 ## 3. 各软件采集来源与 TPS 计算口径
@@ -166,6 +202,7 @@ npm run release:dmg -- --repo=shadow-qw/AI-Turn-Meter
 
 ```bash
 ai-turn-meter status                 # 查看守护进程与四家 CDP / 最新轮次状态
+ai-turn-meter providers [import|remove] # 管理外部数据源插件（列表、导入 .mjs 或移除）
 ai-turn-meter cost [--days=7]        # 查看今日/本周/历史 Token 用量与 API 等效费用估算
 ai-turn-meter receipt [--date=...]   # 打印每日 AI 账单小票（支持 --scope=day|week|month --currency=both|usd|cny --rate=7 --theme=paper|dark --svg=out.svg）
 ai-turn-meter fingerprint [--mode=.] # 手动运行降智检测（passive|codex_protocol|quick|deep，支持 --target=codex|<id> --record-baseline）
@@ -192,7 +229,8 @@ npm run uninstall:all                # 等价于本地仓库运行 ai-turn-meter
 > 安全模型：守护进程仅监听回环地址，所有接口均校验 `Host` 并拒绝浏览器 `Origin` / 跨站 `Sec-Fetch-Site`；写入与敏感接口（`POST /v1/config`、`POST /v1/cursor/sync-local`、`/v1/fingerprint/*`、`POST /v1/ingest`）额外要求请求头携带 `~/.local/share/ai-turn-meter/daemon.token`（`X-ATM-Token`）；`POST /v1/ingest/cursor-hook` 豁免 Token 以便 Remote-SSH 转发上报，仍执行回环与事件白名单校验。
 
 - `GET /health`：健康检查（返回 `ok`、`pid`、`port`、`version`）
-- `GET /v1/apps`：各客户端安装状态、调试端口（5s 异步缓存）与最新轮次状态
+- `GET /v1/apps`：各客户端安装状态、调试端口（5s 异步缓存）、外部数据源插件列表与最新轮次状态
+- `GET /v1/providers`、`POST /v1/providers/import`、`POST /v1/providers/reload` & `DELETE /v1/providers`：查看、校验导入、重载与移除本地外部数据源插件
 - `GET /v1/state?limit=20`：最新全局状态与 `byTool` 摘要
 - `GET /v1/turns?limit=30&tool=`：按时间倒序的最近轮次列表
 - `GET /v1/usage?days=7&tool=`：多维度用量统计、费用估算与各软件剩余配额卡片

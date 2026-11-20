@@ -24,7 +24,7 @@ final class MeterViewModel: ObservableObject {
     static let receiptHideProjects = "atm.receiptHideProjects.v1"
   }
 
-  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.26"
+  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.27"
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
@@ -69,7 +69,10 @@ final class MeterViewModel: ObservableObject {
   @Published var menuBarProvider: String = {
     let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarProvider) ?? "auto"
     let allowed: Set<String> = ["auto", "codex", "cursor", "antigravity", "codebuddy"]
-    return allowed.contains(raw) ? raw : "auto"
+    if allowed.contains(raw) || raw.hasPrefix("ext:") {
+      return raw
+    }
+    return "auto"
   }()
   @Published var menuBarUsageScope: MenuBarUsageScope = {
     if let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarUsageScope),
@@ -137,6 +140,10 @@ final class MeterViewModel: ObservableObject {
 
   @Published var apps: [String: StatusAppEntry] = [:]
   @Published var vsixVersions: [String: String] = [:]
+  @Published var externalProviders: [ExternalProviderMeta] = []
+  @Published var providersDir: String = (NSHomeDirectory() as NSString).appendingPathComponent(".local/share/ai-turn-meter/providers")
+  @Published var showPluginCodeSheet: Bool = false
+  @Published var pluginImportBusy: Bool = false
 
   @Published var busy: Bool = false
   @Published var statusBanner: String? = nil
@@ -170,6 +177,342 @@ final class MeterViewModel: ObservableObject {
   private var lastUsageRefreshAt: Date = .distantPast
 
   let orderedKeys = ["antigravity", "codex", "cursor", "codebuddy"]
+
+  func isExternalProvider(_ key: String) -> Bool {
+    key.hasPrefix("ext:")
+  }
+
+  var externalProviderKeys: [String] {
+    externalProviders.map(\.key)
+  }
+
+  var allQuotaProviderKeys: [String] {
+    ["codex", "cursor", "antigravity", "codebuddy"] + externalProviderKeys
+  }
+
+  func externalProviderMeta(for key: String) -> ExternalProviderMeta? {
+    externalProviders.first(where: { $0.key == key })
+  }
+
+  func toolIconSymbol(for key: String) -> String? {
+    if let meta = externalProviderMeta(for: key), let icon = meta.icon, !icon.isEmpty {
+      return icon
+    }
+    if let icon = usageData?.cards?[key]?.providerIcon, !icon.isEmpty {
+      return icon
+    }
+    return nil
+  }
+
+  func openProvidersFolder() {
+    let dir = providersDir.isEmpty
+      ? (NSHomeDirectory() as NSString).appendingPathComponent(".local/share/ai-turn-meter/providers")
+      : providersDir
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+  }
+
+  static let samplePluginTemplate: String = #"""
+export default {
+  id: 'my-gateway',
+  name: 'Custom Token Gateway',
+  shortName: 'Gateway',
+  icon: 'building.2',
+  accentColor: '#1677FF',
+  currency: 'CNY',
+  detailUrl: 'https://gateway.example.com/dashboard',
+  async fetch({ nowMs, helpers }) {
+    // Replace with your endpoint & auth logic
+    const used = 120.5;
+    const limit = 1000;
+    return {
+      account: 'demo-user',
+      planTitle: 'Monthly Plan',
+      quotaWindows: [
+        {
+          id: 'monthly',
+          title: '本月额度',
+          used,
+          limit,
+          resetAtMs: nowMs + 15 * 86400 * 1000,
+          windowSeconds: 30 * 86400,
+        },
+      ],
+      metrics: {
+        todayCost: 12.8,
+        periodLabel: '本月',
+        periodCost: used,
+        periodLimit: limit,
+      },
+      daily: [],
+      breakdowns: [],
+    };
+  },
+};
+"""#
+
+  func copySamplePluginTemplate() {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(Self.samplePluginTemplate, forType: .string)
+    bannerIsError = false
+    statusBanner = "已复制外部插件示例模板到剪贴板"
+  }
+
+  func pickAndImportPluginFiles(targetFileName: String? = nil) {
+    let panel = NSOpenPanel()
+    panel.title = targetFileName == nil ? "选择外部数据源插件 (.mjs)" : "选择用于替换 \(targetFileName!) 的插件文件 (.mjs)"
+    panel.message = "导入的插件会保存在本机用户目录，升级软件不会被覆盖"
+    panel.prompt = "导入"
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = targetFileName == nil
+    if let mjsType = UTType(filenameExtension: "mjs") {
+      panel.allowedContentTypes = [mjsType]
+    }
+    guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+    if let overrideName = targetFileName, let first = panel.urls.first {
+      importPluginFileURL(first, overrideFileName: overrideName, navigateToImported: false)
+    } else {
+      importPluginFileURLs(panel.urls)
+    }
+  }
+
+  func importPluginFileURLs(_ urls: [URL]) {
+    let mjsUrls = urls.filter { $0.pathExtension.lowercased() == "mjs" }
+    guard !mjsUrls.isEmpty else {
+      bannerIsError = true
+      statusBanner = "仅支持导入 .mjs 格式的外部数据源插件"
+      return
+    }
+    if mjsUrls.count == 1 {
+      importPluginFileURL(mjsUrls[0], overrideFileName: nil, navigateToImported: true)
+      return
+    }
+    var remaining = mjsUrls
+    var successCount = 0
+    var lastError: String? = nil
+
+    func next() {
+      guard !remaining.isEmpty else {
+        if let err = lastError, successCount == 0 {
+          self.bannerIsError = true
+          self.statusBanner = err
+        } else if let err = lastError {
+          self.bannerIsError = true
+          self.statusBanner = "已导入 \(successCount) 个插件，部分失败：\(err)"
+        } else {
+          self.bannerIsError = false
+          self.statusBanner = "已成功导入 \(successCount) 个外部插件"
+        }
+        return
+      }
+      let url = remaining.removeFirst()
+      self.importPluginFileURL(url, overrideFileName: nil, navigateToImported: remaining.isEmpty && successCount == 0) { ok, err in
+        if ok { successCount += 1 }
+        else if let err = err { lastError = err }
+        next()
+      }
+    }
+    next()
+  }
+
+  private func importPluginFileURL(
+    _ fileUrl: URL,
+    overrideFileName: String?,
+    navigateToImported: Bool,
+    completion: ((Bool, String?) -> Void)? = nil
+  ) {
+    guard let content = try? String(contentsOf: fileUrl, encoding: .utf8) else {
+      let msg = "无法读取文件：\(fileUrl.lastPathComponent)"
+      bannerIsError = true
+      statusBanner = msg
+      completion?(false, msg)
+      return
+    }
+    let fileName = overrideFileName ?? fileUrl.lastPathComponent
+    importPlugin(fileName: fileName, content: content, navigateToImported: navigateToImported, completion: completion)
+  }
+
+  func importPlugin(
+    fileName: String,
+    content: String,
+    navigateToImported: Bool = true,
+    completion: ((Bool, String?) -> Void)? = nil
+  ) {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/import"),
+          let jsonData = try? JSONSerialization.data(withJSONObject: [
+            "fileName": fileName,
+            "content": content,
+          ]) else {
+      completion?(false, "无法构建导入请求")
+      return
+    }
+    pluginImportBusy = true
+    bannerIsError = false
+    statusBanner = "正在校验并导入插件 \(fileName)…"
+
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 15)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jsonData
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.pluginImportBusy = false
+        if let err = err {
+          let msg = "导入失败：\(err.localizedDescription)"
+          self.bannerIsError = true
+          self.statusBanner = msg
+          completion?(false, msg)
+          return
+        }
+        guard let http = resp as? HTTPURLResponse else {
+          let msg = "后台服务无响应"
+          self.bannerIsError = true
+          self.statusBanner = msg
+          completion?(false, msg)
+          return
+        }
+        if http.statusCode == 404 {
+          let msg = "当前后台守护进程版本过旧，请先在「通用 → 同步扩展与后台配置」点击重新同步"
+          self.bannerIsError = true
+          self.statusBanner = msg
+          completion?(false, msg)
+          return
+        }
+        struct ImportRes: Decodable {
+          let ok: Bool?
+          let error: String?
+          let imported: ExternalProviderMeta?
+          let providersDir: String?
+          let providers: [ExternalProviderMeta]?
+        }
+        let parsed = data.flatMap { try? JSONDecoder().decode(ImportRes.self, from: $0) }
+        if http.statusCode == 200, parsed?.ok == true {
+          if let dir = parsed?.providersDir, !dir.isEmpty { self.providersDir = dir }
+          if let list = parsed?.providers { self.applyExternalProviders(list) }
+          let importedName = parsed?.imported?.name ?? fileName
+          self.bannerIsError = false
+          self.statusBanner = "已导入外部插件：\(importedName)"
+          self.fetchAppsStatusHttp(forceRefresh: true)
+          self.fetchUsageSummary(silent: false, forceRefresh: true)
+          if navigateToImported, let key = parsed?.imported?.key {
+            self.openSettingsPane(.provider(key))
+          }
+          completion?(true, nil)
+        } else {
+          let msg = parsed?.error ?? "插件校验失败（HTTP \(http.statusCode)）"
+          self.bannerIsError = true
+          self.statusBanner = msg
+          completion?(false, msg)
+        }
+      }
+    }.resume()
+  }
+
+  func removeExternalPlugin(_ meta: ExternalProviderMeta) {
+    let queryPart: String
+    if let fileName = meta.fileName, let enc = fileName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+      queryPart = "fileName=\(enc)"
+    } else if let enc = meta.key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+      queryPart = "key=\(enc)"
+    } else {
+      return
+    }
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers?\(queryPart)") else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 8)
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "移除插件失败：\(err.localizedDescription)"
+          return
+        }
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+          self.bannerIsError = true
+          self.statusBanner = "移除插件失败"
+          return
+        }
+        struct RemoveRes: Decodable {
+          let ok: Bool?
+          let providers: [ExternalProviderMeta]?
+        }
+        if let data = data, let parsed = try? JSONDecoder().decode(RemoveRes.self, from: data), let list = parsed.providers {
+          self.applyExternalProviders(list)
+        } else {
+          self.externalProviders.removeAll(where: { $0.key == meta.key })
+        }
+        if self.settingsPane == .provider(meta.key) {
+          self.settingsPane = .plugins
+        }
+        if self.popoverSelection == meta.key {
+          self.popoverSelection = "all"
+        }
+        if self.menuBarProvider == meta.key {
+          self.setMenuBarProvider("auto")
+        }
+        self.bannerIsError = false
+        self.statusBanner = "已移除外部插件：\(meta.name)"
+        self.fetchAppsStatusHttp(forceRefresh: true)
+        self.fetchUsageSummary(silent: true, forceRefresh: true)
+      }
+    }.resume()
+  }
+
+  func reloadExternalProviders() {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/reload") else { return }
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 15)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = Data("{}".utf8)
+    statusBanner = "正在重新扫描外部数据源插件…"
+    bannerIsError = false
+
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "重新扫描插件失败：\(err.localizedDescription)"
+          return
+        }
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+          self.bannerIsError = true
+          self.statusBanner = "重新扫描插件失败（后台服务未响应）"
+          return
+        }
+        struct ReloadRes: Decodable {
+          let ok: Bool?
+          let providersDir: String?
+          let providers: [ExternalProviderMeta]?
+        }
+        if let data = data, let parsed = try? JSONDecoder().decode(ReloadRes.self, from: data) {
+          if let dir = parsed.providersDir, !dir.isEmpty { self.providersDir = dir }
+          if let list = parsed.providers {
+            self.applyExternalProviders(list)
+          }
+          self.bannerIsError = false
+          self.statusBanner = "已重新扫描插件（共 \(self.externalProviders.count) 个）"
+        }
+        self.fetchAppsStatusHttp(forceRefresh: true)
+        self.fetchUsageSummary(silent: false, forceRefresh: true)
+      }
+    }.resume()
+  }
+
+  private func applyExternalProviders(_ list: [ExternalProviderMeta]) {
+    self.externalProviders = list
+    for p in list {
+      if let enabled = p.enabled {
+        self.toolToggles[p.key] = enabled
+      } else if self.toolToggles[p.key] == nil {
+        self.toolToggles[p.key] = true
+      }
+    }
+    if isExternalProvider(popoverSelection) && !list.contains(where: { $0.key == popoverSelection && isToolEnabled($0.key) }) {
+      popoverSelection = "all"
+    }
+  }
 
   var isActiveOverall: Bool {
     daemonOnline && masterEnabled
@@ -390,6 +733,12 @@ final class MeterViewModel: ObservableObject {
   }
 
   func toolAccentColor(for key: String) -> Color {
+    if let meta = externalProviderMeta(for: key), let c = CodexBarPalette.color(hex: meta.accentColor) {
+      return c
+    }
+    if let hex = usageData?.cards?[key]?.accentColor, let c = CodexBarPalette.color(hex: hex) {
+      return c
+    }
     switch key {
     case "antigravity": return Color(red: 0.15, green: 0.45, blue: 0.96)
     case "codex": return Color(red: 0.06, green: 0.72, blue: 0.50)
@@ -400,13 +749,15 @@ final class MeterViewModel: ObservableObject {
   }
 
   func toolShortTitle(for key: String) -> String {
+    if let meta = externalProviderMeta(for: key) { return meta.shortName }
+    if let short = usageData?.cards?[key]?.providerShortName, !short.isEmpty { return short }
     switch key {
     case "all": return "概览"
     case "antigravity": return "Antigravity"
     case "codex": return "Codex"
     case "cursor": return "Cursor"
     case "codebuddy": return "CodeBuddy"
-    default: return key
+    default: return key.hasPrefix("ext:") ? String(key.dropFirst(4)) : key
     }
   }
 
@@ -419,12 +770,14 @@ final class MeterViewModel: ObservableObject {
   }
 
   func displayTitle(for key: String) -> String {
+    if let meta = externalProviderMeta(for: key) { return meta.name }
+    if let name = usageData?.cards?[key]?.providerName, !name.isEmpty { return name }
     switch key {
     case "antigravity": return "Antigravity"
     case "codex": return "Codex Desktop"
     case "cursor": return "Cursor"
     case "codebuddy": return "CodeBuddy CN"
-    default: return key
+    default: return key.hasPrefix("ext:") ? String(key.dropFirst(4)) : key
     }
   }
 
@@ -591,6 +944,12 @@ final class MeterViewModel: ObservableObject {
           return
         }
         self.usageData = parsed
+        if let dir = parsed.providersDir, !dir.isEmpty {
+          self.providersDir = dir
+        }
+        if let extList = parsed.externalProviders {
+          self.applyExternalProviders(extList)
+        }
         self.lastSyncedAt = Date()
         self.lastUsageRefreshAt = Date()
         if self.usageToolFilter == "all" {
@@ -631,6 +990,12 @@ final class MeterViewModel: ObservableObject {
       }
     }
     self.apps = st.apps
+    if let dir = st.providersDir, !dir.isEmpty {
+      self.providersDir = dir
+    }
+    if let extList = st.externalProviders {
+      self.applyExternalProviders(extList)
+    }
     self.lastSyncedAt = Date()
     if let cfg = st.config {
       applyDaemonConfig(cfg)
