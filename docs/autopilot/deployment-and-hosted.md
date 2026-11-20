@@ -1,3 +1,5 @@
+> 当前状态覆盖下文历史诊断配置：本地发表checkpoint P的实际synthetic workflow为literal false且仅exit1，没有可达driver/metadata/vars路径。旧定义移入tests/fixtures/autopilot/diagnostic-workflow.inert.json，仅供离线漏洞回归；没有配置或批准D。当前可执行只读入口见docs/superpowers/runbooks/publication-preflight.md。
+
 # B：冷启动audit与临时Linux合成隔离预检（未部署）
 
 ## 已可审查代码，不是启用凭证

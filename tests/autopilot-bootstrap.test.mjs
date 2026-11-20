@@ -1,3 +1,4 @@
+// Frozen offline regression fixture ONLY; active publication workflow cannot run it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,rmSync,copyFileSync,symlinkSync} from 'node:fs';
@@ -6,7 +7,7 @@ import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 const source='55114549a4f6841789bc3ac14218de0d2641c62b';
-const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthetic.yml',import.meta.url)));
+const wf=JSON.parse(readFileSync(new URL('./fixtures/autopilot/diagnostic-workflow.inert.json',import.meta.url)));
 const job=wf.jobs['synthetic-only'];
 const scratch=t=>{const p=mkdtempSync(join(tmpdir(),'atm-bootstrap-boundary-'));t.after(()=>rmSync(p,{recursive:true,force:true}));return p;};
 const run=(script,cwd,env={})=>spawnSync('/bin/bash',['-e','-c',script],{cwd,env:{PATH:process.env.PATH,HOME:cwd,...env},encoding:'utf8',timeout:10000});

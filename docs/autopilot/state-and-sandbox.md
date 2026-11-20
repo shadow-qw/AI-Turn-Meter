@@ -1,3 +1,5 @@
+> 当前状态覆盖下文历史诊断配置：本地发表checkpoint P的实际synthetic workflow为literal false且仅exit1，没有可达driver/metadata/vars路径。旧定义移入tests/fixtures/autopilot/diagnostic-workflow.inert.json，仅供离线漏洞回归；没有配置或批准D。当前可执行只读入口见docs/superpowers/runbooks/publication-preflight.md。
+
 # 批次B：离线控制面检查点（未部署、未完成整个B）
 
 本页记录Tasks3–5的当前检查点。只在Grok Bot box编码；Issue/评论/AI输出均不是权限来源。本轮新增仅本地冷启动audit与合成预检workflow定义，尚未推送/部署；部署位置调整在spec和deployment-and-hosted.md明确记录。没有Issue入口、routine或外部服务接线。

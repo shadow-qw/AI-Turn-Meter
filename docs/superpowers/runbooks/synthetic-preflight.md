@@ -1,6 +1,8 @@
-# 固定合成诊断：写入前只读 preflight
+# 冻结的旧诊断预检：仅离线回归，不是当前操作入口
 
-这里只检查一次受审固定bootstrap，不是生产Issue入口或不可重放授权系统。
+**当前发表checkpoint P已将实际synthetic workflow固定硬停。以下旧门只作离线回归，不得执行此旧单阶段清单来配置vars/push，也不是未来D的批准。** 当前发表入口见publication-preflight.md；未来D须在P真实发表及新H/B/T后另建准确checkpoint/validator/hash/before，不能重跑P旧事件。
+
+这里只保留此前受审固定bootstrap的安全回归，不是生产Issue入口或不可重放授权系统。
 **本文没有设置vars/push命令，不授予外部操作权限。** 必须先成功结束只读阶段，再由有权操作者按单独批准进行写操作；不要把“可能失败的解析”和写操作放在同一Shell用换行串接。
 
 ## 1. 固定本次身份，先取完整快照

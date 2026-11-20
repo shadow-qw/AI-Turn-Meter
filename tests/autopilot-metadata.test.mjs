@@ -1,8 +1,9 @@
+// Frozen offline regression fixture ONLY; active publication workflow cannot run it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
-const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthetic.yml',import.meta.url)));
+const wf=JSON.parse(readFileSync(new URL('./fixtures/autopilot/diagnostic-workflow.inert.json',import.meta.url)));
 const job=wf.jobs['synthetic-only'],step=job.steps.find(x=>x.name?.startsWith('Record exact PR metadata'));
 const code=step.run.split("<<'NODE'\n")[1].split('\nNODE')[0];
 const token='ghs_'+'ABCD1234'.repeat(4)+'ABCD',head='a'.repeat(40),base='601e7775e5f9b5748f4426cfd0f741e337c2eeca';
