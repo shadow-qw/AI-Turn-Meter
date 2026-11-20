@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {argsFor,assertHost,assertInspect,IMAGE} from './contract.mjs';
+import {argsFor,assertHost,assertInspect,IMAGE,verifyThenStart} from './contract.mjs';
 const root='/tmp/atm-hosted-canary-Ab12cd';
 test('fixed image and offline unprivileged contract',()=>{
  const a=argsFor({root,mode:'baseline'});
@@ -39,4 +39,20 @@ test('inspect must reject shared namespaces, devices, capability or environment 
 });
 test('all trusted synthetic entrypoints use a start barrier before bounded fixtures',()=>{
  for(const mode of ['baseline','cpu','memory','pids','timeout']){const a=argsFor({root,mode});assert.ok(a.includes('/src/harness.mjs'));assert.equal(a.at(-2),mode);}
+});
+
+test('pre-start inspect rejects contradictory, unlimited, malformed and incomplete CPU families',()=>{
+ const bad=[{NanoCpus:250000000,CpuQuota:-1,CpuPeriod:100000},{NanoCpus:250000000,CpuQuota:'unlimited',CpuPeriod:100000},{NanoCpus:-1,CpuQuota:25000,CpuPeriod:100000},{NanoCpus:500000000.5,CpuQuota:25000,CpuPeriod:100000},{NanoCpus:0,CpuQuota:0,CpuPeriod:0},{NanoCpus:250000000,CpuQuota:0,CpuPeriod:100000},{NanoCpus:250000000,CpuQuota:25000,CpuPeriod:0}];
+ for(const field of ['NanoCpus','CpuQuota','CpuPeriod'])for(const value of [-1,.5,'0',null,true,Number.MAX_SAFE_INTEGER+1,NaN,Infinity,undefined])bad.push({...{NanoCpus:250000000,CpuQuota:25000,CpuPeriod:100000},[field]:value});
+ for(const cpu of bad){const i=strict();Object.assign(i.HostConfig,cpu);assert.throws(()=>assertInspect(i,root),JSON.stringify(cpu));}
+});
+test('official inspect zero defaults, nano-only, quota-only and consistent dual limits remain supported',()=>{
+ for(const cpu of [{NanoCpus:250000000},{NanoCpus:250000000,CpuQuota:0,CpuPeriod:0},{NanoCpus:0,CpuQuota:25000,CpuPeriod:100000},{NanoCpus:250000000,CpuQuota:25000,CpuPeriod:100000}]){const i=strict();Object.assign(i.HostConfig,cpu);assert.doesNotThrow(()=>assertInspect(i,root));}
+ const missing=strict();delete missing.HostConfig.NanoCpus;assert.throws(()=>assertInspect(missing,root));
+});
+
+test('actual adapter pre-start helper refuses invalid inspect before invoking start',()=>{
+ let starts=0;const bad=strict();Object.assign(bad.HostConfig,{CpuQuota:-1,CpuPeriod:100000});
+ assert.throws(()=>verifyThenStart(()=>bad,()=>starts++,root),/SANDBOX_UNAVAILABLE/);assert.equal(starts,0);
+ const calls=[];const good=strict();assert.equal(verifyThenStart(()=>{calls.push('inspect');return good;},()=>calls.push('start'),root),good);assert.deepEqual(calls,['inspect','start']);
 });

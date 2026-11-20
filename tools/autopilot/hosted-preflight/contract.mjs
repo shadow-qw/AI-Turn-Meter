@@ -25,9 +25,17 @@ export function assertInspect(i,root){
  const h=i.HostConfig;
  const reject=()=>{throw Error('SANDBOX_UNAVAILABLE: inspect contract mismatch');};
  if(!h)reject();
- const nano=h.NanoCpus,quota=h.CpuQuota,period=h.CpuPeriod;
- const nanoSet=Number.isSafeInteger(nano)&&nano>0,quotaSet=Number.isSafeInteger(quota)&&quota>0;
- if((nanoSet&&nano!==250000000)||(quotaSet&&(!Number.isSafeInteger(period)||period<1000||period>1000000||quota*4!==period))||(!nanoSet&&!quotaSet))reject();
+ // Podman/Docker inspect uses missing/0 for an unused family, never a
+ // negative, string, null, fractional or overflowed value. Do not let a
+ // valid family hide an explicitly unlimited/malformed other family.
+ for(const key of ['NanoCpus','CpuQuota','CpuPeriod']){
+  if(Object.hasOwn(h,key)&&(!Number.isSafeInteger(h[key])||h[key]<0))reject();
+ }
+ const nano=h.NanoCpus??0,quota=h.CpuQuota??0,period=h.CpuPeriod??0;
+ const nanoSet=nano!==0,quotaSet=quota!==0||period!==0;
+ if(nanoSet&&nano!==250000000)reject();
+ if(quotaSet&&(quota===0||period<1000||period>1000000||quota!==period/4))reject();
+ if(!nanoSet&&!quotaSet)reject();
  if(i.ImageName!==IMAGE||!Array.isArray(i.EffectiveCaps)||i.EffectiveCaps.length||!Array.isArray(i.BoundingCaps)||i.BoundingCaps.length)reject();
  if(h.PidMode!=='private'||h.IpcMode!=='private'||h.CgroupMode!=='private'||h.CapAdd?.length||h.Devices?.length)reject();
  const env=i.Config?.Env;
@@ -35,4 +43,12 @@ export function assertInspect(i,root){
  if(!h||i.Config?.User!=='65534:65534'||h.Privileged!==false||h.ReadonlyRootfs!==true||h.NetworkMode!=='none'||!h.CapDrop?.some(x=>x.toUpperCase()==='ALL')||!h.SecurityOpt?.includes('no-new-privileges')||h.SecurityOpt?.some(x=>x.includes('unconfined'))||h.Memory!==134217728||h.MemorySwap!==134217728||h.PidsLimit!==32)throw Error('SANDBOX_UNAVAILABLE: inspect contract mismatch');
  const mounts=i.Mounts;
  if(!Array.isArray(mounts)||mounts.length!==2||!mounts.some(m=>m.Source===`${root}/src`&&m.Destination==='/src'&&m.RW===false)||!mounts.some(m=>m.Source===`${root}/out`&&m.Destination==='/out'&&m.RW===true))throw Error('SANDBOX_UNAVAILABLE: mount mismatch');
+}
+
+// Internal adapter seam: inspect is verified before the start side effect.
+export function verifyThenStart(inspect,start,root){
+ const info=inspect();
+ assertInspect(info,root);
+ start();
+ return info;
 }

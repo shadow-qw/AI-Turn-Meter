@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {execFileSync} from 'node:child_process';
 import {probe} from './host-probe.mjs';
-import {argsFor,assertInspect,IMAGE} from './contract.mjs';
+import {argsFor,verifyThenStart,IMAGE} from './contract.mjs';
 if(process.argv.length!==2||process.env.GITHUB_ACTIONS!=='true'||process.env.RUNNER_ENVIRONMENT!=='github-hosted')throw Error('SANDBOX_UNAVAILABLE: hosted synthetic-only entrypoint');
 const root=mkdtempSync('/tmp/atm-hosted-canary-');
 for(const d of ['src','out','home','storage','runroot','empty-hooks','host-only'])mkdirSync(join(root,d),{mode:d==='out'?0o777:0o700});
@@ -35,8 +35,9 @@ for(const mode of modes){
  pod(createArgs);
  try {
   const inspect=()=>JSON.parse(pod(['inspect',name]))[0];
-  assertInspect(inspect(),root);
-  pod(['start',name]);
+  const preStart=inspect();
+  console.log(JSON.stringify({mode,preStartCpu:{NanoCpus:preStart.HostConfig?.NanoCpus,CpuQuota:preStart.HostConfig?.CpuQuota,CpuPeriod:preStart.HostConfig?.CpuPeriod}}));
+  verifyThenStart(()=>preStart,()=>pod(['start',name]),root);
   const initial=inspect();const pid=initial.State.Pid;
   // Track the unique container's cgroup; validate later that it has no residual processes.
   let cg=null;

@@ -2,7 +2,7 @@
 
 固定仓库shadow-qw/AI-Turn-Meter，repository id `1461122513`。
 
-本轮15文件bundle fingerprint（SHA256，非审批）：`a943d9e8cc17fe495edf92ccff24691ec8cbcc88a5999f16217c4d07559dad06`。批准revision仍为**无**；enabled/autoMerge/publish全部false。
+本轮15文件bundle fingerprint（SHA256，非审批）：`6739527eec425a786cae9b0d67737dfe8f95d060ea4ad1eb4d627656357f2fef`。批准revision仍为**无**；enabled/autoMerge/publish全部false。
 
 | 固定源码 | SHA256 |
 |---|---|
@@ -12,9 +12,9 @@
 | tools/autopilot/state.mjs | `f43af58dcc3851bc712291cf857823bd9e1d9fe53a675cb93878573cf54de919` |
 | tools/autopilot/sandbox.mjs | `ac26f575ef3e6ca7825a8d4ea835027792e8afe70fae2ac67cd08a1c6bcaa830` |
 | tools/autopilot/deployment_guard.py | `f7f2534dc625efa685ccc53e2e869588bc1f3584e5ff3ffe53d514f4c0758740` |
-| tools/autopilot/hosted-preflight/contract.mjs | `b433d1c9d54bdf4bb63fe24876fd81dd72eb6a2f3ba31958f8ee9e1868b53480` |
+| tools/autopilot/hosted-preflight/contract.mjs | `ac65bd7acde1c1471a97ac1ac6c9c4138dcfff742b77a456aa57b589bb836433` |
 | tools/autopilot/hosted-preflight/host-probe.mjs | `214d04b23dbe92350f1e82abf4e18893522002fe374c5915c90fc842ba2d8a02` |
-| tools/autopilot/hosted-preflight/run-synthetic.mjs | `a1245a998b12a3f31b8ab0ec212e0ba56da800caa48afbf568cd288e8be88ee1` |
+| tools/autopilot/hosted-preflight/run-synthetic.mjs | `4a7619da39860dfb5c6f3df5bf5eca6db8c91d74e2e0d90fc843b079acf8ee75` |
 | tools/autopilot/hosted-preflight/harness.mjs | `df13509af0f39e5f2f4440a9e4a225c3450f04f5676b44cb27d34c747fd2c403` |
 | tools/autopilot/hosted-preflight/fixtures/baseline.mjs | `0f8480dbe21cfa51c0acc7c9e213a74fb0471fc73571d9806baff8e102ea8873` |
 | tools/autopilot/hosted-preflight/fixtures/cpu.mjs | `c2be86a353ddc000537b7000da19b2eea1009c187074d4f97226aa66a779ec2e` |
