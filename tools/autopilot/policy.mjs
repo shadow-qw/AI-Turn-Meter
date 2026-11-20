@@ -4,7 +4,7 @@ const bytes=readFileSync(new URL('./policy.json',import.meta.url));
 function freeze(x) { Object.values(x).forEach(v=>{if(v&&typeof v==='object')freeze(v);});return Object.freeze(x); }
 export const policy=freeze(JSON.parse(bytes));
 // Fingerprint, NOT approval: deployment must independently pin this bundle.
-const trustedFiles=['contracts.mjs','policy.mjs','policy.json','state.mjs','sandbox.mjs'];
+const trustedFiles=['contracts.mjs','policy.mjs','policy.json','state.mjs','sandbox.mjs','deployment_guard.py','hosted-preflight/contract.mjs','hosted-preflight/host-probe.mjs','hosted-preflight/run-synthetic.mjs','hosted-preflight/harness.mjs','hosted-preflight/fixtures/baseline.mjs','hosted-preflight/fixtures/cpu.mjs','hosted-preflight/fixtures/pids.mjs','hosted-preflight/fixtures/memory.mjs','hosted-preflight/fixtures/timeout.mjs'];
 export const policyRevision=createHash('sha256').update(JSON.stringify(trustedFiles.map(name=>[name,createHash('sha256').update(readFileSync(new URL(name,import.meta.url))).digest('hex')]))).digest('hex');
 const prefixes=['.git/','.github/','scripts/','packaging/','tools/','docs/autopilot/','docs/superpowers/','packages/desktop-macos/','packages/daemon/bin/','packages/vscode-extension/'];
 const protectedFiles=['package.json','package-lock.json','npm-shrinkwrap.json','AGENTS.md','CLAUDE.md','.npmrc','.gitmodules','.gitignore','.gitattributes','.nvmrc','.node-version','yarn.lock','pnpm-lock.yaml','bun.lock','bun.lockb','Makefile','Dockerfile'];

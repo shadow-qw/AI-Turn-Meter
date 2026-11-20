@@ -1,0 +1,55 @@
+{
+  "name": "Autopilot synthetic isolation preflight (not candidate acceptance)",
+  "on": {
+    "pull_request": {
+      "paths": [
+        "tools/autopilot/**",
+        "tests/autopilot-*.test.mjs",
+        ".github/workflows/autopilot-synthetic.yml"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "synthetic-${{ github.event.pull_request.number }}",
+    "cancel-in-progress": true
+  },
+  "jobs": {
+    "synthetic-only": {
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 10,
+      "steps": [
+        {
+          "uses": "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "24"
+          }
+        },
+        {
+          "name": "Exact source and image provenance",
+          "env": {
+            "SOURCE_SHA": "${{ github.sha }}"
+          },
+          "run": "test \"$(git rev-parse HEAD)\" = \"$SOURCE_SHA\"\nuname -sm\nprintf 'ImageVersion=%s\\n' \"$ImageVersion\"\nnode --version\n/usr/bin/podman --version\n"
+        },
+        {
+          "name": "Offline component tests",
+          "run": "scratch=$(mktemp -d)\nenv -i PATH=\"$PATH\" HOME=\"$scratch\" TMPDIR=\"$scratch\" npm test\n"
+        },
+        {
+          "name": "Fixed synthetic rootless canaries only",
+          "run": "scratch=$(mktemp -d)\nenv -i PATH=\"$PATH\" HOME=\"$scratch\" GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted node tools/autopilot/hosted-preflight/run-synthetic.mjs\n"
+        }
+      ]
+    }
+  }
+}

@@ -71,7 +71,7 @@ webhook 的认证说明“来自持有发送密钥的一端”，不代表 Issue
 
 Grok Bot 可信协调器决定队列/权限/merge/release；独立审查会话只读审核候选，不采信编码会话自评。AI 仍可能犯错，所以安全规则、检查来源和写入 gate 必须确定性实现，不能只靠提示词。
 
-候选构建/测试视为执行不可信代码：box 使用受限无特权容器或等价隔离执行环境，空 HOME、临时数据库/端口、无宿主目录/浏览器/SSH/凭据/状态目录/套接字挂载，无 Git 凭据、网络默认关闭、资源限制。源码通过无凭据只读快照送入。若无法建立这种隔离，不能自动运行 Issue 导出的代码；转人工。不能在存有其他 agent 登录的共享 box 宿主直接跑候选 npm 脚本。
+候选构建/测试视为执行不可信代码：候选 Linux 执行可使用合法临时 GitHub Linux runner 上的受限 rootless 容器；AI 编码与可信协调仍在 Grok Bot box。box 仅在同样隔离合同真实验收后才可作为候选执行位置，不能用当前缺 cgroup 委派的共享宿主替代。执行环境必须提供，空 HOME、临时数据库/端口、无宿主目录/浏览器/SSH/凭据/状态目录/套接字挂载，无 Git 凭据、网络默认关闭、资源限制。源码通过无凭据只读快照送入。若无法建立这种隔离，不能自动运行 Issue 导出的代码；转人工。不能在存有其他 agent 登录的共享 box 宿主直接跑候选 npm 脚本。
 
 macOS 验证用合法授权的临时 macOS runner；不使用用户电脑、不把 Linux 假装成 Mac、不在含私人 Keychain/真实账号的常驻 Mac 上跑候选。无发布 secrets 的构建 job 使用最小只读 token并关闭 checkout 凭据持久化。验证不自动登录四个客户端。
 
@@ -167,3 +167,10 @@ RC 构建 tarball 会更改临时 Formula；校验 staging 后不提交、不推
 - [GitHub Actions 事件：issues](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issues)：issues workflow 须在默认分支；activity types 可明确选择。
 - [GitHub Release REST API](https://docs.github.com/en/rest/releases/releases#create-a-release)：`target_commitish`、`prerelease`、`make_latest`；使用前应以实际 API schema 为准。
 - Grok Bot routines 技能（本次读取）：原生 GitHub 支持 issue-assigned 而不支持 issue-opened/labeled；webhook 的 URL/sender key 由用户在 routine 面板取得；定时触发最短 5 分钟。本设计未创建任何 routine。
+
+
+### B 检查点部署调整（未启用）
+
+2026-11-20：准备临时ubuntu-24.04上的固定合成预检，未提交远程/未跑CI，非真实Issue验证。仍须全部无凭据/离线/非root/资源及取消合同；不购买runner、不引入AI API、不扩大token权限。新增外置root所有的批准文件/只读安装树作为启动信任根的候选具体化，需要部署引导审阅后配置；本轮未写/etc、未安装unit或修改宿主权限。
+
+旧库仅可在旧进程关闭后的离线组件测试中迁移。新冷启动audit要求固定systemd控制器与jobs slice均masked/inactive/无cgroup任务、私有状态目录内核独占锁及外置准确字节批准。现阶段不支持收养unmanaged/v1库、遗留WAL/SHM、active lease或任何可能代表远程工作的intent；没有自动升级、备份回退或实际controller启动器。不能据此声称F1生产升级已完成；未来必须由持锁supervisor贯穿controller及本地jobs生命周期，并由真实远程adapter确认所有远程jobs已停，才可恢复工作。

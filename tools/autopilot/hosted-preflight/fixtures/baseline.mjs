@@ -1,0 +1,21 @@
+// Give host inspector time to record container PID/cgroup; no work before this delay.
+await new Promise(r=>setTimeout(r,500));
+import assert from 'node:assert/strict';
+import {readFileSync,writeFileSync,existsSync,mkdirSync,readdirSync} from 'node:fs';
+import net from 'node:net';
+assert.equal(process.getuid(),65534);
+assert.match(process.argv[2],/^\/tmp\/atm-hosted-canary-[A-Za-z0-9]+\/host-only\/fake-secret$/);
+assert.throws(()=>readFileSync(process.argv[2]),/ENOENT|EACCES/);
+const s=readFileSync('/proc/self/status','utf8');
+assert.match(s,/^CapEff:\s+0+$/m); assert.match(s,/^NoNewPrivs:\s+1$/m); assert.match(s,/^Seccomp:\s+2$/m);
+assert.equal(process.env.HOME,'/tmp/home'); mkdirSync('/tmp/home'); assert.deepEqual(readdirSync('/tmp/home'),[]);
+assert.ok(!Object.keys(process.env).some(x=>/TOKEN|SECRET|PASSWORD|GH_|GITHUB_|SSH_AUTH_SOCK|GIT_CONFIG/.test(x)));
+for(const p of ['/home/box','/home/runner','/cursor/stores','/github','/var/run/docker.sock','/run/podman/podman.sock','/host-only/fake-secret']) assert.equal(existsSync(p),false,p);
+assert.throws(()=>writeFileSync('/src/write-probe','x'),/EROFS|EACCES/);
+assert.throws(()=>writeFileSync('/root-write-probe','x'),/EROFS|EACCES/);
+assert.equal(readFileSync('/sys/fs/cgroup/memory.max','utf8').trim(),'134217728');
+assert.equal(readFileSync('/sys/fs/cgroup/memory.swap.max','utf8').trim(),'0');
+assert.equal(readFileSync('/sys/fs/cgroup/pids.max','utf8').trim(),'32');
+const [q,p]=readFileSync('/sys/fs/cgroup/cpu.max','utf8').trim().split(/\s+/).map(Number);assert.equal(q/p,0.25);
+const r=await new Promise(resolve=>{const s=net.createConnection({host:'1.1.1.1',port:443});const t=setTimeout(()=>{s.destroy();resolve('timeout');},1000);s.on('connect',()=>{clearTimeout(t);s.destroy();resolve('connected');});s.on('error',()=>{clearTimeout(t);resolve('blocked');});});assert.notEqual(r,'connected');
+writeFileSync('/out/baseline.json',JSON.stringify({synthetic:true,node:process.version,network:r,baseline:true}));

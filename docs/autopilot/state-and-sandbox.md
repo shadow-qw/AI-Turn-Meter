@@ -1,6 +1,6 @@
 # 批次B：离线控制面检查点（未部署、未完成整个B）
 
-本页记录对已批准计划Tasks3–5的当前实现，不修改历史spec/plan。只在Grok Bot box编码；Issue/评论/AI输出均不是权限来源。未新增入口、CLI、workflow、routine或外部服务。
+本页记录Tasks3–5的当前检查点。只在Grok Bot box编码；Issue/评论/AI输出均不是权限来源。本轮新增仅本地冷启动audit与合成预检workflow定义，尚未推送/部署；部署位置调整在spec和deployment-and-hosted.md明确记录。没有Issue入口、routine或外部服务接线。
 
 ## 接口与权限边界
 
@@ -27,7 +27,7 @@ SQLite使用WAL、synchronous=FULL、busy_timeout、内部DB schema v2（v1保�
 
 `inspectSandbox`无条件SANDBOX_UNAVAILABLE，`runSandbox`也无条件拒绝，不能用输入flag、注入spawn或伪造inspect/canary JSON解锁。没有运行/拉取容器、安装运行时、改cgroup/rootful fallback、执行真实Issue代码，亦没有修改现有发布硬停止。
 
-本次已阅读box外hosted-plan及其probe/driver/contract原型。临时GitHub Ubuntu rootless VM仅是**待审部署候选**；未选择/部署，不静默把原spec第74行“box沙箱”改成其他平台。若后续采纳，须独立记录/审阅部署位置差异：AI编码/可信协调仍在box，只把无凭据候选Linux运行迁至临时VM，隔离合同不降低。
+本轮已把hosted原型集成为仅固定合成fixture的真实rootless预检适配器，另有外置批准/独占冷audit组件。详见[部署与预检合同](deployment-and-hosted.md)。AI/协调仍box；临时GitHub Linux runner是明确记录的候选执行位置调整，不是把本box说成可用。生产候选入口仍硬拒绝，新的合成适配器尚未实跑容器/CI。
 
 ### Task5尚缺的具体门
 
@@ -37,7 +37,7 @@ SQLite使用WAL、synchronous=FULL、busy_timeout、内部DB schema v2（v1保�
 4. 可信H/B/T源码快照制作：无.git/认证文件/符号链接/子模块/敏感宿主挂载，TOCTOU防护、输出磁盘/日志/产物大小上限与摘要归属。argv路径格式验证不是上述证明。
 5. 临时VM上真实有界baseline、网络/只读/伪凭据不可读、CPU节流、memory OOM、pids限制、超时子孙清理canary，保存cgroup实际值和残余进程证据；不得在共享box或真实secret旁执行。
 6. 取消/失联/VM终止的可信证明与reconcile绑定；单个finally或模拟spawn不是所有故障已清理。
-7. 经独立审查才实现可运行adapter，保留未验fail-closed；再与Task8/D的可信workflow及精确SHA证据接线。
+7. 合成adapter代码已备本地审查；真实hosted实跑、生产adapter/完整快照及配额、Task8/D的可信workflow与精确SHA证据接线仍缺。
 
 本检查点仅接受离线单元/真实SQLite并发测试，不宣称容器或整个B完成。没有push、合并、tag、发布、监听或自动化启用。
 
@@ -65,3 +65,6 @@ DB v1升级v2只增加hold_reason/hold_generation/blocked_reason，从历史人�
 | pause/resume | 可信管理员、有界理由/审计；不清issue hold/耗费，不授权运行 |
 
 时间正好耗尽不允许进入下一版working，剩余1ms可进入；已开始验证的结果推进和安全终止/结算仍可完成。这里没有把状态迁移或账本intent说成实际runner启动，真实时间测量/runner gate仍属未接线部分。内部数据库v2与对外JSON schemaVersion=1不是同一版本空间。
+
+
+当前15文件可信闭包包含新guard与合成harness，trust-manifest重算。F1生产升级尚未关闭：原库迁移测试不是在线旧controller停止证明。新audit拒绝未登记/v1/sidecar/active/任何remote intent，且无真实启动/升级或stop-adapter接线；不能用其可用性推出整个B完成。

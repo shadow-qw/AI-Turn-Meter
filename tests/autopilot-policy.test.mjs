@@ -43,7 +43,7 @@ test('contracts reject sparse acceptance arrays',()=>{
 });
 
 test('policy revision binds controller code as well as JSON, not an approval',()=>{
- const entries=['contracts.mjs','policy.mjs','policy.json','state.mjs','sandbox.mjs'].map(name=>[name,createHash('sha256').update(readFileSync(new URL('../tools/autopilot/'+name,import.meta.url))).digest('hex')]);
+ const entries=['contracts.mjs','policy.mjs','policy.json','state.mjs','sandbox.mjs','deployment_guard.py','hosted-preflight/contract.mjs','hosted-preflight/host-probe.mjs','hosted-preflight/run-synthetic.mjs','hosted-preflight/harness.mjs','hosted-preflight/fixtures/baseline.mjs','hosted-preflight/fixtures/cpu.mjs','hosted-preflight/fixtures/pids.mjs','hosted-preflight/fixtures/memory.mjs','hosted-preflight/fixtures/timeout.mjs'].map(name=>[name,createHash('sha256').update(readFileSync(new URL('../tools/autopilot/'+name,import.meta.url))).digest('hex')]);
  assert.equal(policyRevision,createHash('sha256').update(JSON.stringify(entries)).digest('hex'));
  assert.equal(policy.enabled,false);
 });
