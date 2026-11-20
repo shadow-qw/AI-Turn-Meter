@@ -174,3 +174,6 @@ RC 构建 tarball 会更改临时 Formula；校验 staging 后不提交、不推
 2026-11-20：准备临时ubuntu-24.04上的固定合成预检，未提交远程/未跑CI，非真实Issue验证。仍须全部无凭据/离线/非root/资源及取消合同；不购买runner、不引入AI API、不扩大token权限。新增外置root所有的批准文件/只读安装树作为启动信任根的候选具体化，需要部署引导审阅后配置；本轮未写/etc、未安装unit或修改宿主权限。
 
 旧库仅可在旧进程关闭后的离线组件测试中迁移。新冷启动audit要求固定systemd控制器与jobs slice均masked/inactive/无cgroup任务、私有状态目录内核独占锁及外置准确字节批准。现阶段不支持收养unmanaged/v1库、遗留WAL/SHM、active lease或任何可能代表远程工作的intent；没有自动升级、备份回退或实际controller启动器。不能据此声称F1生产升级已完成；未来必须由持锁supervisor贯穿controller及本地jobs生命周期，并由真实远程adapter确认所有远程jobs已停，才可恢复工作。
+
+
+2026-11-20 B修复：Linux合成采证收窄为外置准确批准workflow SHA与独立driver源SHA的一次性维护分支push诊断，不是常驻PR门。不得在宿主执行待审PR package/test/driver后自证隔离；未来候选来源链仍由Task8实现。两个外置非secret批准值未设置，本轮不push/运行/启用。

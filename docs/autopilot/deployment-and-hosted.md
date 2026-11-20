@@ -24,11 +24,16 @@ inspect在start之前核验镜像、65534用户、空capabilities、NNP、只读
 
 五项：baseline伪secret/只读/空HOME/网络/内核NNP-seccomp/cgroup精确值；有界CPU节流；最多12个有限寿命子进程验证pids；最多192MiB分配验证128MiB cgroup OOM；超时子进程late-write及cgroup空。额度128MiB/32pids/0.25CPU仅合成预检，不偷换生产2GiB/128pids/2CPU。输出写入仅可信fixture固定小文件；此bind输出方式**没有生产磁盘配额**，绝不能接候选。未实现完整mountinfo/fd/namespace审计、生产资源、真实取消/失联/VM销毁证明或H/B/T无.git快照传输。
 
-`.github/workflows/autopilot-synthetic.yml`仅pull_request路径过滤，临时ubuntu-24.04、10min、contents:read、固定action SHA、准确github.sha、checkout不持久化凭据、无secret/写权限/dispatch/安装/发布。可以在独立审查后普通分支push获得一次真实证据；当前没有push或run。它不是候选required check，不颁发生产sandbox证书。现有Mac CI与发布硬失败原样保留。
+`.github/workflows/autopilot-synthetic.yml`现在仅是固定维护分支的一次性push诊断，**不响应PR/Issue，不是常驻候选门**。外置仓库variables `ATM_SYNTHETIC_APPROVED_SOURCE_SHA`须等于受审源87d3d39d40e63f18752443a6aee10e6797e75adb，`ATM_SYNTHETIC_APPROVED_WORKFLOW_SHA`须由独立复审后固定为包含本定义的准确最终commit；默认未配置、不启动job。首次push before必须为1ff4ef7f3a2bc1064fc72f8e62fa2826bc2d72ba，仓库ID/维护分支/actor/event after/github.sha/github.workflow_sha严格一致，强推/删除/未知值拒绝。这是人工bootstrap身份限制，不改变未来全作者Issue接入。
+
+checkout只取独立批准的源87d3d39到trusted-bootstrap，绝不checkout待审PR/github.sha；九个实际执行器/harness/fixture的固定SHA256在inline builtin校验后才允许运行。没有npm/package scripts或PR测试宿主执行。checkout/setup-node固定SHA、contents:read、不持久化凭据。job条件在动作前检查外置批准，inline事件门在checkout前再检查。公开只读API核对PR2当前head/base/merge及tree元数据，不下载或执行它们；head不是准确workflow批准值、base变化、merge未知或API失败则停止。driver source与workflow/PR SHA分别记录，不能将driver结果说成验证了PR合并树。
+
+本临时机制不是对有仓库写权限者任意改写/新增workflow的生产防线；未来可信默认workflow/规则隔离仍属Task8/9。下一次只可在独立复审和两个外置准确批准值设置后，普通push最终head获取固定bootstrap的有限诊断；不可单独push中间87d3d39（它仍含旧PR workflow），不可接任意候选。真实原始inspect全字段、完整cgroup统计/递归清理/VM销毁证据仍缺，不给完整安全证书。现有Mac CI及发布硬禁用不变。
+
 
 ## 启动前外部步骤（本轮不执行）
 
-1. 独立审查准确commit/15文件闭包及新workflow，父助手普通分支push采集synthetic结果。若host缺委派，不调整共享box，不自动sudo；保留失败日志，再审一次性VM引导是否需授权。
+1. 独立审查准确commit/15文件闭包及新workflow，父助手先按准确最终head与87d3d39设置两个外置批准值（本轮不设置），再普通分支push最终head采集有限synthetic诊断。若host缺委派，不调整共享box，不自动sudo；保留失败日志，再审一次性VM引导是否需授权。
 2. 外部可信操作者审阅root所有批准路径/只读安装树与专用管理身份的具体部署差异；现在无批准、无安装、无unit。
 3. 先补齐持锁supervisor、可信enrollment、真正旧进程/远程jobs停止证明及离线备份/回退，再审冷升级；v1历史数据不能通过写一个JSON标记强行接入。
 4. 真实hosted五canary及原始inspect/controller值、镜像/Node/runner版本、exact SHA证据通过后，才实施生产adapter与快照/输出配额。`sandbox.mjs`现有候选入口仍SANDBOX_UNAVAILABLE；不是本轮合成运行器的别名。
@@ -36,3 +41,8 @@ inspect在start之前核验镜像、65534用户、空capabilities、NNP、只读
 未遗忘：Task4实际AI/build幂等计时与snapshot失效后的历史结算；Task5/8执行中30min强停与2h runner等待；Task8/9远程副作用查询/重放和终止证明；Task10可信发布链。全部仍在ledger，不进入C。
 
 新workflow用JSON子集序列化（合法YAML），便于在无PyYAML/actionlint、且不安装依赖的环境用标准库精确解析；已验证结构不等于GitHub服务端语义或真实CI通过。
+
+
+CPU修复：NanoCpus/CpuQuota/CpuPeriod每个已出现字段必须非负安全整数；缺省/0仅是未设置family。quota与period必须成对形成0.25；负数（包括-1无限制）、string/null/小数/溢出/不完整pair均拒绝。保留Nano-only、quota-only、双表示一致。真实Podman兼容仍待固定bootstrap实跑，合成完整inspect对象不冒充真实运行样本。
+
+外置批准缺失/不符导致job skipped时，不能把绿色/跳过的check UI视为canary通过。需要实际执行日志与明确结果；没有任何生产gate消费本诊断check。
