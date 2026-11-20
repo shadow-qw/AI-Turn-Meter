@@ -5,7 +5,7 @@ import {spawnSync} from 'node:child_process';
 const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthetic.yml',import.meta.url)));
 const job=wf.jobs['synthetic-only'],step=job.steps.find(x=>x.name?.startsWith('Record exact PR metadata'));
 const code=step.run.split("<<'NODE'\n")[1].split('\nNODE')[0];
-const token='INERT_METADATA_CANARY_DO_NOT_LOG',head='a'.repeat(40),base='759f3ea525b64281060b14ed43c6f35ae15705c8';
+const token='ghs_'+'ABCD1234'.repeat(4)+'ABCD',head='a'.repeat(40),base='759f3ea525b64281060b14ed43c6f35ae15705c8';
 function probe(scenario,patch={}) {
  const prelude=`
  const scenario=${JSON.stringify(scenario)},patch=${JSON.stringify(patch)};
@@ -25,7 +25,7 @@ function probe(scenario,patch={}) {
   if(typeof scenario==='number')return new Response(JSON.stringify({message:patch.large?'x'.repeat(300000):patch.message??'unrecognized '+process.env.ATM_METADATA_TOKEN}),{status:scenario,headers:{'x-github-request-id':'ABC:123','x-ratelimit-limit':'60','x-ratelimit-remaining':'0','x-ratelimit-reset':'123456','x-ratelimit-resource':'core','x-ratelimit-used':'60','authorization':process.env.ATM_METADATA_TOKEN,'x-ratelimit-evil':process.env.ATM_METADATA_TOKEN,...patch.headers}});
   let value;
   if(calls===1)value={state:'open',head:{sha:'${head}',repo:{id:1461122513}},base:{sha:'${base}',repo:{id:1461122513}},merge_commit_sha:'b'.repeat(40),...patch};
-  else value={sha:url.split('/').at(-1),tree:{sha:'c'.repeat(40)},parents:patch.badParents?[{sha:'d'.repeat(40)},{sha:'${head}'}]:[{sha:'${base}'},{sha:'${head}'}]};
+  else value={sha:url.split('/').at(-1),tree:{sha:patch.treeParts?patch.treeParts[calls-2]:'c'.repeat(40)},parents:patch.badParents?[{sha:'d'.repeat(40)},{sha:'${head}'}]:[{sha:'${base}'},{sha:'${head}'}]};
   return new Response(JSON.stringify(value));
  };
  `;
@@ -41,11 +41,11 @@ test('actual builtin metadata uses step-only readonly token and preserves normal
 });
 for(const status of [403,429,500,503])test(`HTTP${status}: bounded allowlisted diagnostics, no pass/no secret`,()=>{
  const r=probe(status);assert.notEqual(r.status,0);assert.equal(r.signal,null);
- assert.match(r.stderr,new RegExp(`"status":${status}`));assert.match(r.stderr,/"x-github-request-id":"ABC:123"/);assert.match(r.stderr,/"x-ratelimit-remaining":"0"/);
+ assert.match(r.stderr,new RegExp(`"status":${status}`));assert.match(r.stderr,/"classification":"[a-z-]+"/);assert.doesNotMatch(r.stderr,/x-github-|x-ratelimit-|ABC:123/);
  assert.doesNotMatch(r.stderr+r.stdout,new RegExp(token+'|x-ratelimit-evil|Bearer|publicMetadataOnly'));
 });
-test('known rate-limit message is normalized, unknown text never echoed',()=>{
- const r=probe(403,{message:'API rate limit exceeded for 10.0.0.1 '+token});assert.match(r.stderr,/API rate limit exceeded/);assert.doesNotMatch(r.stderr,/10\.0\.0\.1|INERT_METADATA/);
+test('untrusted error text cannot classify 403 as rate limit or be echoed',()=>{
+ const r=probe(403,{message:'API rate limit exceeded for 10.0.0.1 '+token});assert.match(r.stderr,/forbidden-status/);assert.doesNotMatch(r.stderr,/API rate limit exceeded/);assert.doesNotMatch(r.stderr,new RegExp('10\\.0\\.0\\.1|'+token));
 });
 for(const scenario of ['redirect','transport','timeout','body-timeout','oversize','bad-json'])test(`${scenario} fails closed without printing raw error/body/token`,()=>{
  const r=probe(scenario);assert.notEqual(r.status,0);assert.equal(r.signal,null,'bounded completion');assert.match(r.stderr,/METADATA_REJECTED/);assert.doesNotMatch(r.stderr+r.stdout,new RegExp(token+'|publicMetadataOnly|untrusted.invalid'));
@@ -65,4 +65,26 @@ test('actual driver shell env-i boundary strips metadata token before inert chil
  const shell=job.steps.at(-1).run.replace('node tools/autopilot/hosted-preflight/run-synthetic.mjs',`node -e 'if(process.env.ATM_METADATA_TOKEN||process.env.GITHUB_TOKEN)process.exit(3);console.log("INERT_ENV_EMPTY")'`)+ '\nrmdir "$scratch"\n';
  const r=spawnSync('/bin/bash',['-e','-c',shell],{env:{PATH:process.env.PATH,ATM_METADATA_TOKEN:token,GITHUB_TOKEN:token},encoding:'utf8',timeout:1500});
  assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/INERT_ENV_EMPTY/);assert.doesNotMatch(r.stdout+r.stderr,new RegExp(token));
+});
+
+// Response diagnostics must have a finite output alphabet independent of arbitrary
+// response text. Do not grow an encoding blacklist: compare entire error outputs.
+test('MI1: all response string encodings/fragments leave identical status-only diagnostics',()=>{
+ const hex=Buffer.from(token).toString('hex');
+ const variants=[token,token.toLowerCase(),token.toUpperCase(),hex,hex.toUpperCase(),hex.match(/.{1,8}/g).join(':'),Buffer.from(token).toString('base64'),[...token].map(x=>'%'+x.charCodeAt(0).toString(16)).join(''),...hex.match(/.{1,20}/g),...token.match(/.{1,10}/g),'12345678901234567890','core','ABC:123'];
+ let baseline;
+ for(const text of variants){
+  const r=probe(403,{headers:{'x-github-request-id':text,'x-ratelimit-limit':text,'x-ratelimit-remaining':text,'x-ratelimit-reset':text,'x-ratelimit-used':text,'x-ratelimit-resource':text,'location':text},message:text});
+  assert.equal(r.status,1);assert.equal(r.signal,null);assert.equal(r.stdout,'');
+  const lines=r.stderr.trim().split('\n');
+  assert.equal(lines.length,2);assert.deepEqual(JSON.parse(lines[0].replace(/^METADATA_HTTP /,'')),{status:403,classification:'forbidden-status'});
+  assert.equal(lines[1],'METADATA_REJECTED http-status');
+  baseline??=r.stderr;assert.equal(r.stderr,baseline,'response-controlled text must not alter output');
+ }
+});
+test('adjacent success path validates tree hashes without echoing arbitrary hex response strings',()=>{
+ const hex=Buffer.from(token).toString('hex'),r=probe('success',{treeParts:[hex.slice(0,40),hex.slice(40)]});
+ assert.equal(r.status,0,r.stderr);assert.doesNotMatch(r.stdout+r.stderr,new RegExp(hex.slice(0,40)+'|'+hex.slice(40),'i'));
+ assert.doesNotMatch(r.stdout,/"(?:merge|headTree|mergeTree)":/);
+ assert.match(r.stdout,/"mergeValidated":true/);
 });
