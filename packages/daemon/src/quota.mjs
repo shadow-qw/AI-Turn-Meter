@@ -1405,11 +1405,9 @@ export function fetchCodeBuddyQuota() {
       let planTitle = null;
       try {
         const copilot = JSON.parse(getVal('Tencent-Cloud.coding-copilot') || 'null');
-        const flag = copilot?.cloud_product_config_cache?.[0]?.data?._configFlag || '';
-        if (flag.includes('众测') && flag.includes('IOA')) {
-          planTitle = 'iOA 众测';
-        } else if (flag.includes('IOA')) {
-          planTitle = '企业 iOA';
+        const flag = String(copilot?.cloud_product_config_cache?.[0]?.data?._configFlag || '');
+        if (flag.includes('众测') && (copilot?.enterpriseId || flag.length > 0)) {
+          planTitle = 'Enterprise Beta';
         } else if (copilot?.enterpriseId) {
           planTitle = 'Enterprise';
         }

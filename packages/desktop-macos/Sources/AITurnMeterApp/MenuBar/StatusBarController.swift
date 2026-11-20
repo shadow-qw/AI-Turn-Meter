@@ -138,9 +138,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       }
       candidateKeys = [vm.menuBarProvider]
     } else if vm.popoverSelection != "all", vm.isToolEnabled(vm.popoverSelection) {
-      candidateKeys = [vm.popoverSelection] + ["codex", "cursor", "antigravity", "codebuddy"].filter { $0 != vm.popoverSelection }
+      candidateKeys = [vm.popoverSelection] + vm.allQuotaProviderKeys.filter { $0 != vm.popoverSelection }
     } else {
-      candidateKeys = ["codex", "cursor", "antigravity", "codebuddy"]
+      candidateKeys = vm.allQuotaProviderKeys
     }
     for key in candidateKeys {
       guard vm.isToolEnabled(key) else { continue }
@@ -203,18 +203,23 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     key == "antigravity" ? "AGY" : vm.toolShortTitle(for: key)
   }
 
-  private func scopedTodayMetrics() -> (tokens: Int, costUsd: Double?)? {
+  private func scopedTodayMetrics() -> (tokens: Int, cost: Double?, symbol: String, isBillingOnly: Bool)? {
     if vm.menuBarUsageScope == .provider && vm.menuBarProvider != "auto" {
       guard vm.isToolEnabled(vm.menuBarProvider),
-            let today = vm.usageData?.cards?[vm.menuBarProvider]?.today else { return nil }
-      return (today.totalTokens, today.costUsd)
+            let card = vm.usageData?.cards?[vm.menuBarProvider] else { return nil }
+      let sym = card.resolvedCurrencySymbol
+      let isExtBillingOnly =
+        (card.isExternal == true || vm.isExternalProvider(vm.menuBarProvider)) &&
+        card.billingSummary?.todayTokens == nil &&
+        card.today.totalTokens == 0
+      return (card.today.totalTokens, card.billingSummary?.todayCost ?? card.today.costUsd, sym, isExtBillingOnly)
     }
     if let allToday = vm.usageData?.cards?["all"]?.today,
        (allToday.totalTokens > 0 || (vm.todaySummary?.totalTokens ?? 0) == 0) {
-      return (allToday.totalTokens, allToday.costUsd)
+      return (allToday.totalTokens, allToday.costUsd, "$", false)
     }
     guard let today = vm.todaySummary else { return nil }
-    return (today.totalTokens, today.estimatedCostUsd)
+    return (today.totalTokens, today.estimatedCostUsd, "$", false)
   }
 
   private func compactMenuBarTitle() -> String {
@@ -225,7 +230,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     case .quotaRemaining:
       let keys = vm.menuBarProvider != "auto"
         ? [vm.menuBarProvider]
-        : ["codex", "cursor", "antigravity", "codebuddy"]
+        : vm.allQuotaProviderKeys
       var parts: [String] = []
       for key in keys {
         guard vm.isToolEnabled(key),
@@ -235,16 +240,19 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       }
       if !parts.isEmpty { return parts.joined(separator: " · ") }
       guard let today = scopedTodayMetrics() else { return "" }
-      return MeterFormat.usd(today.costUsd)
+      return MeterFormat.money(today.cost, symbol: today.symbol)
     case .tps:
       guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider), let tps = turn.tps, tps > 0 else { return "" }
       return MeterFormat.tps(tps)
     case .todayCost:
       guard let today = scopedTodayMetrics() else { return "" }
-      return MeterFormat.usd(today.costUsd)
+      return MeterFormat.money(today.cost, symbol: today.symbol)
     case .todayTokensAndCost:
       guard let today = scopedTodayMetrics() else { return "" }
-      return "\(MeterFormat.tokens(today.tokens)) · \(MeterFormat.usd(today.costUsd))"
+      if today.isBillingOnly {
+        return MeterFormat.money(today.cost, symbol: today.symbol)
+      }
+      return "\(MeterFormat.tokens(today.tokens)) · \(MeterFormat.money(today.cost, symbol: today.symbol))"
     case .latestInline:
       guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider) else { return "" }
       let inTok = MeterFormat.tokens(turn.totalInputTokens)
@@ -266,6 +274,23 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         lines.append("\(title): \(inline)")
       } else {
         lines.append("\(title): 等待新对话")
+      }
+    }
+    for meta in vm.externalProviders {
+      guard vm.isToolEnabled(meta.key) else { continue }
+      if !vm.isActiveOverall {
+        lines.append("\(meta.name): 已暂停")
+      } else if let card = vm.usageData?.cards?[meta.key] {
+        let sym = card.resolvedCurrencySymbol
+        if let firstWin = card.quotaWindows?.first {
+          let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: firstWin.remainingPct).rounded())
+          let costPart = (card.billingSummary?.periodCost ?? card.days30.costUsd).map { " · \(MeterFormat.money($0, symbol: sym))" } ?? ""
+          lines.append("\(meta.name): \(firstWin.title) \(vm.quotaDisplayMode.verbLabel)\(pct)%\(costPart)")
+        } else if let hint = card.quotaHint {
+          lines.append("\(meta.name): \(hint)")
+        } else {
+          lines.append("\(meta.name): \(card.statusText ?? "已同步")")
+        }
       }
     }
     return lines.joined(separator: "\n")

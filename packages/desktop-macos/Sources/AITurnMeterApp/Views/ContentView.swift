@@ -19,6 +19,7 @@ struct ContentView: View {
     SettingsAppPaneItem(id: "usage", pane: .usage, title: "用量", icon: "chart.bar"),
     SettingsAppPaneItem(id: "turns", pane: .turns, title: "轮次", icon: "clock"),
     SettingsAppPaneItem(id: "fingerprint", pane: .fingerprint, title: "降智检测", icon: "checkmark.shield"),
+    SettingsAppPaneItem(id: "plugins", pane: .plugins, title: "插件", icon: "puzzlepiece.extension"),
     SettingsAppPaneItem(id: "menubar", pane: .menuBar, title: "菜单栏", icon: "menubar.rectangle"),
     SettingsAppPaneItem(id: "remote", pane: .remote, title: "远程", icon: "network"),
     SettingsAppPaneItem(id: "about", pane: .about, title: "关于", icon: "info.circle"),
@@ -36,6 +37,16 @@ struct ContentView: View {
     guard !q.isEmpty else { return preferred }
     return preferred.filter {
       vm.toolShortTitle(for: $0).lowercased().contains(q) || vm.displayTitle(for: $0).lowercased().contains(q)
+    }
+  }
+
+  private var filteredExternalProviders: [ExternalProviderMeta] {
+    let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !q.isEmpty else { return vm.externalProviders }
+    return vm.externalProviders.filter {
+      $0.name.lowercased().contains(q) ||
+      $0.shortName.lowercased().contains(q) ||
+      $0.key.lowercased().contains(q)
     }
   }
 
@@ -157,6 +168,51 @@ struct ContentView: View {
                   }
                 }
               }
+
+              if !filteredExternalProviders.isEmpty {
+                HStack {
+                  Text("外部插件")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                  Spacer()
+                  Button {
+                    vm.pickAndImportPluginFiles()
+                  } label: {
+                    Image(systemName: "plus")
+                      .font(.system(size: 10.5, weight: .semibold))
+                      .foregroundColor(.secondary)
+                  }
+                  .buttonStyle(.plain)
+                  .help("导入 .mjs 插件")
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 14)
+                .padding(.bottom, 4)
+
+                ForEach(filteredExternalProviders) { meta in
+                  let enabled = vm.isToolEnabled(meta.key)
+                  let isSelected = vm.settingsPane == .provider(meta.key)
+                  let dotColor: Color = {
+                    if !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.35) }
+                    if meta.ok == false { return .orange }
+                    return Color(red: 0.20, green: 0.72, blue: 0.42)
+                  }()
+
+                  sidebarRow(pane: .provider(meta.key), isSelected: isSelected) {
+                    ToolGlyph.iconView(for: meta.key, sfSymbolOverride: meta.icon, size: 14)
+                      .foregroundColor(enabled && vm.isActiveOverall ? .primary : .secondary.opacity(0.6))
+                      .frame(width: 18)
+                    Text(meta.shortName)
+                      .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
+                      .foregroundColor(enabled && vm.isActiveOverall ? .primary : .secondary)
+                      .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Circle()
+                      .fill(dotColor)
+                      .frame(width: 6, height: 6)
+                  }
+                }
+              }
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 12)
@@ -189,6 +245,8 @@ struct ContentView: View {
           case .fingerprint:
             FingerprintTabView(vm: vm)
               .padding(16)
+          case .plugins:
+            PluginsSettingsPaneView(vm: vm)
           }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -228,6 +286,9 @@ struct ContentView: View {
     }
     .sheet(isPresented: $vm.showCursorLoginSheet) {
       CursorWebLoginSheetView(vm: vm)
+    }
+    .sheet(isPresented: $vm.showPluginCodeSheet) {
+      PluginCodeImportSheetView(vm: vm)
     }
     .sheet(isPresented: $vm.showCursorCookieSheet) {
       VStack(alignment: .leading, spacing: 12) {

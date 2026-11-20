@@ -725,7 +725,14 @@ export class TurnStore {
    * Aggregate usage, cost, and cache savings over `days` local calendar days (0 or 'all' = all history).
    * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number, quotasByTool?: Record<string, any> | null, enabledTools?: Record<string, boolean> | null }} [opts]
    */
-  getUsageSummary({ days = 7, tool = null, nowMs = Date.now(), quotasByTool = null, enabledTools = null } = {}) {
+  getUsageSummary({
+    days = 7,
+    tool = null,
+    nowMs = Date.now(),
+    quotasByTool = null,
+    enabledTools = null,
+    externalData = null,
+  } = {}) {
     const todayStartMs = startOfLocalDayMs(nowMs);
     const resolvedDays =
       days === 'all' || days === 0 || days === '0' || days === null
@@ -751,10 +758,45 @@ export class TurnStore {
           quotaHint: q?.quotaHint ?? null,
         };
       }
+      if (externalData && typeof externalData === 'object') {
+        if (externalData.cards && typeof externalData.cards === 'object') {
+          for (const [extKey, extCard] of Object.entries(externalData.cards)) {
+            overlaidCards[extKey] = extCard;
+          }
+        }
+        if (
+          overlaidCards.all &&
+          Array.isArray(externalData.overviewWindows) &&
+          externalData.overviewWindows.length > 0
+        ) {
+          overlaidCards.all = {
+            ...overlaidCards.all,
+            quotaWindows: [
+              ...(overlaidCards.all.quotaWindows || []),
+              ...externalData.overviewWindows,
+            ],
+          };
+        }
+        if (overlaidCards.all && Number(externalData.activeAccounts) > 0) {
+          const builtInCountMatch = String(overlaidCards.all.accountEmail || '').match(/^(\d+)/);
+          const builtInCount = builtInCountMatch ? Number(builtInCountMatch[1]) : 0;
+          const totalCount = builtInCount + Number(externalData.activeAccounts);
+          overlaidCards.all = {
+            ...overlaidCards.all,
+            accountEmail: `${totalCount} 个已登录账号`,
+          };
+        }
+      }
       return {
         ...base,
         generatedAtMs: nowMs,
         cards: overlaidCards,
+        ...(externalData
+          ? {
+              externalProviders: Array.isArray(externalData.providers) ? externalData.providers : [],
+              providersDir: externalData.providersDir || null,
+            }
+          : {}),
       };
     };
 

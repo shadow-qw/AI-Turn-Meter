@@ -15,6 +15,11 @@ import {
 } from './auth.mjs';
 import { CdpInlineInjector } from './cdp-injector.mjs';
 import {
+  defaultExternalProvidersDir,
+  ExternalProviderRegistry,
+  isExternalProviderKey,
+} from './external-providers.mjs';
+import {
   analyzePassiveTelemetry,
   buildManualProbePack,
   inspectLocalCodexConfig,
@@ -34,6 +39,9 @@ const CURSOR_EVENT_SET = new Set(CURSOR_EVENTS);
 const PROTECTED_ROUTES = new Set([
   'POST /v1/config',
   'POST /v1/cursor/sync-local',
+  'POST /v1/providers/reload',
+  'POST /v1/providers/import',
+  'DELETE /v1/providers',
   'GET /v1/fingerprint/overview',
   'POST /v1/fingerprint/endpoints',
   'DELETE /v1/fingerprint/endpoints',
@@ -62,6 +70,13 @@ function loadMeterConfig(configPath) {
     for (const k of TOOL_KEYS) {
       if (typeof raw?.tools?.[k] === 'boolean') tools[k] = raw.tools[k];
       if (typeof raw?.inlineTools?.[k] === 'boolean') inlineTools[k] = raw.inlineTools[k];
+    }
+    if (raw?.tools && typeof raw.tools === 'object') {
+      for (const [k, v] of Object.entries(raw.tools)) {
+        if (isExternalProviderKey(k) && typeof v === 'boolean') {
+          tools[k] = v;
+        }
+      }
     }
     const cursorCookie =
       typeof raw?.cursorCookie === 'string' && raw.cursorCookie.trim()
@@ -107,12 +122,14 @@ export function createMeterServer({
   port = Number(process.env.AI_TURN_METER_PORT || 47831),
   dbPath,
   stateDir,
+  providersDir = null,
   authToken = null,
   requireAuthToken = true,
   enableWatchers = true,
   enableCdp = process.env.AI_TURN_METER_DISABLE_CDP !== '1',
   enableAntigravityRpc = true,
   enableQuotaProbe = enableWatchers,
+  enableExternalProviders = true,
 } = {}) {
   const store = new TurnStore(dbPath);
   const effectiveDbPath = dbPath !== undefined ? dbPath : store.dbPath;
@@ -120,6 +137,8 @@ export function createMeterServer({
     stateDir || (effectiveDbPath && effectiveDbPath !== ':memory:' ? dirname(effectiveDbPath) : undefined);
   const effectiveToken = authToken || loadOrCreateDaemonToken(hookStateDir);
   const configPath = hookStateDir ? join(hookStateDir, 'config.json') : null;
+  const resolvedProvidersDir = providersDir || defaultExternalProvidersDir(hookStateDir);
+  const externalProviders = new ExternalProviderRegistry({ providersDir: resolvedProvidersDir });
   let config = loadMeterConfig(configPath);
   /** @type {Set<http.ServerResponse>} */
   const sseClients = new Set();
@@ -294,8 +313,13 @@ export function createMeterServer({
       const forceRefresh = url.searchParams.get('refresh') === '1';
       const meta = getPackageMeta();
       const listeningPort = server.address()?.port || port;
-      getCachedAppsStatus(forceRefresh)
-        .then((baseApps) => {
+      Promise.all([
+        getCachedAppsStatus(forceRefresh),
+        enableExternalProviders
+          ? externalProviders.listMetadata({ enabledTools: config.tools }).catch(() => [])
+          : Promise.resolve([]),
+      ])
+        .then(([baseApps, extList]) => {
           const state = { ...store.getState(30, config.tools), config: publicConfig(config) };
           const apps = {};
           for (const [k, entry] of Object.entries(baseApps)) {
@@ -312,6 +336,8 @@ export function createMeterServer({
               online: true,
               config: state.config,
               apps,
+              externalProviders: extList,
+              providersDir: externalProviders.providersDir,
               state,
             })
           );
@@ -320,6 +346,73 @@ export function createMeterServer({
           if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'failed to inspect apps' }));
+          }
+        });
+      return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/v1/providers') {
+      const fileName = url.searchParams.get('fileName') || null;
+      const key = url.searchParams.get('key') || null;
+      if (!fileName && !key) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'missing fileName or key' }));
+        return;
+      }
+      externalProviders
+        .removePlugin({ fileName, key })
+        .then(async (rmRes) => {
+          if (rmRes.key && Object.prototype.hasOwnProperty.call(config.tools, rmRes.key)) {
+            delete config.tools[rmRes.key];
+            persistConfig();
+            broadcast('state', { ...store.getState(20, config.tools), config: publicConfig(config) });
+          }
+          const providers = enableExternalProviders
+            ? await externalProviders.listMetadata({ enabledTools: config.tools }).catch(() => [])
+            : [];
+          if (!res.headersSent) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                deleted: rmRes.deleted,
+                fileName: rmRes.fileName,
+                key: rmRes.key,
+                providersDir: externalProviders.providersDir,
+                providers,
+              })
+            );
+          }
+        })
+        .catch((err) => {
+          if (!res.headersSent) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: err?.message || '移除插件失败' }));
+          }
+        });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/providers') {
+      const forceRefresh = url.searchParams.get('refresh') === '1';
+      const run = enableExternalProviders
+        ? forceRefresh
+          ? externalProviders
+              .fetchAll({ nowMs: Date.now(), forceRefresh: true, enabledTools: config.tools })
+              .then((out) => ({ providersDir: out.providersDir, providers: out.providers, cards: out.cards }))
+          : externalProviders
+              .listMetadata({ enabledTools: config.tools })
+              .then((providers) => ({ providersDir: externalProviders.providersDir, providers }))
+        : Promise.resolve({ providersDir: externalProviders.providersDir, providers: [] });
+      run
+        .then((payload) => {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(payload));
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'failed to inspect providers' }));
           }
         });
       return;
@@ -353,17 +446,36 @@ export function createMeterServer({
         triggerCursorHistorySync({ force: false });
       }
       const sendUsage = async () => {
-        const quotasByTool = enableQuotaProbe
-          ? await getAllQuotas(Date.now(), {
-              forceRefresh,
-              cursorCookie: config.cursorCookie,
-              enabledTools: config.tools,
-            }).catch(() => null)
-          : null;
+        const nowMs = Date.now();
+        const [quotasByTool, externalData] = await Promise.all([
+          enableQuotaProbe
+            ? getAllQuotas(nowMs, {
+                forceRefresh,
+                cursorCookie: config.cursorCookie,
+                enabledTools: config.tools,
+              }).catch(() => null)
+            : Promise.resolve(null),
+          enableExternalProviders
+            ? externalProviders
+                .fetchAll({
+                  nowMs,
+                  forceRefresh,
+                  enabledTools: config.tools,
+                })
+                .catch(() => null)
+            : Promise.resolve(null),
+        ]);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify(
-            store.getUsageSummary({ days, tool, quotasByTool, enabledTools: config.tools })
+            store.getUsageSummary({
+              days,
+              tool,
+              nowMs,
+              quotasByTool,
+              enabledTools: config.tools,
+              externalData,
+            })
           )
         );
       };
@@ -529,6 +641,8 @@ export function createMeterServer({
         url.pathname === '/v1/ingest/cursor-hook' ||
         url.pathname === '/v1/config' ||
         url.pathname === '/v1/cursor/sync-local' ||
+        url.pathname === '/v1/providers/reload' ||
+        url.pathname === '/v1/providers/import' ||
         url.pathname === '/v1/fingerprint/endpoints' ||
         url.pathname === '/v1/fingerprint/run')
     ) {
@@ -837,6 +951,77 @@ export function createMeterServer({
               });
             return;
           }
+          if (url.pathname === '/v1/providers/import') {
+            const fileName = typeof payload?.fileName === 'string' ? payload.fileName : '';
+            const content = typeof payload?.content === 'string' ? payload.content : '';
+            externalProviders
+              .importPluginSource({ fileName, content })
+              .then(async (imp) => {
+                config.tools[imp.meta.key] = true;
+                persistConfig();
+                broadcast('state', { ...store.getState(20, config.tools), config: publicConfig(config) });
+                const out = enableExternalProviders
+                  ? await externalProviders.fetchAll({
+                      nowMs: Date.now(),
+                      forceRefresh: true,
+                      enabledTools: config.tools,
+                    })
+                  : { providersDir: externalProviders.providersDir, providers: [imp.meta], cards: {} };
+                if (!res.headersSent) {
+                  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                  res.end(
+                    JSON.stringify({
+                      ok: true,
+                      imported: imp.meta,
+                      providersDir: out.providersDir,
+                      providers: out.providers,
+                      card: out.cards?.[imp.meta.key] || null,
+                    })
+                  );
+                }
+              })
+              .catch((err) => {
+                if (!res.headersSent) {
+                  res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                  res.end(JSON.stringify({ ok: false, error: err?.message || '导入插件失败' }));
+                }
+              });
+            return;
+          }
+          if (url.pathname === '/v1/providers/reload') {
+            externalProviders.clearCaches();
+            const run = enableExternalProviders
+              ? externalProviders.fetchAll({
+                  nowMs: Date.now(),
+                  forceRefresh: true,
+                  enabledTools: config.tools,
+                })
+              : Promise.resolve({
+                  providersDir: externalProviders.providersDir,
+                  providers: [],
+                  cards: {},
+                });
+            run
+              .then((out) => {
+                if (!res.headersSent) {
+                  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                  res.end(
+                    JSON.stringify({
+                      ok: true,
+                      providersDir: out.providersDir,
+                      providers: out.providers,
+                    })
+                  );
+                }
+              })
+              .catch(() => {
+                if (!res.headersSent) {
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: false, error: 'failed to reload providers' }));
+                }
+              });
+            return;
+          }
           if (url.pathname === '/v1/config') {
             const prevInline = Object.fromEntries(TOOL_KEYS.map((k) => [k, isInlineEnabled(k)]));
             const prevTools = { ...config.tools };
@@ -846,6 +1031,11 @@ export function createMeterServer({
             if (payload?.tools && typeof payload.tools === 'object') {
               for (const k of TOOL_KEYS) {
                 if (typeof payload.tools[k] === 'boolean') config.tools[k] = payload.tools[k];
+              }
+              for (const [k, v] of Object.entries(payload.tools)) {
+                if (isExternalProviderKey(k) && typeof v === 'boolean') {
+                  config.tools[k] = v;
+                }
               }
             }
             if (typeof payload?.inlineEnabled === 'boolean') config.inlineEnabled = payload.inlineEnabled;
@@ -958,6 +1148,11 @@ export function createMeterServer({
       spoolTimer.unref?.();
     }
     cdpInjector?.start();
+    if (enableExternalProviders) {
+      externalProviders
+        .fetchAll({ nowMs: Date.now(), forceRefresh: false, enabledTools: config.tools })
+        .catch(() => {});
+    }
     if (enableQuotaProbe) {
       getAllQuotas(Date.now(), {
         cursorCookie: config.cursorCookie,
@@ -1001,6 +1196,7 @@ export function createMeterServer({
     server,
     store,
     authToken: effectiveToken,
+    externalProviders,
     start,
     stop,
     codexAdapter,

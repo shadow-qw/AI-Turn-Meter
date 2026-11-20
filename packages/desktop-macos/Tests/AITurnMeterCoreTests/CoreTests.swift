@@ -117,6 +117,8 @@ struct AITurnMeterCoreTests {
     #expect(MeterFormat.tokens(2_000_000) == "2M")
     #expect(MeterFormat.usd(0.0042) == "$0.0042")
     #expect(MeterFormat.usd(1.234) == "$1.23")
+    #expect(MeterFormat.money(420.5, symbol: "¥") == "¥420.50")
+    #expect(MeterFormat.compactMoney(420.5, symbol: "¥") == "¥421")
     #expect(MeterFormat.tps(42.0) == "42 tok/s")
     #expect(MeterFormat.pct(87.0) == "87%")
     #expect(MeterFormat.shortDate("2026-11-19") == "11/19")
@@ -147,5 +149,57 @@ struct AITurnMeterCoreTests {
     #expect(!UpdateChecker.matchesChecksum(expected: String(repeating:"0", count:64), actual: digest))
     #expect(!UpdateChecker.matchesChecksum(expected: "", actual: digest))
     #expect(!UpdateChecker.matchesChecksum(expected: String(repeating:"x", count:64), actual: digest))
+  }
+
+  @Test("External provider metadata and billing card snapshots decode cleanly")
+  func externalProviderDecoding() throws {
+    let json = """
+    {
+      "days": 7,
+      "tool": null,
+      "today": { "turnCount": 0, "callCount": 0, "totalInputTokens": 0, "uncachedInputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0, "outputTokens": 0, "thinkingTokens": 0, "totalTokens": 0, "cacheRatePct": null, "avgTps": null, "estimatedCostUsd": 0, "cacheSavingsUsd": 0, "pricedTurnCount": 0, "unpricedTurnCount": 0 },
+      "totals": { "turnCount": 0, "callCount": 0, "totalInputTokens": 0, "uncachedInputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0, "outputTokens": 0, "thinkingTokens": 0, "totalTokens": 0, "cacheRatePct": null, "avgTps": null, "estimatedCostUsd": 0, "cacheSavingsUsd": 0, "pricedTurnCount": 0, "unpricedTurnCount": 0 },
+      "byTool": [],
+      "byModel": [],
+      "byProject": [],
+      "daily": [],
+      "providersDir": "/tmp/providers",
+      "externalProviders": [
+        { "key": "ext:gw", "providerId": "gw", "name": "Gateway", "shortName": "GW", "icon": "building.2", "accentColor": "#1677FF", "currency": "CNY", "currencySymbol": "¥", "detailUrl": "https://example.com", "fileName": "gw.mjs", "enabled": true, "ok": true }
+      ],
+      "cards": {
+        "ext:gw": {
+          "isExternal": true,
+          "providerName": "Gateway",
+          "providerShortName": "GW",
+          "currencyCode": "CNY",
+          "currencySymbol": "¥",
+          "statusText": "已同步",
+          "footnote": "实时账单",
+          "accountEmail": "alice",
+          "planTitle": "Team",
+          "quotaWindows": [{ "id": "ext:gw:m", "title": "本月额度", "remainingPct": 62.5, "resetText": "10 天后重置", "pacePct": 50.0, "subtitle": "已用 ¥375.00 / ¥1000.00" }],
+          "billingSummary": { "todayCost": 30.5, "todayTokens": null, "periodLabel": "本月", "periodCost": 375.0, "periodLimit": 1000.0, "periodRemaining": 625.0, "periodTokens": null, "updatedAtMs": 1700000000000 },
+          "today": { "costUsd": 30.5, "totalTokens": 0, "totalInputTokens": 0, "outputTokens": 0, "turnCount": 0, "callCount": 0, "cacheRatePct": null, "avgTps": null, "cacheSavingsUsd": null },
+          "currentWindow": { "costUsd": 375.0, "totalTokens": 0, "turnCount": 0 },
+          "days30": { "costUsd": 375.0, "totalTokens": 0, "turnCount": 0 },
+          "daily30": [{ "date": "2026-11-19", "label": "11月19日", "totalTokens": 0, "costUsd": 30.5, "turnCount": 0, "models": [] }],
+          "projects": [],
+          "recentWindows": [],
+          "breakdowns": [{ "id": "models", "title": "模型明细", "items": [{ "id": "m1", "name": "pro-model", "cost": 200.0, "limit": null, "usagePct": null, "sharePct": 53.3, "tokens": null, "subtitle": null }] }],
+          "topModel": "pro-model"
+        }
+      }
+    }
+    """
+    let parsed = try JSONDecoder().decode(UsageSummaryResponse.self, from: Data(json.utf8))
+    #expect(parsed.providersDir == "/tmp/providers")
+    #expect(parsed.externalProviders?.count == 1)
+    #expect(parsed.externalProviders?.first?.key == "ext:gw")
+    let card = try #require(parsed.cards?["ext:gw"])
+    #expect(card.isExternal == true)
+    #expect(card.resolvedCurrencySymbol == "¥")
+    #expect(card.billingSummary?.periodRemaining == 625.0)
+    #expect(card.breakdowns?.first?.items.first?.name == "pro-model")
   }
 }

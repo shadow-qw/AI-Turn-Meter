@@ -37,12 +37,14 @@ enum ToolGlyph {
     case "codex": return "terminal"
     case "cursor": return "cursorarrow.rays"
     case "codebuddy": return "chevron.left.forwardslash.chevron.right"
-    default: return "app"
+    default:
+      if key.hasPrefix("ext:") { return "puzzlepiece.extension" }
+      return "app"
     }
   }
 
   @ViewBuilder
-  static func iconView(for key: String, size: CGFloat = 15) -> some View {
+  static func iconView(for key: String, sfSymbolOverride: String? = nil, size: CGFloat = 15) -> some View {
     if let img = brandImage(for: key) {
       Image(nsImage: img)
         .resizable()
@@ -51,7 +53,13 @@ enum ToolGlyph {
         .scaledToFit()
         .frame(width: size, height: size)
     } else {
-      Image(systemName: iconName(for: key))
+      let symbolName: String = {
+        if let custom = sfSymbolOverride, !custom.isEmpty, NSImage(systemSymbolName: custom, accessibilityDescription: nil) != nil {
+          return custom
+        }
+        return iconName(for: key)
+      }()
+      Image(systemName: symbolName)
         .font(.system(size: max(12, size - 2), weight: .semibold))
         .frame(width: size, height: size)
     }
