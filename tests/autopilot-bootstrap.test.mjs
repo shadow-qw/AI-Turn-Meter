@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,rmSync,copyFileSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,rmSync,copyFileSync,symlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-const source='87d3d39d40e63f18752443a6aee10e6797e75adb';
+const source='773bb92fb59e865071e91e884c4824a4af709ac1';
 const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthetic.yml',import.meta.url)));
 const job=wf.jobs['synthetic-only'];
 const scratch=t=>{const p=mkdtempSync(join(tmpdir(),'atm-bootstrap-boundary-'));t.after(()=>rmSync(p,{recursive:true,force:true}));return p;};
@@ -28,7 +28,7 @@ test('modified PR driver is not the workflow checkout or executable source',t=>{
 });
 test('actual inline approval gate rejects wrong source, event, head, workflow or baseline',t=>{
  const cwd=scratch(t),step=job.steps.find(s=>s.name==='Gate one-shot approval');assert.ok(step);
- const sha='a'.repeat(40),before='c6c5d4fd0a6ba167f3a2cbcf1fa123ee712656f8';
+ const sha='a'.repeat(40),before='42bb66fb37373a707a8d6c2aa891906be4c4c533';
  const event={ref:'refs/heads/docs/issue-autopilot-design-20261119',before,after:sha,forced:false,deleted:false,repository:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}};
  const path=join(cwd,'event.json');writeFileSync(path,JSON.stringify(event));
  const env={GITHUB_EVENT_NAME:'push',GITHUB_REPOSITORY:'shadow-qw/AI-Turn-Meter',GITHUB_REPOSITORY_ID:'1461122513',GITHUB_ACTOR:'shadow-qw',GITHUB_REF:event.ref,GITHUB_SHA:sha,GITHUB_WORKFLOW_SHA:sha,GITHUB_EVENT_PATH:path,APPROVED_WORKFLOW_SHA:sha,APPROVED_SOURCE_SHA:source};
@@ -55,10 +55,12 @@ test('actual byte-verifier checks pinned fixture bytes and rejects altered drive
 test('documented preflight rejects every bad identity before marker under all Python optimization modes',t=>{
  const file=new URL('../docs/superpowers/runbooks/synthetic-preflight.md',import.meta.url);
  assert.ok(existsSync(file),'reviewed preflight runbook must exist');
- const text=readFileSync(file,'utf8'),match=text.match(/```python\n([\s\S]*?)\n```/);assert.ok(match);
- const digest=createHash('sha256').update(match[1]+'\n').digest('hex');assert.ok(text.includes("'"+digest+"'"),'runbook must pin exact tested validator bytes');
- const cwd=scratch(t),path=join(cwd,'pr.json'),script=join(cwd,'validate-pr.py'),marker=join(cwd,'AFTER_GATE');writeFileSync(script,match[1]+'\n');
- const valid={number:2,state:'open',merged:false,head:{sha:'c6c5d4fd0a6ba167f3a2cbcf1fa123ee712656f8',ref:'docs/issue-autopilot-design-20261119',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}},base:{sha:'759f3ea525b64281060b14ed43c6f35ae15705c8',ref:'main',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}}};
+ const text=readFileSync(file,'utf8'),matches=[...text.matchAll(/```python\n([\s\S]*?)\n```/g)];assert.equal(matches.length,1);const match=matches[0];
+ const shells=[...text.matchAll(/```bash\n([\s\S]*?)\n```/g)];assert.equal(shells.length,1);
+ const digest=createHash('sha256').update(match[1]+'\n').digest('hex');assert.ok((text.includes("'"+digest+"'")||text.includes('"'+digest+'"')),'runbook must pin exact tested validator bytes');
+ const cwd=scratch(t),path=join(cwd,'pr-before.json'),script=join(cwd,'validate-pr.py'),marker=join(cwd,'AFTER_GATE');writeFileSync(script,match[1]+'\n');
+ const bin=join(cwd,'bin');mkdirSync(bin);writeFileSync(join(bin,'sha256sum'),'#!/bin/sh\nexit 64\n',{mode:0o755}); // No GNU CLI dependency on macOS.
+ const valid={number:2,state:'open',merged:false,head:{sha:'42bb66fb37373a707a8d6c2aa891906be4c4c533',ref:'docs/issue-autopilot-design-20261119',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}},base:{sha:'759f3ea525b64281060b14ed43c6f35ae15705c8',ref:'main',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}}};
  const bad=['not-json','<wrapper>'+JSON.stringify(valid),JSON.stringify(valid).slice(0,-10),'null','[]','"unknown"',JSON.stringify(valid)+' '.repeat(1048577),Buffer.from([255])];
  const fields={'number':999,'state':'unknown','merged':true,'head.sha':'a'.repeat(40),'head.ref':'main','head.repo.id':1,'head.repo.full_name':'evil/repo','base.sha':'a'.repeat(40),'base.ref':'other','base.repo.id':1,'base.repo.full_name':'evil/base'};
  for(const [key,value] of Object.entries(fields)){
@@ -74,16 +76,18 @@ test('documented preflight rejects every bad identity before marker under all Py
  let negatives=0;
  for(const mode of modes){
   const check=(raw,input=path)=>{
-   rmSync(marker,{force:true});writeFileSync(path,raw);
-   return spawnSync('/bin/bash',['-c',`set -euo pipefail\nprintf '%s  %s\\n' "$GUARD_SHA" "$GUARD_FILE" | sha256sum --check --strict --status\npython3 "$@"\nprintf local-only > "$MARKER"`,'preflight','-B',...mode.flags,script,input],{env:{PATH:process.env.PATH,HOME:cwd,MARKER:marker,GUARD_SHA:digest,GUARD_FILE:script,...mode.env},encoding:'utf8',timeout:3000});
+   rmSync(marker,{force:true});rmSync(path,{recursive:true,force:true});if(input===cwd)mkdirSync(path);else if(input===path)writeFileSync(path,raw);
+   const shell=shells[0][1].replaceAll('/workspace/atm-preflight',cwd).replace('python3 -B','python3 '+mode.flags.join(' ')+' -B');
+   // Execute the actual pinned runbook shell, not a reconstruction; only relocate scratch paths.
+   return spawnSync('/bin/bash',['-c',shell+'\nprintf local-only > "$MARKER"'],{env:{PATH:bin+':'+process.env.PATH,HOME:cwd,MARKER:marker,...mode.env},encoding:'utf8',timeout:3000});
   };
   const ok=check(JSON.stringify(valid));assert.equal(ok.status,0,mode.name+': '+ok.stderr);assert.equal(ok.stdout,'PREFLIGHT_PR_IDENTITY_OK\n');assert.equal(existsSync(marker),true);
   for(const raw of bad){const r=check(raw);assert.equal(r.status,1,mode.name);assert.equal(r.stdout,'');assert.equal(r.stderr,'PREFLIGHT_PR_REJECTED\n');assert.equal(existsSync(marker),false,mode.name+': marker must not run');negatives++;}
   for(const input of [join(cwd,'missing.json'),cwd]){const r=check('{}',input);assert.equal(r.status,1);assert.equal(r.stdout,'');assert.equal(r.stderr,'PREFLIGHT_PR_REJECTED\n');assert.equal(existsSync(marker),false);negatives++;}
-  for(const altered of [match[1]+"\nprint('UNREVIEWED_COPY')\n",null]){
-   if(altered===null)rmSync(script);else writeFileSync(script,altered);
+  for(const altered of [match[1]+"\nprint('UNREVIEWED_COPY')\n",match[1].replaceAll("require(","require( ")+"\n",match[1].replaceAll("\n","\r\n")+"\r\n",null,"symlink"]){
+   rmSync(script,{force:true});if(altered==='symlink'){const target=join(cwd,'same-reviewed-bytes.py');writeFileSync(target,match[1]+'\n');symlinkSync(target,script);}else if(altered!==null)writeFileSync(script,altered);
    const r=check(JSON.stringify(valid));assert.notEqual(r.status,0);assert.equal(r.stdout,'');assert.equal(existsSync(marker),false);negatives++;
-   writeFileSync(script,match[1]+'\n');
+   rmSync(script,{force:true});writeFileSync(script,match[1]+'\n');
   }
  }
  t.diagnostic('5 positive modes; '+negatives+' negative mode-cases rejected before local marker');
