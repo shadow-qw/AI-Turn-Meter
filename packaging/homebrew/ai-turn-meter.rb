@@ -1,8 +1,8 @@
 class AiTurnMeter < Formula
   desc "Unified local daemon and inline token/TPS meter for Antigravity, Codex, Cursor, and CodeBuddy CN"
   homepage "https://github.com/shadow-qw/AI-Turn-Meter"
-  url "https://github.com/shadow-qw/AI-Turn-Meter/releases/download/v0.2.28/ai-turn-meter-0.2.28.tar.gz"
-  sha256 "1746783f1c6868d3cb95f92a186acd5a98e67d817ea6554bc364b35e84e38296"
+  url "https://github.com/shadow-qw/AI-Turn-Meter/releases/download/v0.2.29/ai-turn-meter-0.2.29.tar.gz"
+  sha256 "2437a5860700d8d296cdcdfbe15cf1bfd89f5ab13666ada5d491b693c9f7b324"
 
   depends_on :macos
   depends_on "node"

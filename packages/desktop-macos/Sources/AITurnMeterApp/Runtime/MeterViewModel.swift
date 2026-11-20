@@ -25,7 +25,7 @@ final class MeterViewModel: ObservableObject {
     static let receiptHideProjects = "atm.receiptHideProjects.v1"
   }
 
-  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.28"
+  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.29"
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
