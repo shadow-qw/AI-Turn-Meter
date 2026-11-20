@@ -15,6 +15,7 @@ final class MeterViewModel: ObservableObject {
     static let menuBarIconStyle = "atm.menuBarIconStyle.v1"
     static let menuBarProvider = "atm.menuBarProvider.v1"
     static let menuBarUsageScope = "atm.menuBarUsageScope.v1"
+    static let providerOrder = "atm.providerOrder.v1"
     static let quotaDisplayMode = "atm.quotaDisplayMode.v1"
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
     static let showRecentWindowsInMenu = "atm.showRecentWindowsInMenu.v2"
@@ -24,7 +25,7 @@ final class MeterViewModel: ObservableObject {
     static let receiptHideProjects = "atm.receiptHideProjects.v1"
   }
 
-  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.27"
+  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.28"
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
@@ -141,6 +142,7 @@ final class MeterViewModel: ObservableObject {
   @Published var apps: [String: StatusAppEntry] = [:]
   @Published var vsixVersions: [String: String] = [:]
   @Published var externalProviders: [ExternalProviderMeta] = []
+  @Published var providerOrder: [String] = UserDefaults.standard.stringArray(forKey: PrefKey.providerOrder) ?? ProviderOrder.defaultBuiltIn
   @Published var providersDir: String = (NSHomeDirectory() as NSString).appendingPathComponent(".local/share/ai-turn-meter/providers")
   @Published var showPluginCodeSheet: Bool = false
   @Published var pluginImportBusy: Bool = false
@@ -176,8 +178,6 @@ final class MeterViewModel: ObservableObject {
   private var hasStarted = false
   private var lastUsageRefreshAt: Date = .distantPast
 
-  let orderedKeys = ["antigravity", "codex", "cursor", "codebuddy"]
-
   func isExternalProvider(_ key: String) -> Bool {
     key.hasPrefix("ext:")
   }
@@ -186,8 +186,29 @@ final class MeterViewModel: ObservableObject {
     externalProviders.map(\.key)
   }
 
+  var orderedAllProviderKeys: [String] {
+    ProviderOrder.resolve(
+      saved: providerOrder,
+      available: ProviderOrder.defaultBuiltIn + externalProviderKeys
+    )
+  }
+
+  var orderedKeys: [String] {
+    orderedAllProviderKeys.filter { !isExternalProvider($0) }
+  }
+
   var allQuotaProviderKeys: [String] {
-    ["codex", "cursor", "antigravity", "codebuddy"] + externalProviderKeys
+    orderedAllProviderKeys
+  }
+
+  func moveProvider(from sourceKey: String, to targetKey: String) {
+    let current = orderedAllProviderKeys
+    let updated = ProviderOrder.move(order: current, from: sourceKey, to: targetKey)
+    guard updated != current else { return }
+    providerOrder = updated
+    UserDefaults.standard.set(updated, forKey: PrefKey.providerOrder)
+    onPreferencesChanged?()
+    onStateUpdated?()
   }
 
   func externalProviderMeta(for key: String) -> ExternalProviderMeta? {

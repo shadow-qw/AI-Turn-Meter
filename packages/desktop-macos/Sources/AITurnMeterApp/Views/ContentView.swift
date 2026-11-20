@@ -1,6 +1,7 @@
 import AITurnMeterCore
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 private struct SettingsAppPaneItem: Identifiable {
   let id: String
@@ -9,10 +10,33 @@ private struct SettingsAppPaneItem: Identifiable {
   let icon: String
 }
 
+private struct ProviderReorderDropDelegate: DropDelegate {
+  let targetKey: String
+  @Binding var draggingKey: String?
+  let onMove: (String, String) -> Void
+
+  func dropEntered(info: DropInfo) {
+    guard let source = draggingKey, source != targetKey else { return }
+    withAnimation(.easeInOut(duration: 0.16)) {
+      onMove(source, targetKey)
+    }
+  }
+
+  func dropUpdated(info: DropInfo) -> DropProposal? {
+    DropProposal(operation: .move)
+  }
+
+  func performDrop(info: DropInfo) -> Bool {
+    draggingKey = nil
+    return true
+  }
+}
+
 struct ContentView: View {
   @ObservedObject var vm: MeterViewModel
   @State private var searchText: String = ""
   @State private var hoveredPane: SettingsPane? = nil
+  @State private var draggingProviderKey: String? = nil
 
   private let appPanes: [SettingsAppPaneItem] = [
     SettingsAppPaneItem(id: "general", pane: .general, title: "通用", icon: "gearshape"),
@@ -31,22 +55,18 @@ struct ContentView: View {
     return appPanes.filter { $0.title.lowercased().contains(q) }
   }
 
-  private var providerKeys: [String] {
-    let preferred = ["codex", "cursor", "antigravity", "codebuddy"]
-    let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard !q.isEmpty else { return preferred }
-    return preferred.filter {
-      vm.toolShortTitle(for: $0).lowercased().contains(q) || vm.displayTitle(for: $0).lowercased().contains(q)
-    }
+  private var isSearching: Bool {
+    !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
-  private var filteredExternalProviders: [ExternalProviderMeta] {
+  private var unifiedProviderKeys: [String] {
+    let all = vm.orderedAllProviderKeys
     let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard !q.isEmpty else { return vm.externalProviders }
-    return vm.externalProviders.filter {
-      $0.name.lowercased().contains(q) ||
-      $0.shortName.lowercased().contains(q) ||
-      $0.key.lowercased().contains(q)
+    guard !q.isEmpty else { return all }
+    return all.filter { key in
+      vm.toolShortTitle(for: key).lowercased().contains(q) ||
+      vm.displayTitle(for: key).lowercased().contains(q) ||
+      key.lowercased().contains(q)
     }
   }
 
@@ -134,47 +154,17 @@ struct ContentView: View {
                 }
               }
 
-              if !providerKeys.isEmpty {
-                Text("提供商")
-                  .font(.system(size: 11, weight: .medium))
-                  .foregroundColor(.secondary)
-                  .padding(.horizontal, 10)
-                  .padding(.top, 14)
-                  .padding(.bottom, 4)
-
-                ForEach(providerKeys, id: \.self) { key in
-                  let entry = vm.apps[key]
-                  let installed = entry?.installed ?? false
-                  let enabled = vm.isToolEnabled(key)
-                  let isSelected = vm.settingsPane == .provider(key)
-                  let dotColor: Color = {
-                    if !installed || !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.35) }
-                    if entry?.cdpPort == nil { return .orange }
-                    return Color(red: 0.20, green: 0.72, blue: 0.42)
-                  }()
-
-                  sidebarRow(pane: .provider(key), isSelected: isSelected) {
-                    ToolGlyph.iconView(for: key, size: 14)
-                      .foregroundColor(installed && enabled && vm.isActiveOverall ? .primary : .secondary.opacity(0.6))
-                      .frame(width: 18)
-                    Text(vm.toolShortTitle(for: key))
-                      .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
-                      .foregroundColor(installed && enabled && vm.isActiveOverall ? .primary : .secondary)
-                      .lineLimit(1)
-                    Spacer(minLength: 4)
-                    Circle()
-                      .fill(dotColor)
-                      .frame(width: 6, height: 6)
-                  }
-                }
-              }
-
-              if !filteredExternalProviders.isEmpty {
+              if !unifiedProviderKeys.isEmpty {
                 HStack {
-                  Text("外部插件")
+                  Text("提供商")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.secondary)
                   Spacer()
+                  if !isSearching {
+                    Text("拖动排序")
+                      .font(.system(size: 9.5))
+                      .foregroundColor(.secondary.opacity(0.6))
+                  }
                   Button {
                     vm.pickAndImportPluginFiles()
                   } label: {
@@ -189,27 +179,62 @@ struct ContentView: View {
                 .padding(.top, 14)
                 .padding(.bottom, 4)
 
-                ForEach(filteredExternalProviders) { meta in
-                  let enabled = vm.isToolEnabled(meta.key)
-                  let isSelected = vm.settingsPane == .provider(meta.key)
+                ForEach(unifiedProviderKeys, id: \.self) { key in
+                  let isExternal = vm.isExternalProvider(key)
+                  let meta = isExternal ? vm.externalProviderMeta(for: key) : nil
+                  let entry = isExternal ? nil : vm.apps[key]
+                  let installed = isExternal ? true : (entry?.installed ?? false)
+                  let enabled = vm.isToolEnabled(key)
+                  let pane = SettingsPane.provider(key)
+                  let isSelected = vm.settingsPane == pane
+                  let isHovered = hoveredPane == pane
                   let dotColor: Color = {
-                    if !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.35) }
-                    if meta.ok == false { return .orange }
+                    if !installed || !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.35) }
+                    if isExternal {
+                      return meta?.ok == false ? .orange : Color(red: 0.20, green: 0.72, blue: 0.42)
+                    }
+                    if entry?.cdpPort == nil { return .orange }
                     return Color(red: 0.20, green: 0.72, blue: 0.42)
                   }()
 
-                  sidebarRow(pane: .provider(meta.key), isSelected: isSelected) {
-                    ToolGlyph.iconView(for: meta.key, sfSymbolOverride: meta.icon, size: 14)
-                      .foregroundColor(enabled && vm.isActiveOverall ? .primary : .secondary.opacity(0.6))
+                  let rowView = sidebarRow(pane: pane, isSelected: isSelected) {
+                    ToolGlyph.iconView(for: key, sfSymbolOverride: vm.toolIconSymbol(for: key), size: 14)
+                      .foregroundColor(installed && enabled && vm.isActiveOverall ? .primary : .secondary.opacity(0.6))
                       .frame(width: 18)
-                    Text(meta.shortName)
+                    Text(vm.toolShortTitle(for: key))
                       .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
-                      .foregroundColor(enabled && vm.isActiveOverall ? .primary : .secondary)
+                      .foregroundColor(installed && enabled && vm.isActiveOverall ? .primary : .secondary)
                       .lineLimit(1)
                     Spacer(minLength: 4)
+                    if isHovered && !isSearching {
+                      Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(.secondary.opacity(0.55))
+                    }
                     Circle()
                       .fill(dotColor)
                       .frame(width: 6, height: 6)
+                  }
+                  .opacity(draggingProviderKey == key ? 0.45 : 1.0)
+
+                  if isSearching {
+                    rowView
+                  } else {
+                    rowView
+                      .onDrag {
+                        draggingProviderKey = key
+                        return NSItemProvider(object: key as NSString)
+                      }
+                      .onDrop(
+                        of: [UTType.plainText],
+                        delegate: ProviderReorderDropDelegate(
+                          targetKey: key,
+                          draggingKey: $draggingProviderKey,
+                          onMove: { src, dst in
+                            vm.moveProvider(from: src, to: dst)
+                          }
+                        )
+                      )
                   }
                 }
               }
@@ -381,6 +406,7 @@ struct ContentView: View {
   ) -> some View {
     let isHovered = hoveredPane == pane
     return Button {
+      draggingProviderKey = nil
       vm.openSettingsPane(pane)
     } label: {
       HStack(spacing: 8) {
@@ -397,8 +423,14 @@ struct ContentView: View {
     }
     .buttonStyle(.plain)
     .onHover { inside in
-      if inside { hoveredPane = pane }
-      else if hoveredPane == pane { hoveredPane = nil }
+      if inside {
+        if draggingProviderKey != nil && NSEvent.pressedMouseButtons == 0 {
+          draggingProviderKey = nil
+        }
+        hoveredPane = pane
+      } else if hoveredPane == pane {
+        hoveredPane = nil
+      }
     }
   }
 }

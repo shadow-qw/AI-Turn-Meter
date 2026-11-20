@@ -265,31 +265,32 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
 
   private func buildTooltip() -> String {
     var lines = ["AI Turn Meter v\(vm.version)"]
-    for key in vm.orderedKeys {
-      guard let entry = vm.apps[key], entry.installed else { continue }
-      let title = vm.displayTitle(for: key)
-      if !vm.isActiveOverall || !vm.isToolEnabled(key) {
-        lines.append("\(title): 已暂停")
-      } else if let inline = entry.latestTurn?.inlineText {
-        lines.append("\(title): \(inline)")
+    for key in vm.orderedAllProviderKeys {
+      if vm.isExternalProvider(key) {
+        guard let meta = vm.externalProviderMeta(for: key), vm.isToolEnabled(key) else { continue }
+        if !vm.isActiveOverall {
+          lines.append("\(meta.name): 已暂停")
+        } else if let card = vm.usageData?.cards?[meta.key] {
+          let sym = card.resolvedCurrencySymbol
+          if let firstWin = card.quotaWindows?.first {
+            let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: firstWin.remainingPct).rounded())
+            let costPart = (card.billingSummary?.periodCost ?? card.days30.costUsd).map { " · \(MeterFormat.money($0, symbol: sym))" } ?? ""
+            lines.append("\(meta.name): \(firstWin.title) \(vm.quotaDisplayMode.verbLabel)\(pct)%\(costPart)")
+          } else if let hint = card.quotaHint {
+            lines.append("\(meta.name): \(hint)")
+          } else {
+            lines.append("\(meta.name): \(card.statusText ?? "已同步")")
+          }
+        }
       } else {
-        lines.append("\(title): 等待新对话")
-      }
-    }
-    for meta in vm.externalProviders {
-      guard vm.isToolEnabled(meta.key) else { continue }
-      if !vm.isActiveOverall {
-        lines.append("\(meta.name): 已暂停")
-      } else if let card = vm.usageData?.cards?[meta.key] {
-        let sym = card.resolvedCurrencySymbol
-        if let firstWin = card.quotaWindows?.first {
-          let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: firstWin.remainingPct).rounded())
-          let costPart = (card.billingSummary?.periodCost ?? card.days30.costUsd).map { " · \(MeterFormat.money($0, symbol: sym))" } ?? ""
-          lines.append("\(meta.name): \(firstWin.title) \(vm.quotaDisplayMode.verbLabel)\(pct)%\(costPart)")
-        } else if let hint = card.quotaHint {
-          lines.append("\(meta.name): \(hint)")
+        guard let entry = vm.apps[key], entry.installed else { continue }
+        let title = vm.displayTitle(for: key)
+        if !vm.isActiveOverall || !vm.isToolEnabled(key) {
+          lines.append("\(title): 已暂停")
+        } else if let inline = entry.latestTurn?.inlineText {
+          lines.append("\(title): \(inline)")
         } else {
-          lines.append("\(meta.name): \(card.statusText ?? "已同步")")
+          lines.append("\(title): 等待新对话")
         }
       }
     }

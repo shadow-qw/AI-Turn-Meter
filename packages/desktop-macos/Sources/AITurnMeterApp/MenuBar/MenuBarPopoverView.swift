@@ -16,14 +16,11 @@ private struct ProviderSwitcherBar: View {
 
   private var switcherKeys: [String] {
     let useFallback = vm.apps.isEmpty
-    let builtIn = ["codex", "cursor", "antigravity", "codebuddy"].filter { key in
+    let ordered = vm.orderedAllProviderKeys.filter { key in
       let available = useFallback ? true : isToolAvailable(key)
       return available && vm.isToolEnabled(key)
     }
-    let external = vm.externalProviderKeys.filter { key in
-      vm.isToolEnabled(key)
-    }
-    return ["all"] + builtIn + external
+    return ["all"] + ordered
   }
 
   private func indicatorFraction(for key: String, installed: Bool, active: Bool) -> Double {
@@ -348,7 +345,10 @@ private struct CodexBarStyleCardView: View {
       dividerLine
 
       // Primary Quota Windows (Remaining % + Reset countdown + Pace marker)
-      let windows = card.quotaWindows ?? []
+      let rawWindows = card.quotaWindows ?? []
+      let windows = isAll
+        ? ProviderOrder.sortOverviewWindows(rawWindows, by: vm.orderedAllProviderKeys)
+        : rawWindows
       if !windows.isEmpty {
         VStack(alignment: .leading, spacing: 8) {
           ForEach(windows) { win in

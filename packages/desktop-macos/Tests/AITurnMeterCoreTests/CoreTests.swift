@@ -191,4 +191,25 @@ struct AITurnMeterCoreTests {
     #expect(card.billingSummary?.periodRemaining == 625.0)
     #expect(card.breakdowns?.first?.items.first?.name == "pro-model")
   }
+
+  @Test("ProviderOrder resolves saved order, moves built-in and external providers, and sorts overview windows")
+  func providerOrderResolveMoveAndSort() {
+    let available = ["codex", "cursor", "antigravity", "codebuddy", "ext:gw", "ext:extra"]
+    let resolved = ProviderOrder.resolve(saved: ["ext:gw", "cursor", "removed-key"], available: available)
+    #expect(resolved == ["ext:gw", "cursor", "codex", "antigravity", "codebuddy", "ext:extra"])
+
+    let moved = ProviderOrder.move(order: resolved, from: "codex", to: "ext:gw")
+    #expect(moved == ["codex", "ext:gw", "cursor", "antigravity", "codebuddy", "ext:extra"])
+
+    let movedToEnd = ProviderOrder.move(order: moved, from: "codex", to: "ext:extra")
+    #expect(movedToEnd == ["ext:gw", "cursor", "antigravity", "codebuddy", "ext:extra", "codex"])
+
+    let windows = [
+      CardQuotaWindow(id: "overview-codex", title: "Codex", remainingPct: 80),
+      CardQuotaWindow(id: "overview-cursor", title: "Cursor", remainingPct: 50),
+      CardQuotaWindow(id: "overview-ext:gw", title: "GW", remainingPct: 30),
+    ]
+    let sorted = ProviderOrder.sortOverviewWindows(windows, by: ["ext:gw", "cursor", "codex"])
+    #expect(sorted.map(\.id) == ["overview-ext:gw", "overview-cursor", "overview-codex"])
+  }
 }

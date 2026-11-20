@@ -310,7 +310,10 @@ struct UsageSummaryTabView: View {
             }
 
             // External Provider Plugin Cards (kept separate from local USD token estimates)
-            let activeExternal = vm.externalProviders.filter { vm.isToolEnabled($0.key) }
+            let activeExternal: [ExternalProviderMeta] = vm.orderedAllProviderKeys.compactMap { key in
+              guard vm.isExternalProvider(key), vm.isToolEnabled(key) else { return nil }
+              return vm.externalProviderMeta(for: key)
+            }
             if !activeExternal.isEmpty {
               SettingsGroupCard {
                 VStack(alignment: .leading, spacing: 10) {

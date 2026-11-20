@@ -223,6 +223,76 @@ public struct CardQuotaWindow: Decodable, Identifiable {
   public let resetText: String?
   public let pacePct: Double?
   public let subtitle: String?
+
+  public init(
+    id: String,
+    title: String,
+    remainingPct: Double,
+    resetText: String? = nil,
+    pacePct: Double? = nil,
+    subtitle: String? = nil
+  ) {
+    self.id = id
+    self.title = title
+    self.remainingPct = remainingPct
+    self.resetText = resetText
+    self.pacePct = pacePct
+    self.subtitle = subtitle
+  }
+}
+
+public enum ProviderOrder {
+  public static let defaultBuiltIn: [String] = ["codex", "cursor", "antigravity", "codebuddy"]
+
+  public static func resolve(saved: [String], available: [String]) -> [String] {
+    let availSet = Set(available)
+    var seen = Set<String>()
+    var out: [String] = []
+    for key in saved where availSet.contains(key) && !seen.contains(key) {
+      seen.insert(key)
+      out.append(key)
+    }
+    for key in available where !seen.contains(key) {
+      seen.insert(key)
+      out.append(key)
+    }
+    return out
+  }
+
+  public static func move(order: [String], from sourceKey: String, to targetKey: String) -> [String] {
+    guard sourceKey != targetKey,
+          let fromIdx = order.firstIndex(of: sourceKey),
+          let toIdx = order.firstIndex(of: targetKey) else {
+      return order
+    }
+    var next = order
+    let item = next.remove(at: fromIdx)
+    next.insert(item, at: toIdx)
+    return next
+  }
+
+  public static func sortOverviewWindows(
+    _ windows: [CardQuotaWindow],
+    by order: [String]
+  ) -> [CardQuotaWindow] {
+    guard windows.count > 1, !order.isEmpty else { return windows }
+    var rankMap: [String: Int] = [:]
+    for (idx, key) in order.enumerated() {
+      rankMap[key] = idx
+    }
+    return windows.enumerated().sorted { lhs, rhs in
+      let lKey = lhs.element.id.hasPrefix("overview-")
+        ? String(lhs.element.id.dropFirst("overview-".count))
+        : lhs.element.id
+      let rKey = rhs.element.id.hasPrefix("overview-")
+        ? String(rhs.element.id.dropFirst("overview-".count))
+        : rhs.element.id
+      let lRank = rankMap[lKey] ?? Int.max
+      let rRank = rankMap[rKey] ?? Int.max
+      if lRank != rRank { return lRank < rRank }
+      return lhs.offset < rhs.offset
+    }.map(\.element)
+  }
 }
 
 public struct CodexBarCardSnapshot: Decodable {
