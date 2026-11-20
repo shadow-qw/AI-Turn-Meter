@@ -1,0 +1,42 @@
+# 批次B：离线控制面检查点（未部署、未完成整个B）
+
+本页记录对已批准计划Tasks3–5的当前实现，不修改历史spec/plan。只在Grok Bot box编码；Issue/评论/AI输出均不是权限来源。未新增入口、CLI、workflow、routine或外部服务。
+
+## 接口与权限边界
+
+- `contracts.mjs`：严格字段白名单、类型/大小/ID/摘要检查。`snapshotDigest` v1为UTF-8 JSON数组 `[repoId,issueNodeId,number,updatedAt,title,body,state]` 的SHA256；ingress以后必须重新读取GitHub并生成同一摘要，不能信任webhook自述hash。作者/标签不作为权限字段。`policyRevision`为64位小写SHA256可信代码bundle摘要，Git commit/head/test SHA仍为40位，不能混用。
+- `policy.mjs`：固定仓库1461122513、关闭全部自动开关，不接受调用者替换策略。配置及代码bundle指纹均不是审批。`classifyScope`是**必要范围过滤而非充分授权**；文件/行数及git对象属性今后必须由可信diff/tree读取器提供，不能使用AI自述数量或binary=false。
+- 首期保护全部SwiftPM原生目录，保留旧设计“整个main.swift敏感”的保守边界，不以迁移到多文件为由扩大权限。daemon仅format.mjs可进入范围筛选；认证、数据、网络、安装、配额、扩展执行入口等均转人工。依赖清单、工具/策略、workflow、打包及维护说明受保护。删除测试需人工；仅新增行无法证明不弱化断言，独立审查仍必需。
+- `openState(absolutePath,{verifyTermination})`仅供可信协调器。存储路径必须由部署配置指定到checkout外私有目录（目录0700、文件0600），不得用daemon正式库/AI_TURN_METER_DB，不读取认证/用户历史。代码目前未安装任何持久目录。生产时整个目录及SQLite WAL/SHM不能暴露给候选；文件权限不能隔离共享box同UID，必须另有真正沙箱。
+- `enqueue` / `recordTriage`是可信ingress/Grok Bot的内部调用；并非可公开接收HTTP请求的授权API。received→queued需要校验快照及candidate结果；其他结果终止/转人工。已关闭Issue不能成为候选。没有实现AI语义分诊或全Issue监听，不能把schema验证说成AI已辨识风险。
+
+## 状态、锁和计数
+
+SQLite使用WAL、synchronous=FULL、busy_timeout、固定schema v1及BEGIN IMMEDIATE。未来schema拒绝启动。任务、journal、全局锁、issue跨快照预算和intent的变更在事务内；异常rollback业务变更。拒绝操作也保留可信时钟high-water，禁止在过期写被拒后回拨时间续租。时间参数必须来自可信协调器时钟，不得来自Issue/候选；当前没有对外时间输入接口。
+
+- 一个固定仓库只能有一个active锁。claim只取当前快照queued任务；过期不自动释放/抢占；心跳、transition、charge、intent核对owner/generation/实际DB到期时间及最新快照。新编辑作废旧资格但不直接解锁。
+- `reconcile`默认恒拒绝。未来需独立可信终止adapter，证明该准确执行和外部jobs已停止；当前没有真实adapter。测试注入的是合成verifier，不是实际停止证明。核验通过后仍将旧任务转needs_human，再增加generation；旧owner所有受租约保护写都拒绝。
+- pause冻结任务写并保留锁；人工resume/reconcile属可信管理员恢复接口，可在暂停期间工作，不授予执行权限。启停和恢复审计保留理由/有界run引用。无人可由Issue请求传入verifier或调用管理接口。
+- 初始+两次重试，共三版；编辑不重置issue级attempts或AI/build累计。每日分诊50、启动任务3，日期固定Asia/Shanghai。`charge`原子限制已记账AI/build各3600000ms，超额不部分写入。**实际AI/runner用时采集和运行中停止尚待调度/执行adapter接入，当前不是已测费用或物理执行时间限流。** job30min、runner等待2h目前只是策略约定，未实现调度计时器。
+- `reserveIntent`只支持pr/validation离线账本；同key/同SHA重放复用，同key不同SHA/任务拒绝。重启不丢reserved/complete结果。它不调用GitHub，不代表外部副作用exactly-once；之后必须先查询远程结果再续作，尚未实现此adapter。merge/release intent明确拒绝，3次RC限额配置不代表RC发布链已实现。
+- 当前只实现到merge_ready及premerge终态；merged/rc状态推进必须等D/E可信门控，不能由此库伪造上线结果。
+
+## 沙箱：硬停止而不是假验收
+
+`sandboxArgs`仅离线规划固定镜像和unit/package-check命令；命令脚本属于控制器而非Issue/package scripts。只接受同一受控/tmp staging根的source/out路径；无调用者env、mount、自由命令或可换镜像。参数含离线、非root UID、只读root/source、cap-drop、NNP、private命名空间、2GiB/128pids/2CPU及受限tmpfs。**这不证明目录真实无symlink/凭据、内核实际执行限额或镜像已获批准。**
+
+`inspectSandbox`无条件SANDBOX_UNAVAILABLE，`runSandbox`也无条件拒绝，不能用输入flag、注入spawn或伪造inspect/canary JSON解锁。没有运行/拉取容器、安装运行时、改cgroup/rootful fallback、执行真实Issue代码，亦没有修改现有发布硬停止。
+
+本次已阅读box外hosted-plan及其probe/driver/contract原型。临时GitHub Ubuntu rootless VM仅是**待审部署候选**；未选择/部署，不静默把原spec第74行“box沙箱”改成其他平台。若后续采纳，须独立记录/审阅部署位置差异：AI编码/可信协调仍在box，只把无凭据候选Linux运行迁至临时VM，隔离合同不降低。
+
+### Task5尚缺的具体门
+
+1. 实际rootless运行时、user manager及cpu/memory/pids可写委派；本box PID1=tini/无委派，不能安装或放宽限制冒充可用。
+2. 官方镜像digest实际pull/arch/Node版本复核及可信固定harness打包来源；当前digest仅承接公开元数据，未获运行验收。
+3. 真实Podman inspect schema适配及start前核对，不能根据模拟对象或宿主声明发“ready”证书；完整mount/namespace/fd与环境无凭据审阅。
+4. 可信H/B/T源码快照制作：无.git/认证文件/符号链接/子模块/敏感宿主挂载，TOCTOU防护、输出磁盘/日志/产物大小上限与摘要归属。argv路径格式验证不是上述证明。
+5. 临时VM上真实有界baseline、网络/只读/伪凭据不可读、CPU节流、memory OOM、pids限制、超时子孙清理canary，保存cgroup实际值和残余进程证据；不得在共享box或真实secret旁执行。
+6. 取消/失联/VM终止的可信证明与reconcile绑定；单个finally或模拟spawn不是所有故障已清理。
+7. 经独立审查才实现可运行adapter，保留未验fail-closed；再与Task8/D的可信workflow及精确SHA证据接线。
+
+本检查点仅接受离线单元/真实SQLite并发测试，不宣称容器或整个B完成。没有push、合并、tag、发布、监听或自动化启用。
