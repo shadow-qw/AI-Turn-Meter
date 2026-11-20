@@ -145,6 +145,7 @@ final class MeterViewModel: ObservableObject {
   @Published var providerOrder: [String] = UserDefaults.standard.stringArray(forKey: PrefKey.providerOrder) ?? ProviderOrder.defaultBuiltIn
   @Published var providersDir: String = (NSHomeDirectory() as NSString).appendingPathComponent(".local/share/ai-turn-meter/providers")
   @Published var showPluginCodeSheet: Bool = false
+  @Published var pluginLoginKey: String? = nil
   @Published var pluginImportBusy: Bool = false
 
   @Published var busy: Bool = false
@@ -481,6 +482,77 @@ export default {
     }.resume()
   }
 
+  func startPluginLogin(_ key: String) {
+    guard let meta = externalProviderMeta(for: key), meta.auth?.isWebCookie == true else {
+      bannerIsError = true
+      statusBanner = "该插件未声明网页登录方式"
+      return
+    }
+    pluginLoginKey = key
+  }
+
+  func savePluginCredentials(key: String, credentials: [String: Any]) {
+    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/auth"),
+          let body = try? JSONSerialization.data(withJSONObject: ["key": key, "credentials": credentials]) else { return }
+    bannerIsError = false
+    statusBanner = "已获取登录凭证，正在同步额度…"
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 20)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = body
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        struct AuthRes: Decodable {
+          let ok: Bool?
+          let error: String?
+          let providers: [ExternalProviderMeta]?
+        }
+        let http = resp as? HTTPURLResponse
+        let parsed = data.flatMap { try? JSONDecoder().decode(AuthRes.self, from: $0) }
+        if err == nil, http?.statusCode == 200, parsed?.ok == true {
+          if let list = parsed?.providers { self.applyExternalProviders(list) }
+          self.bannerIsError = false
+          self.statusBanner = "登录授权成功"
+          self.fetchAppsStatusHttp(forceRefresh: true)
+          self.fetchUsageSummary(silent: false, forceRefresh: true)
+        } else {
+          self.bannerIsError = true
+          self.statusBanner = parsed?.error ?? err?.localizedDescription ?? "保存登录凭证失败"
+        }
+      }
+    }.resume()
+  }
+
+  func clearPluginCredentials(_ key: String) {
+    guard let enc = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/auth?key=\(enc)") else { return }
+    if let auth = externalProviderMeta(for: key)?.auth, auth.isWebCookie {
+      let domains = (auth.cookieDomains ?? []).map { $0.lowercased() }
+      let store = WKWebsiteDataStore.default().httpCookieStore
+      store.getAllCookies { cookies in
+        for c in cookies {
+          let cd = c.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+          if domains.contains(where: { cd == $0 || $0.hasSuffix("." + cd) || cd.hasSuffix("." + $0) }) {
+            store.delete(c, completionHandler: nil)
+          }
+        }
+      }
+    }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 15)
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, _, _ in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        struct Res: Decodable { let providers: [ExternalProviderMeta]? }
+        if let d = data, let r = try? JSONDecoder().decode(Res.self, from: d), let list = r.providers {
+          self.applyExternalProviders(list)
+        }
+        self.bannerIsError = false
+        self.statusBanner = "已清除登录凭证"
+        self.fetchUsageSummary(silent: true, forceRefresh: true)
+      }
+    }.resume()
+  }
+
   func reloadExternalProviders() {
     guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/reload") else { return }
     var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 15)
@@ -586,6 +658,20 @@ export default {
       UserDefaults.standard.set(true, forKey: PrefKey.showMenuBarSummary)
     }
     onPreferencesChanged?()
+  }
+
+  /// One-click: show this provider in the menu bar with the given text style.
+  /// `mode == nil` restores automatic selection.
+  func pinProviderToMenuBar(_ key: String, mode: MenuBarDisplayMode?) {
+    if !showMenuBarExtra { setShowMenuBarExtra(true) }
+    guard let mode = mode else {
+      setMenuBarProvider("auto")
+      return
+    }
+    setMenuBarProvider(key)
+    setMenuBarDisplayMode(mode)
+    bannerIsError = false
+    statusBanner = "已在菜单栏显示 \(toolShortTitle(for: key))"
   }
 
   func setMenuBarProvider(_ provider: String) {

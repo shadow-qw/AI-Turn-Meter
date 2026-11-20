@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -10,7 +11,7 @@ import {
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { basename, extname, join } from 'node:path';
+import { basename, dirname, extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { httpRequestJson, httpRequestRaw } from './net.mjs';
 import { computeQuotaWindow, formatDurationZh } from './quota.mjs';
@@ -21,7 +22,18 @@ const VALID_EXT_KEY_RE = /^ext:[a-z0-9][a-z0-9_-]{0,31}$/;
 const VALID_PLUGIN_FILENAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}\.mjs$/;
 const VALID_ICON_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 const VALID_HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+const VALID_DOMAIN_RE = /^[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$/;
 const MAX_PLUGIN_BYTES = 256 * 1024;
+const DEFAULT_AUTH_EXCLUDE_KEYWORDS = [
+  'login',
+  'signin',
+  'sign-in',
+  'auth',
+  'oauth',
+  'passport',
+  'sso',
+  'callback',
+];
 
 const DEFAULT_CACHE_TTL_MS = 45_000;
 const MIN_CACHE_TTL_MS = 5_000;
@@ -62,6 +74,177 @@ function sanitizeHttpUrl(raw) {
     }
   } catch {}
   return null;
+}
+
+function normalizeStringList(raw, { max = 20, maxLen = 128, lower = false } = {}) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    let s = item.trim();
+    if (!s) continue;
+    if (lower) s = s.toLowerCase();
+    s = s.slice(0, maxLen);
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function normalizeAuthConfig(rawAuth) {
+  if (!rawAuth || typeof rawAuth !== 'object') return null;
+  const loginUrl = sanitizeHttpUrl(rawAuth.loginUrl);
+  const rawType =
+    typeof rawAuth.type === 'string' && rawAuth.type.trim()
+      ? rawAuth.type.trim().toLowerCase()
+      : loginUrl
+        ? 'web_cookie'
+        : 'token';
+  if (rawType !== 'web_cookie' && rawType !== 'token') return null;
+  if (rawType === 'web_cookie' && !loginUrl) return null;
+
+  let cookieDomains = normalizeStringList(rawAuth.cookieDomains, {
+    max: 10,
+    maxLen: 128,
+    lower: true,
+  })
+    .map((d) => d.replace(/^\.+/, ''))
+    .filter((d) => VALID_DOMAIN_RE.test(d));
+  if (cookieDomains.length === 0 && loginUrl) {
+    try {
+      const host = new URL(loginUrl).hostname.toLowerCase();
+      if (VALID_DOMAIN_RE.test(host)) cookieDomains = [host];
+    } catch {}
+  }
+
+  const requiredCookies = normalizeStringList(rawAuth.requiredCookies, { max: 20, maxLen: 128 });
+  const successUrlPrefixes = Array.isArray(rawAuth.successUrlPrefixes)
+    ? rawAuth.successUrlPrefixes
+        .map((u) => sanitizeHttpUrl(u))
+        .filter(Boolean)
+        .slice(0, 10)
+    : [];
+  const excludePathKeywords =
+    Array.isArray(rawAuth.excludePathKeywords) && rawAuth.excludePathKeywords.length > 0
+      ? normalizeStringList(rawAuth.excludePathKeywords, { max: 20, maxLen: 64, lower: true })
+      : [...DEFAULT_AUTH_EXCLUDE_KEYWORDS];
+  const captureStorageKeys = normalizeStringList(rawAuth.captureStorageKeys, {
+    max: 30,
+    maxLen: 128,
+  });
+
+  const label =
+    typeof rawAuth.label === 'string' && rawAuth.label.trim()
+      ? rawAuth.label.trim().slice(0, 32)
+      : rawType === 'web_cookie'
+        ? '网页登录授权'
+        : '配置凭证';
+  const hint =
+    typeof rawAuth.hint === 'string' && rawAuth.hint.trim()
+      ? rawAuth.hint.trim().slice(0, 180)
+      : null;
+
+  return {
+    type: rawType,
+    loginUrl: loginUrl || null,
+    cookieDomains,
+    requiredCookies,
+    successUrlPrefixes,
+    excludePathKeywords,
+    captureStorageKeys,
+    label,
+    hint,
+  };
+}
+
+function sanitizeStringRecord(raw, { maxEntries = 100, maxKeyLen = 128, maxValLen = 32768 } = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  let count = 0;
+  for (const [k, v] of Object.entries(raw)) {
+    if (count >= maxEntries) break;
+    const key = String(k || '').trim().slice(0, maxKeyLen);
+    if (!key || typeof v !== 'string') continue;
+    out[key] = v.slice(0, maxValLen);
+    count += 1;
+  }
+  return count > 0 ? out : null;
+}
+
+export function sanitizeCredentialsInput(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  let cookie =
+    typeof raw.cookie === 'string' && raw.cookie.trim()
+      ? raw.cookie.trim().slice(0, 65536)
+      : null;
+  const cookies = sanitizeStringRecord(raw.cookies, {
+    maxEntries: 120,
+    maxKeyLen: 128,
+    maxValLen: 8192,
+  });
+  if (!cookie && cookies) {
+    cookie = Object.entries(cookies)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ')
+      .slice(0, 65536);
+  }
+  const token =
+    typeof raw.token === 'string' && raw.token.trim()
+      ? raw.token.trim().slice(0, 16384)
+      : null;
+  const userAgent =
+    typeof raw.userAgent === 'string' && raw.userAgent.trim()
+      ? raw.userAgent.trim().slice(0, 512)
+      : null;
+  const origin = sanitizeHttpUrl(raw.origin);
+
+  let storage = null;
+  if (raw.storage && typeof raw.storage === 'object' && !Array.isArray(raw.storage)) {
+    const local = sanitizeStringRecord(raw.storage.local, {
+      maxEntries: 64,
+      maxKeyLen: 128,
+      maxValLen: 32768,
+    });
+    const session = sanitizeStringRecord(raw.storage.session, {
+      maxEntries: 64,
+      maxKeyLen: 128,
+      maxValLen: 32768,
+    });
+    if (local || session) {
+      storage = {
+        ...(local ? { local } : {}),
+        ...(session ? { session } : {}),
+      };
+    }
+  }
+
+  let extra = null;
+  if (raw.extra && typeof raw.extra === 'object' && !Array.isArray(raw.extra)) {
+    try {
+      const serialized = JSON.stringify(raw.extra);
+      if (serialized && serialized.length <= 32768 && serialized !== '{}') {
+        extra = JSON.parse(serialized);
+      }
+    } catch {}
+  }
+
+  if (!cookie && !token && !storage && !extra) return null;
+
+  return {
+    ...(cookie ? { cookie } : {}),
+    ...(cookies ? { cookies } : {}),
+    ...(token ? { token } : {}),
+    ...(userAgent ? { userAgent } : {}),
+    ...(origin ? { origin } : {}),
+    ...(storage ? { storage } : {}),
+    ...(extra ? { extra } : {}),
+    savedAtMs: typeof raw.savedAtMs === 'number' && Number.isFinite(raw.savedAtMs)
+      ? raw.savedAtMs
+      : Date.now(),
+  };
 }
 
 function sanitizeSlug(raw, fallbackStem) {
@@ -322,6 +505,7 @@ function buildNormalizedCard(meta, raw, { nowMs, stale = false, errorMessage = n
     statusText,
     footnote,
     stale: Boolean(stale || data.stale),
+    needsAuth: Boolean(data.needsAuth),
     accountEmail,
     planTitle,
     quotaWindows,
@@ -489,6 +673,7 @@ function parseLoadedPluginModule(mod, { stem, fileName, filePath }) {
       currency,
       currencySymbol,
       detailUrl: sanitizeHttpUrl(def?.detailUrl ?? mod?.detailUrl),
+      auth: normalizeAuthConfig(def?.auth ?? mod?.auth),
       fileName,
       filePath,
       cacheTtlMs,
@@ -498,14 +683,131 @@ function parseLoadedPluginModule(mod, { stem, fileName, filePath }) {
 }
 
 export class ExternalProviderRegistry {
-  constructor({ providersDir = null } = {}) {
+  constructor({ providersDir = null, credentialsPath = undefined } = {}) {
     this.providersDir = providersDir || defaultExternalProvidersDir();
+    this.credentialsPath =
+      credentialsPath === undefined
+        ? join(dirname(this.providersDir), 'provider-credentials.json')
+        : credentialsPath;
     /** @type {Map<string, { mtimeMs: number, sizeBytes: number, plugin: any, meta: any, loadError: string | null }>} */
     this.moduleCache = new Map();
     /** @type {Map<string, { fetchedAtMs: number, card: any, ok: boolean, error: string | null, lastGoodCard: any, lastGoodAtMs: number }>} */
     this.resultCache = new Map();
     /** @type {Map<string, Promise<any>>} */
     this.inflight = new Map();
+    /** @type {Record<string, any>} */
+    this.credentialsMap = this.loadCredentialsFromDisk();
+  }
+
+  loadCredentialsFromDisk() {
+    if (!this.credentialsPath || !existsSync(this.credentialsPath)) return {};
+    try {
+      chmodSync(this.credentialsPath, 0o600);
+    } catch {}
+    try {
+      const raw = JSON.parse(readFileSync(this.credentialsPath, 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+      const cleaned = {};
+      for (const [k, v] of Object.entries(raw)) {
+        if (!isExternalProviderKey(k)) continue;
+        const sanitized = sanitizeCredentialsInput(v);
+        if (sanitized) cleaned[k] = sanitized;
+      }
+      return cleaned;
+    } catch {
+      return {};
+    }
+  }
+
+  persistCredentials() {
+    if (!this.credentialsPath) return;
+    mkdirSync(dirname(this.credentialsPath), { recursive: true, mode: 0o700 });
+    const tmpPath = `${this.credentialsPath}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`;
+    writeFileSync(tmpPath, `${JSON.stringify(this.credentialsMap, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    renameSync(tmpPath, this.credentialsPath);
+    try {
+      chmodSync(this.credentialsPath, 0o600);
+    } catch {}
+  }
+
+  hasCredentials(key) {
+    return Boolean(isExternalProviderKey(key) && this.credentialsMap[key]);
+  }
+
+  getCredentialsUpdatedAt(key) {
+    const rec = isExternalProviderKey(key) ? this.credentialsMap[key] : null;
+    return typeof rec?.savedAtMs === 'number' ? rec.savedAtMs : null;
+  }
+
+  getCredentials(key) {
+    if (!isExternalProviderKey(key)) return null;
+    const rec = this.credentialsMap[key];
+    if (!rec) return null;
+    try {
+      return JSON.parse(JSON.stringify(rec));
+    } catch {
+      return { ...rec };
+    }
+  }
+
+  setCredentials(key, payload, { merge = false } = {}) {
+    if (!isExternalProviderKey(key)) {
+      throw new Error('无效的插件标识');
+    }
+    const existing = merge ? this.credentialsMap[key] || {} : {};
+    const combined = merge
+      ? {
+          ...existing,
+          ...payload,
+          cookies:
+            existing.cookies || payload?.cookies
+              ? { ...(existing.cookies || {}), ...(payload?.cookies || {}) }
+              : undefined,
+          storage:
+            existing.storage || payload?.storage
+              ? {
+                  local: {
+                    ...(existing.storage?.local || {}),
+                    ...(payload?.storage?.local || {}),
+                  },
+                  session: {
+                    ...(existing.storage?.session || {}),
+                    ...(payload?.storage?.session || {}),
+                  },
+                }
+              : undefined,
+          extra:
+            existing.extra || payload?.extra
+              ? { ...(existing.extra || {}), ...(payload?.extra || {}) }
+              : undefined,
+          savedAtMs: Date.now(),
+        }
+      : { ...payload, savedAtMs: Date.now() };
+    const sanitized = sanitizeCredentialsInput(combined);
+    if (!sanitized) {
+      throw new Error('凭证内容为空或格式无效');
+    }
+    this.credentialsMap[key] = sanitized;
+    this.persistCredentials();
+    this.resultCache.delete(key);
+    return {
+      hasCredentials: true,
+      savedAtMs: sanitized.savedAtMs,
+    };
+  }
+
+  clearCredentials(key) {
+    if (!isExternalProviderKey(key)) return false;
+    const existed = Object.prototype.hasOwnProperty.call(this.credentialsMap, key);
+    if (existed) {
+      delete this.credentialsMap[key];
+      this.persistCredentials();
+    }
+    this.resultCache.delete(key);
+    return existed;
   }
 
   clearCaches() {
@@ -586,7 +888,10 @@ export class ExternalProviderRegistry {
 
     unlinkSync(fullPath);
     this.moduleCache.delete(fullPath);
-    if (resolvedKey) this.resultCache.delete(resolvedKey);
+    if (resolvedKey) {
+      this.resultCache.delete(resolvedKey);
+      this.clearCredentials(resolvedKey);
+    }
     return { deleted: true, fileName: targetFile, key: resolvedKey };
   }
 
@@ -667,6 +972,7 @@ export class ExternalProviderRegistry {
               currency: 'USD',
               currencySymbol: '$',
               detailUrl: null,
+              auth: null,
               fileName: f.fileName,
               filePath: f.filePath,
               cacheTtlMs: DEFAULT_CACHE_TTL_MS,
@@ -701,6 +1007,9 @@ export class ExternalProviderRegistry {
         currency: entry.meta.currency,
         currencySymbol: entry.meta.currencySymbol,
         detailUrl: entry.meta.detailUrl,
+        auth: entry.meta.auth || null,
+        hasCredentials: this.hasCredentials(entry.meta.key),
+        credentialsSavedAtMs: this.getCredentialsUpdatedAt(entry.meta.key),
         fileName: entry.meta.fileName,
         filePath: entry.meta.filePath,
         enabled,
@@ -740,6 +1049,14 @@ export class ExternalProviderRegistry {
         const ctx = {
           nowMs,
           forceRefresh,
+          credentials: this.getCredentials(meta.key),
+          saveCredentials: (patch) => {
+            const clean = sanitizeCredentialsInput(patch);
+            if (!clean) return false;
+            this.setCredentials(meta.key, clean, { merge: true });
+            return true;
+          },
+          clearCredentials: () => this.clearCredentials(meta.key),
           helpers: {
             httpRequestJson,
             httpRequestRaw,
@@ -849,6 +1166,9 @@ export class ExternalProviderRegistry {
         currency: r.meta.currency,
         currencySymbol: r.meta.currencySymbol,
         detailUrl: r.card?.detailUrl || r.meta.detailUrl || null,
+        auth: r.meta.auth || null,
+        hasCredentials: this.hasCredentials(r.meta.key),
+        credentialsSavedAtMs: this.getCredentialsUpdatedAt(r.meta.key),
         fileName: r.meta.fileName,
         filePath: r.meta.filePath,
         enabled: r.enabled,

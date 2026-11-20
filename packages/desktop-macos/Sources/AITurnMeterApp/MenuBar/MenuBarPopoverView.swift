@@ -56,6 +56,7 @@ private struct ProviderSwitcherBar: View {
           .font(.system(size: 9.5, weight: isSelected ? .semibold : .medium))
           .lineLimit(1)
           .minimumScaleFactor(0.72)
+          .frame(height: 13)
           .padding(.horizontal, 2)
 
         GeometryReader { geo in
@@ -229,6 +230,7 @@ private struct CodexBarStyleCardView: View {
   @ObservedObject var vm: MeterViewModel
   let selection: String
   let card: CodexBarCardSnapshot
+  var onLoginRequested: (String) -> Void = { _ in }
   @State private var isCardHovered: Bool = false
 
   private var isAll: Bool { selection == "all" }
@@ -379,9 +381,19 @@ private struct CodexBarStyleCardView: View {
           .foregroundColor(secondaryText)
           .lineLimit(2)
           Spacer(minLength: 4)
-          Text(statusLabel)
-            .font(.system(size: 10, weight: .medium))
-            .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
+          if isExternal, card.needsAuth == true,
+             let auth = vm.externalProviderMeta(for: selection)?.auth, auth.isWebCookie {
+            Button(auth.displayLabel) {
+              onLoginRequested(selection)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
+            .tint(CodexBarPalette.accentBlue)
+          } else {
+            Text(statusLabel)
+              .font(.system(size: 10, weight: .medium))
+              .foregroundColor(isCardHovered ? .white.opacity(0.88) : .secondary)
+          }
         }
       }
 
@@ -426,19 +438,31 @@ private struct CodexBarStyleCardView: View {
       if isBillingOnlyExternal {
         let b = card.billingSummary
         let periodLabel = b?.periodLabel ?? "本月"
-        VStack(alignment: .leading, spacing: 6) {
-          metricGridRow(
-            leftLabel: "今日消耗",
-            leftVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym),
-            rightLabel: "\(periodLabel)已用",
-            rightVal: MeterFormat.money(b?.periodCost ?? card.days30.costUsd, symbol: curSym)
-          )
-          if b?.periodLimit != nil || b?.periodRemaining != nil {
+        if let rem = b?.periodRemaining {
+          VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+              Text("\(periodLabel)剩余余额")
+                .font(.system(size: 10.5))
+                .foregroundColor(secondaryText)
+              Text(MeterFormat.money(rem, symbol: curSym))
+                .font(.system(size: 26, weight: .bold))
+                .monospacedDigit()
+                .foregroundColor(primaryText)
+            }
             metricGridRow(
               leftLabel: "\(periodLabel)限额",
               leftVal: MeterFormat.money(b?.periodLimit, symbol: curSym),
-              rightLabel: "\(periodLabel)剩余",
-              rightVal: MeterFormat.money(b?.periodRemaining, symbol: curSym)
+              rightLabel: "今日消耗",
+              rightVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym)
+            )
+          }
+        } else {
+          VStack(alignment: .leading, spacing: 6) {
+            metricGridRow(
+              leftLabel: "今日消耗",
+              leftVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym),
+              rightLabel: "\(periodLabel)已用",
+              rightVal: MeterFormat.money(b?.periodCost ?? card.days30.costUsd, symbol: curSym)
             )
           }
         }
@@ -703,11 +727,20 @@ private struct PopoverActionRow: View {
   }
 }
 
+private struct PopoverContentHeightKey: PreferenceKey {
+  static var defaultValue: CGFloat = 0
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+    let next = nextValue()
+    if next > 0 { value = next }
+  }
+}
+
 struct MenuBarPopoverView: View {
   @ObservedObject var vm: MeterViewModel
   let onOpenMainTab: (MainTab?) -> Void
   let onCheckUpdates: () -> Void
   let onClosePopover: () -> Void
+  let onContentHeightChanged: (CGFloat) -> Void
 
   private var effectiveSelection: String {
     let candidate = vm.popoverSelection
@@ -764,13 +797,22 @@ struct MenuBarPopoverView: View {
     !vm.runtime.runningFromDmg && (!vm.daemonOnline || !vm.masterEnabled)
   }
 
-  var body: some View {
+  private var popoverContent: some View {
     VStack(alignment: .leading, spacing: 0) {
       ProviderSwitcherBar(vm: vm, selection: $vm.popoverSelection)
 
       Divider().padding(.horizontal, 12).padding(.bottom, 2)
 
-      CodexBarStyleCardView(vm: vm, selection: effectiveSelection, card: activeCard)
+      CodexBarStyleCardView(
+        vm: vm,
+        selection: effectiveSelection,
+        card: activeCard,
+        onLoginRequested: { key in
+          onClosePopover()
+          vm.startPluginLogin(key)
+          onOpenMainTab(nil)
+        }
+      )
 
       if showsContextStrip {
         HStack {
@@ -843,6 +885,26 @@ struct MenuBarPopoverView: View {
       .padding(.top, 3)
       .padding(.bottom, 6)
     }
-    .frame(width: 310)
+    .frame(width: 310, alignment: .top)
+    .fixedSize(horizontal: false, vertical: true)
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      popoverContent
+        .background(
+          GeometryReader { geo in
+            Color.clear.preference(key: PopoverContentHeightKey.self, value: geo.size.height)
+          }
+        )
+      Spacer(minLength: 0)
+    }
+    .frame(minWidth: 310, idealWidth: 310, maxWidth: 310, maxHeight: .infinity, alignment: .top)
+    .onPreferenceChange(PopoverContentHeightKey.self) { height in
+      onContentHeightChanged(height)
+    }
+    .onChange(of: vm.popoverSelection) { _ in
+      CostHistoryFlyoutController.shared.hideImmediately()
+    }
   }
 }

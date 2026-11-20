@@ -196,7 +196,7 @@ function classifyHttpResult(status, text, headers, latencyMs) {
 async function nativeUrlSessionFetchRaw(
   helperBin,
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000 }
+  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, redirect = 'follow' }
 ) {
   const startedAt = Date.now();
   const payload = JSON.stringify({
@@ -205,6 +205,7 @@ async function nativeUrlSessionFetchRaw(
     headers,
     body: body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
     timeoutMs,
+    redirect,
   });
   const res = await runProcessWithStdin(helperBin, ['--net-fetch-json'], payload, timeoutMs + 3000);
   const latencyMs = Date.now() - startedAt;
@@ -214,6 +215,7 @@ async function nativeUrlSessionFetchRaw(
       status: null,
       text: '',
       headers: {},
+      finalUrl: null,
       latencyMs,
       errorKind: 'network',
       errorMessage: res.error || 'native helper failed',
@@ -224,24 +226,27 @@ async function nativeUrlSessionFetchRaw(
     const status = typeof out.status === 'number' ? out.status : null;
     const respHeaders = normalizeResponseHeaders(out.headers);
     const text = typeof out.body === 'string' ? out.body : '';
+    const finalUrl = typeof out.url === 'string' ? out.url : null;
     if (!status) {
       return {
         ok: false,
         status: null,
         text,
         headers: respHeaders,
+        finalUrl,
         latencyMs,
         errorKind: 'network',
         errorMessage: out.error || 'network error',
       };
     }
-    return classifyHttpResult(status, text, respHeaders, latencyMs);
+    return { ...classifyHttpResult(status, text, respHeaders, latencyMs), finalUrl };
   } catch (e) {
     return {
       ok: false,
       status: null,
       text: '',
       headers: {},
+      finalUrl: null,
       latencyMs,
       errorKind: 'network',
       errorMessage: e?.message || 'native parse error',
@@ -350,7 +355,7 @@ async function curlFetchRaw(
 
 export async function httpRequestRaw(
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, fetchImpl = null } = {}
+  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, redirect = 'follow', fetchImpl = null } = {}
 ) {
   const startedAt = Date.now();
   const bodyStr =
@@ -362,18 +367,23 @@ export async function httpRequestRaw(
         method,
         headers,
         body: bodyStr,
+        redirect,
         signal: AbortSignal.timeout(timeoutMs),
       });
       const latencyMs = Date.now() - startedAt;
       const respHeaders = normalizeResponseHeaders(res.headers);
       const text = typeof res.text === 'function' ? await res.text() : '';
-      return classifyHttpResult(res.status, text, respHeaders, latencyMs);
+      return {
+        ...classifyHttpResult(res.status, text, respHeaders, latencyMs),
+        finalUrl: typeof res.url === 'string' && res.url ? res.url : url,
+      };
     } catch (err) {
       return {
         ok: false,
         status: null,
         text: '',
         headers: {},
+        finalUrl: null,
         latencyMs: Date.now() - startedAt,
         errorKind: 'network',
         errorMessage: err?.cause?.code || err?.message || 'fetch failed',
@@ -385,7 +395,13 @@ export async function httpRequestRaw(
   const proxyState = await getProxyState();
 
   if (helperBin && proxyState.hasSystemProxy) {
-    return nativeUrlSessionFetchRaw(helperBin, url, { method, headers, body: bodyStr ?? null, timeoutMs });
+    return nativeUrlSessionFetchRaw(helperBin, url, {
+      method,
+      headers,
+      body: bodyStr ?? null,
+      timeoutMs,
+      redirect,
+    });
   }
 
   try {
@@ -393,15 +409,25 @@ export async function httpRequestRaw(
       method,
       headers,
       body: bodyStr,
+      redirect,
       signal: AbortSignal.timeout(timeoutMs),
     });
     const latencyMs = Date.now() - startedAt;
     const respHeaders = normalizeResponseHeaders(res.headers);
     const text = await res.text();
-    return classifyHttpResult(res.status, text, respHeaders, latencyMs);
+    return {
+      ...classifyHttpResult(res.status, text, respHeaders, latencyMs),
+      finalUrl: typeof res.url === 'string' && res.url ? res.url : url,
+    };
   } catch (err) {
     if (helperBin) {
-      return nativeUrlSessionFetchRaw(helperBin, url, { method, headers, body: bodyStr ?? null, timeoutMs });
+      return nativeUrlSessionFetchRaw(helperBin, url, {
+        method,
+        headers,
+        body: bodyStr ?? null,
+        timeoutMs,
+        redirect,
+      });
     }
     if (proxyState.fallbackProxyUrl) {
       return curlFetchRaw(url, {
@@ -417,6 +443,7 @@ export async function httpRequestRaw(
       status: null,
       text: '',
       headers: {},
+      finalUrl: null,
       latencyMs: Date.now() - startedAt,
       errorKind: 'network',
       errorMessage: err?.cause?.code || err?.message || 'fetch failed',
@@ -426,13 +453,15 @@ export async function httpRequestRaw(
 
 export async function httpRequestJson(
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, fetchImpl = null } = {}
+  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, redirect = 'follow', fetchImpl = null } = {}
 ) {
-  const raw = await httpRequestRaw(url, { method, headers, body, timeoutMs, fetchImpl });
+  const raw = await httpRequestRaw(url, { method, headers, body, timeoutMs, redirect, fetchImpl });
   if (!raw.ok) {
     return {
       ok: false,
       status: raw.status,
+      headers: raw.headers || {},
+      finalUrl: raw.finalUrl || null,
       data: null,
       errorKind: raw.errorKind,
       errorMessage: raw.errorMessage,
@@ -440,8 +469,24 @@ export async function httpRequestJson(
   }
   try {
     const data = raw.text ? JSON.parse(raw.text) : null;
-    return { ok: true, status: raw.status, data, errorKind: 'ok', errorMessage: null };
+    return {
+      ok: true,
+      status: raw.status,
+      headers: raw.headers || {},
+      finalUrl: raw.finalUrl || null,
+      data,
+      errorKind: 'ok',
+      errorMessage: null,
+    };
   } catch {
-    return { ok: false, status: raw.status, data: null, errorKind: 'parse', errorMessage: 'invalid json' };
+    return {
+      ok: false,
+      status: raw.status,
+      headers: raw.headers || {},
+      finalUrl: raw.finalUrl || null,
+      data: null,
+      errorKind: 'parse',
+      errorMessage: 'invalid json',
+    };
   }
 }

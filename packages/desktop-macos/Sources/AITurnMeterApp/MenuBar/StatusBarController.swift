@@ -21,6 +21,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
   private lazy var gaugeTemplateIcon: NSImage = Self.makeGaugeTemplateIcon()
   private var cachedIconKey: IconCacheKey?
   private var cachedIconImage: NSImage?
+  private var lastPopoverHeight: CGFloat = 0
   private lazy var popover: NSPopover = {
     let pop = NSPopover()
     pop.behavior = .transient
@@ -36,13 +37,37 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       },
       onClosePopover: { [weak self] in
         self?.closePopover()
+      },
+      onContentHeightChanged: { [weak self] height in
+        self?.updatePopoverHeight(height)
       }
     ))
-    hosting.sizingOptions = [.preferredContentSize]
+    hosting.sizingOptions = []
     pop.contentViewController = hosting
     CostHistoryFlyoutController.shared.anchorPopover = pop
     return pop
   }()
+
+  private func updatePopoverHeight(_ rawHeight: CGFloat) {
+    guard rawHeight.isFinite, rawHeight > 80 else { return }
+    let screenH = (statusItem?.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
+    let maxH = max(420, screenH - 36)
+    let targetH = min(maxH, ceil(rawHeight))
+    lastPopoverHeight = targetH
+    let targetSize = NSSize(width: 310, height: targetH)
+    if abs(popover.contentSize.height - targetSize.height) < 0.5 &&
+       abs(popover.contentSize.width - targetSize.width) < 0.5 {
+      return
+    }
+    let wasAnimates = popover.animates
+    popover.animates = false
+    NSAnimationContext.runAnimationGroup { ctx in
+      ctx.duration = 0
+      ctx.allowsImplicitAnimation = false
+      popover.contentSize = targetSize
+    }
+    popover.animates = wasAnimates
+  }
 
   func popoverWillClose(_ notification: Notification) {
     CostHistoryFlyoutController.shared.hideImmediately()
@@ -88,6 +113,16 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     guard let btn = statusItem?.button else { return }
     vm.fetchDaemonStateLight()
     vm.fetchUsageSummary(silent: true)
+    if lastPopoverHeight > 80 {
+      popover.contentSize = NSSize(width: 310, height: lastPopoverHeight)
+    } else if let view = popover.contentViewController?.view {
+      view.frame = NSRect(x: 0, y: 0, width: 310, height: 480)
+      view.layoutSubtreeIfNeeded()
+      let fitH = view.fittingSize.height
+      if fitH > 80 {
+        updatePopoverHeight(fitH)
+      }
+    }
     popover.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
     popover.contentViewController?.view.window?.makeKey()
   }
@@ -241,6 +276,27 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       if !parts.isEmpty { return parts.joined(separator: " · ") }
       guard let today = scopedTodayMetrics() else { return "" }
       return MeterFormat.money(today.cost, symbol: today.symbol)
+    case .remainingAmount, .quotaAndAmount:
+      let keys = vm.menuBarProvider != "auto"
+        ? [vm.menuBarProvider]
+        : vm.allQuotaProviderKeys
+      let withPct = vm.menuBarDisplayMode == .quotaAndAmount
+      var parts: [String] = []
+      for key in keys {
+        guard vm.isToolEnabled(key), let card = vm.usageData?.cards?[key] else { continue }
+        let amount = card.billingSummary?.periodRemaining.map {
+          MeterFormat.compactMoney($0, symbol: card.resolvedCurrencySymbol)
+        }
+        let pct = card.quotaWindows?.first.map {
+          "\(vm.quotaDisplayMode.compactPrefix)\(Int(vm.quotaDisplayMode.displayPct(fromRemaining: $0.remainingPct).rounded()))%"
+        }
+        var pieces: [String] = []
+        if withPct, let pct = pct { pieces.append(pct) }
+        if let amount = amount { pieces.append(amount) }
+        if pieces.isEmpty { continue }
+        parts.append("\(menuBarLabel(for: key)) \(pieces.joined(separator: " · "))")
+      }
+      return parts.joined(separator: " · ")
     case .tps:
       guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider), let tps = turn.tps, tps > 0 else { return "" }
       return MeterFormat.tps(tps)

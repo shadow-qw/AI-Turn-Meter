@@ -170,6 +170,24 @@ public struct CardRecentWindow: Decodable, Identifiable {
   public let turnCount: Int
 }
 
+public struct ExternalProviderAuth: Decodable, Equatable, Sendable {
+  public let type: String
+  public let loginUrl: String?
+  public let cookieDomains: [String]?
+  public let requiredCookies: [String]?
+  public let successUrlPrefixes: [String]?
+  public let excludePathKeywords: [String]?
+  public let captureStorageKeys: [String]?
+  public let label: String?
+  public let hint: String?
+
+  public var isWebCookie: Bool { type == "web_cookie" && loginUrl != nil }
+  public var displayLabel: String {
+    if let l = label, !l.isEmpty { return l }
+    return isWebCookie ? "网页登录授权" : "配置凭证"
+  }
+}
+
 public struct ExternalProviderMeta: Decodable, Identifiable, Equatable, Sendable {
   public var id: String { key }
   public let key: String
@@ -181,6 +199,9 @@ public struct ExternalProviderMeta: Decodable, Identifiable, Equatable, Sendable
   public let currency: String?
   public let currencySymbol: String?
   public let detailUrl: String?
+  public let auth: ExternalProviderAuth?
+  public let hasCredentials: Bool?
+  public let credentialsSavedAtMs: Double?
   public let fileName: String?
   public let filePath: String?
   public let enabled: Bool?
@@ -307,6 +328,7 @@ public struct CodexBarCardSnapshot: Decodable {
   public let statusText: String?
   public let footnote: String?
   public let stale: Bool?
+  public let needsAuth: Bool?
   public let accountEmail: String?
   public let planTitle: String?
   public let quotaWindows: [CardQuotaWindow]?
@@ -359,8 +381,10 @@ public struct CodexBarCardSnapshot: Decodable {
     footnote: String? = nil,
     stale: Bool? = nil,
     billingSummary: CardBillingSummary? = nil,
-    breakdowns: [CardBreakdownSection]? = nil
+    breakdowns: [CardBreakdownSection]? = nil,
+    needsAuth: Bool? = nil
   ) {
+    self.needsAuth = needsAuth
     self.isExternal = isExternal
     self.providerName = providerName
     self.providerShortName = providerShortName
@@ -504,6 +528,8 @@ public enum MainTab: String, CaseIterable {
 public enum MenuBarDisplayMode: String, CaseIterable {
   case iconOnly = "iconOnly"
   case quotaRemaining = "quotaRemaining"
+  case remainingAmount = "remainingAmount"
+  case quotaAndAmount = "quotaAndAmount"
   case todayCost = "todayCost"
   case todayTokensAndCost = "todayTokensAndCost"
   case tps = "tps"
@@ -513,6 +539,8 @@ public enum MenuBarDisplayMode: String, CaseIterable {
     switch self {
     case .iconOnly: return "仅图标"
     case .quotaRemaining: return "配额百分比"
+    case .remainingAmount: return "剩余金额（如 ¥1085）"
+    case .quotaAndAmount: return "百分比 + 剩余金额"
     case .todayCost: return "今日费用"
     case .todayTokensAndCost: return "今日用量 + 费用"
     case .tps: return "实时速度"

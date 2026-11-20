@@ -42,6 +42,8 @@ const PROTECTED_ROUTES = new Set([
   'POST /v1/providers/reload',
   'POST /v1/providers/import',
   'DELETE /v1/providers',
+  'POST /v1/providers/auth',
+  'DELETE /v1/providers/auth',
   'GET /v1/fingerprint/overview',
   'POST /v1/fingerprint/endpoints',
   'DELETE /v1/fingerprint/endpoints',
@@ -351,6 +353,26 @@ export function createMeterServer({
       return;
     }
 
+    if (req.method === 'DELETE' && url.pathname === '/v1/providers/auth') {
+      const key = url.searchParams.get('key') || '';
+      if (!isExternalProviderKey(key)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid key' }));
+        return;
+      }
+      const cleared = externalProviders.clearCredentials(key);
+      (enableExternalProviders
+        ? externalProviders.fetchAll({ nowMs: Date.now(), forceRefresh: true, enabledTools: config.tools })
+        : Promise.resolve({ providers: [] })
+      )
+        .catch(() => ({ providers: [] }))
+        .then((out) => {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, cleared, providers: out.providers || [] }));
+        });
+      return;
+    }
+
     if (req.method === 'DELETE' && url.pathname === '/v1/providers') {
       const fileName = url.searchParams.get('fileName') || null;
       const key = url.searchParams.get('key') || null;
@@ -643,6 +665,7 @@ export function createMeterServer({
         url.pathname === '/v1/cursor/sync-local' ||
         url.pathname === '/v1/providers/reload' ||
         url.pathname === '/v1/providers/import' ||
+        url.pathname === '/v1/providers/auth' ||
         url.pathname === '/v1/fingerprint/endpoints' ||
         url.pathname === '/v1/fingerprint/run')
     ) {
@@ -948,6 +971,37 @@ export function createMeterServer({
                   res.writeHead(500, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ ok: false, error: '同步 Cursor 本地登录态失败' }));
                 }
+              });
+            return;
+          }
+          if (url.pathname === '/v1/providers/auth') {
+            const key = typeof payload?.key === 'string' ? payload.key : '';
+            if (!isExternalProviderKey(key)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'invalid key' }));
+              return;
+            }
+            try {
+              externalProviders.setCredentials(key, payload?.credentials || {});
+            } catch (err) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: err?.message || '保存凭证失败' }));
+              return;
+            }
+            externalProviders
+              .fetchAll({ nowMs: Date.now(), forceRefresh: true, enabledTools: config.tools })
+              .catch(() => ({ providers: [], cards: {} }))
+              .then((out) => {
+                const prov = (out.providers || []).find((p) => p.key === key) || null;
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(
+                  JSON.stringify({
+                    ok: true,
+                    provider: prov,
+                    providers: out.providers || [],
+                    card: out.cards?.[key] || null,
+                  })
+                );
               });
             return;
           }

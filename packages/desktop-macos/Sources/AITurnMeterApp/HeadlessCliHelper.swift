@@ -135,6 +135,18 @@ enum HeadlessCliHelper {
     return false
   }
 
+  private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+      _ session: URLSession,
+      task: URLSessionTask,
+      willPerformHTTPRedirection response: HTTPURLResponse,
+      newRequest request: URLRequest,
+      completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+      completionHandler(nil)
+    }
+  }
+
   private static func runNetFetchJson() {
     let inputData = FileHandle.standardInput.readDataToEndOfFile()
     guard let obj = try? JSONSerialization.jsonObject(with: inputData) as? [String: Any],
@@ -146,6 +158,7 @@ enum HeadlessCliHelper {
     let method = (obj["method"] as? String)?.uppercased() ?? "GET"
     let timeoutMs = (obj["timeoutMs"] as? Double) ?? 8000.0
     let timeoutSec = max(1.0, timeoutMs / 1000.0)
+    let manualRedirect = (obj["redirect"] as? String)?.lowercased() == "manual"
 
     let cfg = URLSessionConfiguration.ephemeral
     cfg.httpShouldSetCookies = false
@@ -167,11 +180,15 @@ enum HeadlessCliHelper {
 
     let sem = DispatchSemaphore(value: 0)
     var outPayload: [String: Any] = ["ok": false]
-    let session = URLSession(configuration: cfg)
+    let delegate: URLSessionTaskDelegate? = manualRedirect ? NoRedirectDelegate() : nil
+    let session = URLSession(configuration: cfg, delegate: delegate, delegateQueue: nil)
     session.dataTask(with: req) { data, resp, err in
       if let http = resp as? HTTPURLResponse {
         outPayload["status"] = http.statusCode
         outPayload["ok"] = (200...299).contains(http.statusCode)
+        if let finalUrl = http.url?.absoluteString {
+          outPayload["url"] = finalUrl
+        }
         var respHeaders: [String: String] = [:]
         for (k, v) in http.allHeaderFields {
           respHeaders[String(describing: k).lowercased()] = String(describing: v)

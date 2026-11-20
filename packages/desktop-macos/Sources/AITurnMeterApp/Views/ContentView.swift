@@ -312,6 +312,14 @@ struct ContentView: View {
     .sheet(isPresented: $vm.showCursorLoginSheet) {
       CursorWebLoginSheetView(vm: vm)
     }
+    .sheet(isPresented: Binding(
+      get: { vm.pluginLoginKey != nil },
+      set: { if !$0 { vm.pluginLoginKey = nil } }
+    )) {
+      if let key = vm.pluginLoginKey {
+        ExternalProviderLoginSheetView(vm: vm, key: key)
+      }
+    }
     .sheet(isPresented: $vm.showPluginCodeSheet) {
       PluginCodeImportSheetView(vm: vm)
     }

@@ -408,6 +408,64 @@ struct ExternalProviderDetailView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
 
+            Divider().padding(.leading, 14)
+            HStack(spacing: 8) {
+              Text("状态栏显示")
+                .font(.system(size: 12.5))
+              Spacer()
+              let pinned = vm.menuBarProvider == key
+              if pinned {
+                Text(vm.menuBarDisplayMode.title)
+                  .font(.system(size: 12))
+                  .foregroundColor(.secondary)
+              }
+              Menu {
+                Button("剩余金额（如 \(curSym)1085）") { vm.pinProviderToMenuBar(key, mode: .remainingAmount) }
+                Button("剩余百分比") { vm.pinProviderToMenuBar(key, mode: .quotaRemaining) }
+                Button("百分比 + 剩余金额") { vm.pinProviderToMenuBar(key, mode: .quotaAndAmount) }
+                Button("仅图标（进度条）") { vm.pinProviderToMenuBar(key, mode: .iconOnly) }
+                if pinned {
+                  Divider()
+                  Button("取消固定（自动）") { vm.pinProviderToMenuBar(key, mode: nil) }
+                }
+              } label: {
+                Text(pinned ? "更改…" : "固定到状态栏…")
+              }
+              .menuStyle(.borderlessButton)
+              .fixedSize()
+              .font(.system(size: 12))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            if let auth = meta?.auth, auth.isWebCookie {
+              Divider().padding(.leading, 14)
+              HStack(spacing: 8) {
+                Text("登录授权")
+                  .font(.system(size: 12.5))
+                Spacer()
+                Text(meta?.hasCredentials == true ? "已授权" : "未授权")
+                  .font(.system(size: 12))
+                  .foregroundColor(meta?.hasCredentials == true ? .secondary : .orange)
+                Button(meta?.hasCredentials == true ? "重新登录…" : auth.displayLabel + "…") {
+                  vm.startPluginLogin(key)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+                .tint(CodexBarPalette.accentBlue)
+                if meta?.hasCredentials == true {
+                  Button("退出登录") {
+                    vm.clearPluginCredentials(key)
+                  }
+                  .buttonStyle(.borderless)
+                  .font(.system(size: 12))
+                  .foregroundColor(.red)
+                }
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 10)
+            }
+
             if let fileName = meta?.fileName {
               Divider().padding(.leading, 14)
               HStack(spacing: 8) {
@@ -487,28 +545,35 @@ struct ExternalProviderDetailView: View {
 
             let b = card?.billingSummary
             let periodLabel = b?.periodLabel ?? "本月"
-            settingsKVRow(
-              title: "今日消耗",
-              value: MeterFormat.money(b?.todayCost ?? card?.today.costUsd, symbol: curSym)
-            )
-            Divider().padding(.leading, 14)
-            settingsKVRow(
-              title: "\(periodLabel)已用",
-              value: MeterFormat.money(b?.periodCost ?? card?.days30.costUsd, symbol: curSym)
-            )
-            if let limit = b?.periodLimit, limit > 0 {
-              Divider().padding(.leading, 14)
-              settingsKVRow(
-                title: "\(periodLabel)限额",
-                value: MeterFormat.money(limit, symbol: curSym)
-              )
-            }
             if let rem = b?.periodRemaining {
+              settingsKVRow(
+                title: "\(periodLabel)剩余余额",
+                value: MeterFormat.money(rem, symbol: curSym),
+                valueColor: .primary
+              )
+              if let limit = b?.periodLimit, limit > 0 {
+                Divider().padding(.leading, 14)
+                settingsKVRow(title: "\(periodLabel)限额", value: MeterFormat.money(limit, symbol: curSym))
+              }
               Divider().padding(.leading, 14)
               settingsKVRow(
-                title: "\(periodLabel)剩余",
-                value: MeterFormat.money(rem, symbol: curSym)
+                title: "今日消耗",
+                value: MeterFormat.money(b?.todayCost ?? card?.today.costUsd, symbol: curSym)
               )
+            } else {
+              settingsKVRow(
+                title: "今日消耗",
+                value: MeterFormat.money(b?.todayCost ?? card?.today.costUsd, symbol: curSym)
+              )
+              Divider().padding(.leading, 14)
+              settingsKVRow(
+                title: "\(periodLabel)已用",
+                value: MeterFormat.money(b?.periodCost ?? card?.days30.costUsd, symbol: curSym)
+              )
+              if let limit = b?.periodLimit, limit > 0 {
+                Divider().padding(.leading, 14)
+                settingsKVRow(title: "\(periodLabel)限额", value: MeterFormat.money(limit, symbol: curSym))
+              }
             }
           }
         }

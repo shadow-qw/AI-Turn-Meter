@@ -367,3 +367,101 @@ test('Daemon HTTP integrates /v1/providers, /v1/providers/reload auth, /v1/usage
     rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Plugin auth: declared auth config, credential storage (0600), ctx.credentials, redaction, HTTP auth guard', async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-ext-auth-'));
+  const providersDir = join(tmpDir, 'providers');
+  mkdirSync(providersDir, { recursive: true });
+  writeFileSync(
+    join(providersDir, 'authed.mjs'),
+    `export default {
+      id: 'authed', name: 'Authed', shortName: 'Authed',
+      auth: { type: 'web_cookie', loginUrl: 'https://login.example.com/start', cookieDomains: ['.Example.com'], label: '登录' },
+      async fetch({ credentials }) {
+        if (!credentials?.cookie) return { ok: false, needsAuth: true, statusText: '未登录', quotaWindows: [] };
+        return { ok: true, account: 'u', quotaWindows: [{ id: 'm', title: '额度', used: 1, limit: 10 }] };
+      },
+    };`
+  );
+  const reg = new ExternalProviderRegistry({ providersDir });
+  try {
+    const metaList = await reg.listMetadata();
+    const m = metaList[0];
+    assert.equal(m.auth.type, 'web_cookie');
+    assert.deepEqual(m.auth.cookieDomains, ['example.com']);
+    assert.equal(m.hasCredentials, false);
+
+    let out = await reg.fetchAll({ forceRefresh: true });
+    assert.equal(out.cards['ext:authed'].needsAuth, true);
+
+    reg.setCredentials('ext:authed', { cookie: 'sid=abc', cookies: { sid: 'abc' } });
+    assert.equal(reg.hasCredentials('ext:authed'), true);
+    assert.equal(statSync(reg.credentialsPath).mode & 0o777, 0o600);
+    out = await reg.fetchAll({ forceRefresh: true });
+    assert.equal(out.cards['ext:authed'].quotaWindows.length, 1);
+    assert.equal(out.providers[0].hasCredentials, true);
+    assert.equal(JSON.stringify(out).includes('sid=abc'), false);
+
+    const reg2 = new ExternalProviderRegistry({ providersDir });
+    assert.equal(reg2.getCredentials('ext:authed').cookie, 'sid=abc');
+
+    assert.equal(reg.clearCredentials('ext:authed'), true);
+    assert.equal(reg.hasCredentials('ext:authed'), false);
+    assert.throws(() => reg.setCredentials('ext:authed', {}), /凭证/);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  const tmp2 = mkdtempSync(join(tmpdir(), 'atm-ext-auth-http-'));
+  const pd2 = join(tmp2, 'providers');
+  mkdirSync(pd2, { recursive: true });
+  writeFileSync(
+    join(pd2, 'authed.mjs'),
+    `export default { id: 'authed', auth: { type: 'web_cookie', loginUrl: 'https://login.example.com/' }, fetch: async ({ credentials }) => ({ ok: !!credentials, quotaWindows: [] }) };`
+  );
+  const meter = createMeterServer({
+    port: 0,
+    dbPath: ':memory:',
+    stateDir: tmp2,
+    providersDir: pd2,
+    authToken: 'tok',
+    enableWatchers: false,
+    enableCdp: false,
+    enableAntigravityRpc: false,
+    enableQuotaProbe: false,
+  });
+  const addr = await meter.start();
+  const base = `http://127.0.0.1:${addr.port}`;
+  try {
+    let r = await fetch(`${base}/v1/providers/auth`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'ext:authed', credentials: { cookie: 'a=b' } }),
+    });
+    assert.equal(r.status, 401);
+    r = await fetch(`${base}/v1/providers/auth?key=ext:authed`, { method: 'DELETE' });
+    assert.equal(r.status, 401);
+
+    r = await fetch(`${base}/v1/providers/auth`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-ATM-Token': 'tok' },
+      body: JSON.stringify({ key: 'ext:authed', credentials: { cookie: 'a=b' } }),
+    });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.equal(j.provider.hasCredentials, true);
+    assert.equal(JSON.stringify(j).includes('a=b'), false);
+    const listRes = await (await fetch(`${base}/v1/providers`)).json();
+    assert.equal(JSON.stringify(listRes).includes('a=b'), false);
+
+    r = await fetch(`${base}/v1/providers/auth?key=ext:authed`, {
+      method: 'DELETE',
+      headers: { 'X-ATM-Token': 'tok' },
+    });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).cleared, true);
+  } finally {
+    await meter.stop();
+    rmSync(tmp2, { recursive: true, force: true });
+  }
+});
