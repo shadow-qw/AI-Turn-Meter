@@ -1,0 +1,26 @@
+{
+  "name": "Publication checkpoint - synthetic diagnostic unavailable",
+  "on": {
+    "push": {
+      "branches": [
+        "docs/issue-autopilot-design-20261119"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "publication-no-diagnostic": {
+      "if": "${{ false }}",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 1,
+      "steps": [
+        {
+          "name": "No diagnostic approval in publication checkpoint",
+          "run": "exit 1"
+        }
+      ]
+    }
+  }
+}

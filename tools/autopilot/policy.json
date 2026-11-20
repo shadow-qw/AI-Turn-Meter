@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "repoId": "1461122513",
+  "owner": "shadow-qw",
+  "name": "AI-Turn-Meter",
+  "enabled": false,
+  "autoMerge": false,
+  "publish": false,
+  "limits": { "triagesPerDay": 50, "startsPerDay": 3, "rcPerDay": 3, "attemptsPerIssue": 3, "files": 10, "lines": 300, "aiMs": 3600000, "buildMs": 3600000, "leaseMs": 600000, "heartbeatMs": 60000, "jobMs": 1800000, "runnerWaitMs": 7200000 },
+  "sandbox": { "available": false, "image": "docker.io/library/node@sha256:0e2646ab57e77b7a384a0cb59b6815b182c77e1f9c3ba36bd8435bd9c4e6680e" }
+}

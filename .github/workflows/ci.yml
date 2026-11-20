@@ -1,33 +1,46 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
-
+permissions:
+  contents: read
 jobs:
   verify:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '24'
-
+      - name: Verify exact source and runner
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          uname -sm
+          printf 'ImageVersion=%s\n' "$ImageVersion"
+          xcodebuild -version
+          swiftc --version
       - name: Check version parity
         run: |
-          node -e '
+          scratch=$(mktemp -d)
+          env -i PATH="$PATH" HOME="$scratch" node -e '
             const pkg = require("./package.json");
             const ext = require("./packages/vscode-extension/package.json");
-            if (pkg.version !== ext.version) {
-              throw new Error(`Version mismatch: root=${pkg.version} vs vsix=${ext.version}`);
-            }
+            if (pkg.version !== ext.version) throw new Error(`Version mismatch: root=${pkg.version} vs vsix=${ext.version}`);
           '
-
-      - name: Run Node & Swift tests
-        run: npm run test:all
-
-      - name: Build macOS release binary & package VSIX
+      - name: Run Node and Swift tests
         run: |
-          npm run build:macos
-          npm run package:vsix
+          scratch=$(mktemp -d)
+          env -i PATH="$PATH" HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" XDG_DATA_HOME="$scratch/data" CODEX_HOME="$scratch/codex" AI_TURN_METER_DB="$scratch/db" TMPDIR="$scratch" npm run test:all
+          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" sh scripts/test-update-policy.sh
+      - name: Build macOS release binary and package VSIX
+        run: |
+          scratch=$(mktemp -d)
+          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" npm run build:macos
+          env -i PATH="$PATH" HOME="$scratch" TMPDIR="$scratch" npm run package:vsix

@@ -2445,7 +2445,32 @@ test('fetchCodexQuota deep scan finds rate_limits past >10 empty files & >400 li
   }
 });
 
-test('parseCursorQuotaSummary supports unified weekly Sand pool and v2/usage-status spend, and resolveCursorCookieCandidates deduplicates sources', async () => {
+async function withCursorCandidateFixture(t, nowMs, run) {
+  const homeDir = mkdtempSync(join(tmpdir(), 'atm-cursor-cand-'));
+  const envKeys = ['HOME', 'XDG_CONFIG_HOME'];
+  const previousEnv = envKeys.map((key) => [key, process.env[key]]);
+  let clockMock;
+  let clockMs = nowMs;
+  const expiresAtMs = nowMs + 86400_000;
+  const jwt = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: 'auth0|user_agent_99', exp: Math.floor(expiresAtMs / 1000) })).toString('base64url')}.sig`;
+  try {
+    process.env.HOME = homeDir;
+    process.env.XDG_CONFIG_HOME = join(homeDir, '.config');
+    clockMock = t.mock.method(Date, 'now', () => clockMs);
+    mkdirSync(join(homeDir, '.config', 'cursor'), { recursive: true });
+    writeFileSync(join(homeDir, '.config', 'cursor', 'auth.json'), JSON.stringify({ accessToken: jwt }));
+    return await run({ homeDir, jwt, expiresAtMs, setNowMs: (value) => { clockMs = value; } });
+  } finally {
+    clockMock?.mock.restore();
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+}
+
+test('parseCursorQuotaSummary supports unified weekly Sand pool and v2/usage-status spend, and resolveCursorCookieCandidates deduplicates sources', async (t) => {
   resetQuotaCacheForTests();
   const nowMs = Date.UTC(2026, 10, 18, 10, 0, 0);
   const parsed = parseCursorQuotaSummary(
@@ -2475,20 +2500,79 @@ test('parseCursorQuotaSummary supports unified weekly Sand pool and v2/usage-sta
   assert.equal(parsed.quotaWindows[0].remainingPct, 77.5);
   assert.equal(parsed.resetCreditsText, '$12.50 / $50.00');
 
-  const tmpHome = mkdtempSync(join(tmpdir(), 'atm-cursor-cand-'));
-  try {
-    mkdirSync(join(tmpHome, '.config', 'cursor'), { recursive: true });
-    const jwt = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: 'auth0|user_agent_99', exp: Math.floor((Date.now() + 86400_000) / 1000) })).toString('base64url')}.sig`;
-    writeFileSync(join(tmpHome, '.config', 'cursor', 'auth.json'), JSON.stringify({ accessToken: jwt }));
+  await withCursorCandidateFixture(t, nowMs, async ({ homeDir }) => {
+
     const res = await resolveCursorCookieCandidates({
       cursorCookie: 'WorkosCursorSessionToken=stale_user%3A%3Astale_tok',
-      homeDir: tmpHome,
+      homeDir,
     });
     assert.equal(res.candidates.length, 2);
     assert.equal(res.candidates[0].source, 'config');
     assert.equal(res.candidates[1].source, 'cursor-agent');
+  });
+});
+
+test('resolveCursorCookieCandidates deduplicates identical config and cursor-agent cookies', async (t) => {
+  await withCursorCandidateFixture(t, Date.UTC(2026, 10, 18, 10), async ({ homeDir, jwt }) => {
+    const cookieHeader = `WorkosCursorSessionToken=user_agent_99%3A%3A${jwt}`;
+    const agentOnly = await resolveCursorCookieCandidates({ homeDir });
+    assert.deepEqual(agentOnly.candidates, [{ cookieHeader, source: 'cursor-agent' }]);
+    const duplicate = await resolveCursorCookieCandidates({ homeDir, cursorCookie: cookieHeader });
+    assert.equal(duplicate.candidates.length, 1);
+    assert.deepEqual(duplicate.candidates, [{ cookieHeader, source: 'config' }]);
+  });
+});
+
+test('resolveCursorCookieCandidates rejects agent JWTs at the 60-second expiry boundary', async (t) => {
+  await withCursorCandidateFixture(t, Date.UTC(2026, 10, 18, 10), async ({ homeDir, expiresAtMs, setNowMs }) => {
+    for (const [remainingMs, expectedSources] of [
+      [60_001, ['config', 'cursor-agent']],
+      [60_000, ['config']],
+      [59_999, ['config']],
+      [0, ['config']],
+      [-1, ['config']],
+    ]) {
+      setNowMs(expiresAtMs - remainingMs);
+      const res = await resolveCursorCookieCandidates({
+        homeDir,
+        cursorCookie: 'WorkosCursorSessionToken=stale_user%3A%3Astale_tok',
+      });
+      assert.deepEqual(res.candidates.map(({ source }) => source), expectedSources, `remainingMs=${remainingMs}`);
+    }
+  });
+});
+
+test('cursor candidate fixture restores the clock and present or absent environment after success and failure', async (t) => {
+  const envKeys = ['HOME', 'XDG_CONFIG_HOME'];
+  const inheritedEnv = envKeys.map((key) => [key, process.env[key]]);
+  const originalNow = Date.now;
+  const snapshotEnv = () => envKeys.map((key) => [key, Object.hasOwn(process.env, key), process.env[key]]);
+  try {
+    for (const present of [true, false]) {
+      for (const key of envKeys) {
+        if (present) process.env[key] = `/synthetic-inherited-${key.toLowerCase()}`;
+        else delete process.env[key];
+      }
+      const before = snapshotEnv();
+      await withCursorCandidateFixture(t, 123_000, async ({ homeDir }) => {
+        assert.equal(Date.now(), 123_000);
+        assert.equal(process.env.HOME, homeDir);
+        assert.equal(process.env.XDG_CONFIG_HOME, join(homeDir, '.config'));
+      });
+      assert.equal(Date.now, originalNow);
+      assert.deepEqual(snapshotEnv(), before);
+      await assert.rejects(withCursorCandidateFixture(t, 456_000, async () => {
+        assert.equal(Date.now(), 456_000);
+        throw new Error('synthetic fixture failure');
+      }), /synthetic fixture failure/);
+      assert.equal(Date.now, originalNow);
+      assert.deepEqual(snapshotEnv(), before);
+    }
   } finally {
-    rmSync(tmpHome, { recursive: true, force: true });
+    for (const [key, value] of inheritedEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 
