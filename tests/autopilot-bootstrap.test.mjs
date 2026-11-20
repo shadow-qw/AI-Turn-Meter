@@ -27,7 +27,7 @@ test('modified PR driver is not the workflow checkout or executable source',t=>{
 });
 test('actual inline approval gate rejects wrong source, event, head, workflow or baseline',t=>{
  const cwd=scratch(t),step=job.steps.find(s=>s.name==='Gate one-shot approval');assert.ok(step);
- const sha='a'.repeat(40),before='1ff4ef7f3a2bc1064fc72f8e62fa2826bc2d72ba';
+ const sha='a'.repeat(40),before='465636b2f1bb92f65bcf2057b452d6d3bc580ab8';
  const event={ref:'refs/heads/docs/issue-autopilot-design-20261119',before,after:sha,forced:false,deleted:false,repository:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}};
  const path=join(cwd,'event.json');writeFileSync(path,JSON.stringify(event));
  const env={GITHUB_EVENT_NAME:'push',GITHUB_REPOSITORY:'shadow-qw/AI-Turn-Meter',GITHUB_REPOSITORY_ID:'1461122513',GITHUB_ACTOR:'shadow-qw',GITHUB_REF:event.ref,GITHUB_SHA:sha,GITHUB_WORKFLOW_SHA:sha,GITHUB_EVENT_PATH:path,APPROVED_WORKFLOW_SHA:sha,APPROVED_SOURCE_SHA:source};
