@@ -6,9 +6,12 @@ const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthet
 const job=wf.jobs['synthetic-only'],step=job.steps.find(x=>x.name?.startsWith('Record exact PR metadata'));
 const code=step.run.split("<<'NODE'\n")[1].split('\nNODE')[0];
 const token='ghs_'+'ABCD1234'.repeat(4)+'ABCD',head='a'.repeat(40),base='759f3ea525b64281060b14ed43c6f35ae15705c8';
-function probe(scenario,patch={}) {
+function probe(scenario,patch={},credential=token) {
  const prelude=`
  const scenario=${JSON.stringify(scenario)},patch=${JSON.stringify(patch)};
+ // Plain synthetic env permits NUL/control fixtures that OS execve cannot carry.
+ process.env={...process.env};const input=${JSON.stringify(credential)};
+ if(input===null)delete process.env.ATM_METADATA_TOKEN;else process.env.ATM_METADATA_TOKEN=input;
  const nativeTimer=globalThis.setTimeout;globalThis.setTimeout=(fn,ms,...args)=>nativeTimer(fn,Math.min(ms,50),...args);
  let calls=0;
  globalThis.fetch=async(url,options)=>{
@@ -87,4 +90,22 @@ test('adjacent success path validates tree hashes without echoing arbitrary hex 
  assert.equal(r.status,0,r.stderr);assert.doesNotMatch(r.stdout+r.stderr,new RegExp(hex.slice(0,40)+'|'+hex.slice(40),'i'));
  assert.doesNotMatch(r.stdout,/"(?:merge|headTree|mergeTree)":/);
  assert.match(r.stdout,/"mergeValidated":true/);
+});
+
+test('opaque HTTP-safe synthetic credentials do not assume GitHub prefix, size or alphabet',()=>{
+ for(const value of ['opaque.v1/part+other=','opaque~:_!@#$%^&*()-[]{}','Q'.repeat(4096)]){
+  const r=probe('success',{},value);assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/"mergeValidated":true/);assert.doesNotMatch(r.stdout+r.stderr,new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')));
+ }
+});
+test('missing and invalid-header are fixed distinct errors before any fetch, no derived credential diagnostics',()=>{
+ for(const [value,expected] of [[null,'missing-token'],['','missing-token'],[' ','invalid-header'],['abc def','invalid-header'],['abc\rdef','invalid-header'],['abc\ndef','invalid-header'],['abc\u0000def','invalid-header'],['abc\u0001def','invalid-header'],['abc\tdef','invalid-header'],['abc\u007fdef','invalid-header'],['abcédef','invalid-header'],['abc中def','invalid-header'],['X'.repeat(4097),'invalid-header']]){
+  const r=probe('success',{},value);assert.equal(r.status,1);assert.equal(r.signal,null);assert.equal(r.stdout,'');assert.equal(r.stderr,'METADATA_REJECTED '+expected+'\n');
+ }
+});
+test('newly admitted opaque synthetic values remain non-reflectable on HTTP errors',()=>{
+ const value='synthetic.opaque/part+other=',hex=Buffer.from(value).toString('hex');
+ for(const text of [value,hex,hex.toUpperCase(),hex.slice(0,24),Buffer.from(value).toString('base64')]){
+  const r=probe(403,{headers:{'x-github-request-id':text,'x-ratelimit-remaining':text},message:text},value);
+  assert.equal(r.status,1);assert.equal(r.stdout,'');assert.equal(r.stderr,'METADATA_HTTP {"status":403,"classification":"forbidden-status"}\nMETADATA_REJECTED http-status\n');
+ }
 });
