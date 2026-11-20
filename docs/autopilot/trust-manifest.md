@@ -2,14 +2,14 @@
 
 固定仓库：shadow-qw/AI-Turn-Meter，GitHub repository id `1461122513`。来源为已核对的官方GitHub live CI run repository.id（run44661626585），不是Issue字段。
 
-本轮bundle fingerprint（SHA256，非审批）：`702ca518f8ed1cf23b5f9d6595a0dfad45054862941dacbf21daf9ee7fda97a6`。可信模块改动必须重新生成/独立审阅；添加可信模块必须扩展固定bundle清单，不能因文件不在旧清单就允许执行。
+本轮bundle fingerprint（SHA256，非审批）：`04ffb94de2151c8c78757efd408d0e7e05b34c8ee9fc208aa4b9ed0bf5e99f44`。可信模块改动必须重新生成/独立审阅；添加可信模块必须扩展固定bundle清单，不能因文件不在旧清单就允许执行。
 
 | 固定源码 | SHA256 |
 |---|---|
 | tools/autopilot/contracts.mjs | `adc4d6977916e9b25e83bf7a26c59b0e91c3ddcdf3653661222784ca0ddae815` |
 | tools/autopilot/policy.mjs | `3d80820b0204341e9396b41d555544e6e32551ad824e9bff5ec2752122335e34` |
 | tools/autopilot/policy.json | `8116b5ab4e50fc76582831f1442effa6789c08d80f5e62bcbffe1e8770878a76` |
-| tools/autopilot/state.mjs | `7ebfaba0fad30e93ddab72c9a5c43cab3454575082bb8c19999bdd9d150d7890` |
+| tools/autopilot/state.mjs | `f43af58dcc3851bc712291cf857823bd9e1d9fe53a675cb93878573cf54de919` |
 | tools/autopilot/sandbox.mjs | `ac26f575ef3e6ca7825a8d4ea835027792e8afe70fae2ac67cd08a1c6bcaa830` |
 
 ## 批准与部署状态

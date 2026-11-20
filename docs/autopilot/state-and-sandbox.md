@@ -12,7 +12,7 @@
 
 ## 状态、锁和计数
 
-SQLite使用WAL、synchronous=FULL、busy_timeout、固定schema v1及BEGIN IMMEDIATE。未来schema拒绝启动。任务、journal、全局锁、issue跨快照预算和intent的变更在事务内；异常rollback业务变更。拒绝操作也保留可信时钟high-water，禁止在过期写被拒后回拨时间续租。时间参数必须来自可信协调器时钟，不得来自Issue/候选；当前没有对外时间输入接口。
+SQLite使用WAL、synchronous=FULL、busy_timeout、内部DB schema v2（v1保守迁移、未来版本拒绝）及BEGIN IMMEDIATE。未来schema拒绝启动。任务、journal、全局锁、issue跨快照预算和intent的变更在事务内；异常rollback业务变更。拒绝操作也保留可信时钟high-water，禁止在过期写被拒后回拨时间续租。时间参数必须来自可信协调器时钟，不得来自Issue/候选；当前没有对外时间输入接口。
 
 - 一个固定仓库只能有一个active锁。claim只取当前快照queued任务；过期不自动释放/抢占；心跳、transition、charge、intent核对owner/generation/实际DB到期时间及最新快照。新编辑作废旧资格但不直接解锁。
 - `reconcile`默认恒拒绝。未来需独立可信终止adapter，证明该准确执行和外部jobs已停止；当前没有真实adapter。测试注入的是合成verifier，不是实际停止证明。核验通过后仍将旧任务转needs_human，再增加generation；旧owner所有受租约保护写都拒绝。
@@ -40,3 +40,28 @@ SQLite使用WAL、synchronous=FULL、busy_timeout、固定schema v1及BEGIN IMME
 7. 经独立审查才实现可运行adapter，保留未验fail-closed；再与Task8/D的可信workflow及精确SHA证据接线。
 
 本检查点仅接受离线单元/真实SQLite并发测试，不宣称容器或整个B完成。没有push、合并、tag、发布、监听或自动化启用。
+
+
+## B内审查修复：issue资格不是单个task状态
+
+当前修复仍待同一独立审查者复审。共享eligibility先查持久hold，再查跨快照attempts及AI/build余额；triage、claim、新修复版working都使用它。needs_human/rejected/failed_premerge/cancelled及已核验恢复均建立issue级hold。编辑、关闭重开、pause/resume和重启均不清除hold。
+
+DB v1升级v2只增加hold_reason/hold_generation/blocked_reason，从历史人工/失败终态保守回填hold；保留原预算、锁与fencing代次，不自动释放遗留active。已有queued不合资格项由claim事务持久转needs_human、保存blocked reason及journal，再继续找健康任务，不占新attempt/start名额。candidate triage时发现无资格同样持久转人工，而非仅抛异常留下队头。
+
+只有可信管理员内部releaseHold可按准确issue、当前snapshotHash、holdGeneration和理由请求解除，不能用Issue/triage字段触发。拒绝尚有active、预算耗尽或代次/快照不符的请求；成功也只恢复received，必须重新可信分诊，保留所有耗费和历史。当前无公开入口/权限接线；verifyHoldRelease默认恒false。只有未来受信任只读adapter核验来自带外用户批准、与准确请求tuple绑定的证据后才能放行；Issue文本、reason、自称管理员或布尔字段都不构成批准。该adapter及真实批准证据尚未接线，测试中的恒true仅合成fixture。此方法不是一个可由外部JSON调用的管理服务。
+
+| mutation | 前置条件 / 结果 |
+|---|---|
+| enqueue | 可信来源、字段/摘要/固定repo/时间/非暂停；只新增快照，不清hold |
+| recordTriage | received、最新快照、严格triage、日限额；无资格持久转人工，函数返回不代表执行授权 |
+| claim | 未暂停/无active；共享issue资格及日限额；原子隔离不合格队列项后领取健康任务 |
+| heartbeat | live owner/generation、未过期、最新快照、无hold；不能复活失效租约 |
+| transition | live fence+snapshot+CAS；新working必须共享资格，拒绝不消耗attempt/journal；held只允许终态安全停止 |
+| charge | live fence+snapshot、双字段原子上限；允许held已耗用量对账，不授新工作资格 |
+| reserveIntent | live fence+snapshot、无hold、固定kind及SHA/key；仅本地意图，不是启动job许可 |
+| completeIntent | live fence+snapshot、原intent归属/结果一致；允许held已发生副作用对账，不执行远程写 |
+| reconcile | 管理恢复、已过期、可信实际终止核验及generation绑定；建立hold、增加fence，默认核验仍恒拒绝 |
+| releaseHold | 管理恢复、默认拒绝的带外批准核验、精确hold代次/最新快照、无active且预算有余额；只回到received，不重置预算 |
+| pause/resume | 可信管理员、有界理由/审计；不清issue hold/耗费，不授权运行 |
+
+时间正好耗尽不允许进入下一版working，剩余1ms可进入；已开始验证的结果推进和安全终止/结算仍可完成。这里没有把状态迁移或账本intent说成实际runner启动，真实时间测量/runner gate仍属未接线部分。内部数据库v2与对外JSON schemaVersion=1不是同一版本空间。

@@ -58,7 +58,7 @@ test('initial plus two retries only, even after editing snapshot',t=>{
  for(let i=0;i<2;i++){db.transition(l,{from:'working',to:'validating',evidence:{}},1010+i*2);db.transition(l,{from:'validating',to:'working',evidence:{reason:'test failure'}},1011+i*2);}
  db.transition(l,{from:'working',to:'validating',evidence:{}},1020);assert.throws(()=>db.transition(l,{from:'validating',to:'working',evidence:{reason:'again'}},1021),/ATTEMPT_BUDGET/);
  db.transition(l,{from:'validating',to:'failed_premerge',evidence:{reason:'budget exhausted'}},1022);assert.equal(db.status().tasks.find(x=>x.task_id===l.taskId).state,'needs_human');
- const s=snapshot(1,'edited');const x=db.enqueue(s,1023);assert.throws(()=>db.recordTriage(x.taskId,{schemaVersion:1,outcome:'candidate',snapshotHash:s.contentHash,summary:'retry',acceptance:['test'],riskReasons:[]},1024),/ATTEMPT_BUDGET/);
+ const s=snapshot(1,'edited');const x=db.enqueue(s,1023);db.recordTriage(x.taskId,{schemaVersion:1,outcome:'candidate',snapshotHash:s.contentHash,summary:'retry',acceptance:['test'],riskReasons:[]},1024);assert.equal(db.status().tasks.find(t=>t.task_id===x.taskId).state,'needs_human');assert.equal(db.status().issues[0].attempts,3);assert.equal(db.claim('no-fourth-attempt',1025),null);
 });
 test('daily start cap uses Shanghai dates and rejected claims do not consume slots',t=>{
  const {db}=fixture(t);const before=Date.parse('2026-11-20T15:59:00Z');for(let i=1;i<=4;i++)queued(db,i,before);
@@ -67,7 +67,7 @@ test('daily start cap uses Shanghai dates and rejected claims do not consume slo
 });
 test('triage quota, closed snapshots and future schemas fail closed',t=>{
  const {db}=fixture(t);for(let i=1;i<=50;i++)queued(db,i,1000);assert.throws(()=>queued(db,51,1001),/DAILY_BUDGET/);
- const f=fixture(t);f.db.close();const raw=new DatabaseSync(f.path);raw.exec('PRAGMA user_version=2');raw.close();chmodSync(f.path,0o600);assert.throws(()=>openState(f.path),/SCHEMA_VERSION/);
+ const f=fixture(t);f.db.close();const raw=new DatabaseSync(f.path);raw.exec('PRAGMA user_version=3');raw.close();chmodSync(f.path,0o600);assert.throws(()=>openState(f.path),/SCHEMA_VERSION/);
 });
 test('pause/resume and verified recovery retain bounded audit references',t=>{
  const {db}=fixture(t,{verifyTermination:()=>true});queued(db);const l=db.claim('owner',1001);db.pause('manual check',1002);db.resume('manual resume',1003);
@@ -83,7 +83,7 @@ test('recovery must bind generation even if a future verifier wrongly returns tr
 test('closed issues never become candidates and elapsed budgets survive edited task records',t=>{
  const {db}=fixture(t);const s=snapshot();s.state='closed';s.contentHash=snapshotDigest(s);const x=db.enqueue(s,1000);
  assert.throws(()=>db.recordTriage(x.taskId,{schemaVersion:1,outcome:'candidate',snapshotHash:s.contentHash,summary:'closed',acceptance:['test'],riskReasons:[]},1001),/SNAPSHOT_CLOSED/);
- const f=fixture(t);queued(f.db);const l=f.db.claim('owner',1001);f.db.charge(l,{aiMs:3600000,buildMs:0},1002);f.db.transition(l,{from:'working',to:'failed_premerge',evidence:{reason:'done'}},1003);queued(f.db,1,1004,'edited');assert.throws(()=>f.db.claim('other',1005),/TIME_BUDGET/);
+ const f=fixture(t);queued(f.db);const l=f.db.claim('owner',1001);f.db.charge(l,{aiMs:3600000,buildMs:0},1002);f.db.transition(l,{from:'working',to:'failed_premerge',evidence:{reason:'done'}},1003);queued(f.db,1,1004,'edited');assert.equal(f.db.claim('other',1005),null);assert.equal(f.db.status().issues[0].ai_ms,3600000);assert.equal(f.db.status().tasks.filter(t=>t.state==='queued').length,0);assert.equal(f.db.status().tasks.at(-1).state,'needs_human');
 });
 test('reordered duplicate triage is idempotent and does not spend daily quota twice',t=>{
  const {db}=fixture(t),s=snapshot(),x=db.enqueue(s,1000);
