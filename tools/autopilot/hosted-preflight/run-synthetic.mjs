@@ -12,20 +12,24 @@ for(const d of ['src','out','home','storage','runroot','empty-hooks','host-only'
 // Set exact output directory mode despite inherited umask; this directory is ours only.
 const {chmodSync}=await import('node:fs');chmodSync(join(root,'out'),0o777);
 writeFileSync(join(root,'host-only/fake-secret'),'PUBLIC-SYNTHETIC-NOT-A-CREDENTIAL');
+// Fresh controlled zero-byte resolver; no host DNS file is copied. Bind read-only.
+writeFileSync(join(root,'resolv.conf'),'',{mode:0o444,flag:'wx'});
 writeFileSync(join(root,'registry-auth.json'),'{}',{mode:0o600});
 writeFileSync(join(root,'containers.conf'),'[containers]\nvolumes=[]\nenv=[]\n[engine]\ncgroup_manager="systemd"\n');
 const modes=['baseline','cpu','pids','memory','timeout'];
-copyFileSync(fileURLToPath(new URL('./harness.mjs',import.meta.url)),join(root,'src/harness.mjs'));
+for(const name of ['harness.mjs','contract.mjs'])copyFileSync(fileURLToPath(new URL('./'+name,import.meta.url)),join(root,'src',name));
 for(const mode of modes)copyFileSync(fileURLToPath(new URL(`./fixtures/${mode}.mjs`,import.meta.url)),join(root,'src',`${mode}.mjs`));
 chmodSync(join(root,'src'),0o755);
 const env={PATH:'/usr/local/bin:/usr/bin:/bin',HOME:join(root,'home'),XDG_RUNTIME_DIR:`/run/user/${process.getuid()}`,DBUS_SESSION_BUS_ADDRESS:`unix:path=/run/user/${process.getuid()}/bus`,REGISTRY_AUTH_FILE:join(root,'registry-auth.json'),CONTAINERS_CONF:join(root,'containers.conf')};
 const global=['--root',join(root,'storage'),'--runroot',join(root,'runroot'),'--hooks-dir',join(root,'empty-hooks')];
 const host=probe({env,globalArgs:global});
+console.log(JSON.stringify({syntheticOnly:true,hostProbe:host}));
 const pod=(args)=>execFileSync('/usr/bin/podman',[...global,...args],{env,encoding:'utf8',timeout:15000,maxBuffer:1024*1024}).trim();
 // Pull is preparation only, no candidate execution. Fully qualified immutable official digest.
 execFileSync('/usr/bin/podman',[...global,'pull',IMAGE],{env,stdio:'inherit',timeout:180000});
 const image=JSON.parse(pod(['image','inspect',IMAGE]))[0];
 if(image.Architecture!=='amd64'||!image.RepoDigests?.includes(IMAGE))throw Error('SANDBOX_UNAVAILABLE: image digest/architecture');
+console.log(JSON.stringify({syntheticOnly:true,imageDigest:IMAGE,architecture:'amd64',imageVerified:true}));
 const results=[];
 for(const mode of modes){
  const name=`atm-canary-${mode}`;

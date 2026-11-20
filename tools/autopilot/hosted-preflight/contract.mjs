@@ -6,15 +6,16 @@ export function argsFor(input){
  const {root,mode}=input;
  if(!/^\/tmp\/atm-hosted-canary-[A-Za-z0-9]+$/.test(root)||!modes.has(mode)) throw Error('invalid fixed fixture');
  return ['--cgroup-manager=systemd','run','--name',`atm-canary-${mode}`,
- '--pull=never','--network=none','--read-only','--cap-drop=ALL',
+ '--pull=never','--network=none','--read-only','--read-only-tmpfs=false','--cap-drop=ALL',
  '--security-opt=no-new-privileges','--user=65534:65534','--pid=private','--ipc=private','--cgroupns=private',
  '--pids-limit=32','--memory=128m','--memory-swap=128m','--cpus=0.25',
  '--unsetenv-all','--env=HOME=/tmp/home','--env=PATH=/usr/local/bin:/usr/bin:/bin',
- '--env=NODE_OPTIONS=','--http-proxy=false','--no-hosts','--dns=none',
+ '--env=NODE_OPTIONS=','--http-proxy=false','--no-hosts',
  '--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777',
  '--tmpfs=/run:rw,nosuid,nodev,noexec,size=4m,mode=755',
  '--mount',`type=bind,src=${root}/src,dst=/src,ro=true`,
- '--mount',`type=bind,src=${root}/out,dst=/out,rw=true`,
+ '--mount',`type=bind,src=${root}/out,dst=/out,ro=false`,
+ '--mount',`type=bind,src=${root}/resolv.conf,dst=/etc/resolv.conf,ro=true`,
  '--workdir=/tmp','--entrypoint=/usr/local/bin/node',IMAGE,'/src/harness.mjs',`/src/${mode}.mjs`,mode,`${root}/host-only/fake-secret`];
 }
 export function assertHost(h){
@@ -42,7 +43,8 @@ export function assertInspect(i,root){
  if(!Array.isArray(env)||!['HOME=/tmp/home','PATH=/usr/local/bin:/usr/bin:/bin','NODE_OPTIONS='].every(e=>env.includes(e))||env.some(e=>!['HOME=/tmp/home','PATH=/usr/local/bin:/usr/bin:/bin','NODE_OPTIONS=','container=podman'].includes(e)&&!/^HOSTNAME=[a-z0-9-]+$/.test(e)))reject();
  if(!h||i.Config?.User!=='65534:65534'||h.Privileged!==false||h.ReadonlyRootfs!==true||h.NetworkMode!=='none'||!h.CapDrop?.some(x=>x.toUpperCase()==='ALL')||!h.SecurityOpt?.includes('no-new-privileges')||h.SecurityOpt?.some(x=>x.includes('unconfined'))||h.Memory!==134217728||h.MemorySwap!==134217728||h.PidsLimit!==32)throw Error('SANDBOX_UNAVAILABLE: inspect contract mismatch');
  const mounts=i.Mounts;
- if(!Array.isArray(mounts)||mounts.length!==2||!mounts.some(m=>m.Source===`${root}/src`&&m.Destination==='/src'&&m.RW===false)||!mounts.some(m=>m.Source===`${root}/out`&&m.Destination==='/out'&&m.RW===true))throw Error('SANDBOX_UNAVAILABLE: mount mismatch');
+ const expected=[['/src',`${root}/src`,false],['/out',`${root}/out`,true],['/etc/resolv.conf',`${root}/resolv.conf`,false]];
+ if(!Array.isArray(mounts)||mounts.length!==expected.length||!expected.every(([dest,src,rw])=>mounts.filter(m=>m.Type==='bind'&&m.Source===src&&m.Destination===dest&&m.RW===rw).length===1))throw Error('SANDBOX_UNAVAILABLE: mount mismatch');
 }
 
 // Internal adapter seam: inspect is verified before the start side effect.
@@ -51,4 +53,27 @@ export function verifyThenStart(inspect,start,root){
  assertInspect(info,root);
  start();
  return info;
+}
+
+// Evidence gathered INSIDE the fixed baseline fixture, never from the shared box.
+// Loopback may be down or up; no interface/address/route to another namespace is allowed.
+export function assertOfflineNetwork(n){
+ const fail=()=>{throw Error('SANDBOX_UNAVAILABLE: offline network evidence mismatch');};
+ if(!n||n.resolvConf!==''||!n.interfaces||typeof n.interfaces!=='object'||Array.isArray(n.interfaces))fail();
+ for(const [name,addresses] of Object.entries(n.interfaces)){
+  if(name!=='lo'||!Array.isArray(addresses))fail();
+  for(const a of addresses)if(!a||a.internal!==true||!((a.family==='IPv4'&&a.address==='127.0.0.1')||(a.family==='IPv6'&&a.address==='::1')))fail();
+ }
+ if(typeof n.devices!=='string')fail();
+ const devices=n.devices.trim().split(/\n/);
+ if(devices.length!==3||!devices[0].includes('Inter-')||!/^\s*face\s*\|/.test(devices[1])||!/^\s*lo:\s+(?:\d+\s+){15}\d+\s*$/.test(devices[2]))fail();
+ if(typeof n.ipv4Routes!=='string'||typeof n.ipv6Routes!=='string')fail();
+ const ipv4=n.ipv4Routes.trim().split(/\n/);
+ if(ipv4.length!==1||!/^Iface\s+Destination\s+Gateway\s+Flags\s+RefCnt\s+Use\s+Metric\s+Mask\s+MTU\s+Window\s+IRTT$/.test(ipv4[0]))fail();
+ // Linux can expose unreachable/loopback IPv6 entries even in a fresh none namespace.
+ for(const line of n.ipv6Routes.trim().split(/\n/).filter(Boolean)){
+  const f=line.trim().split(/\s+/);
+  if(f.length!==10||f[9]!=='lo'||!f.slice(0,9).every(x=>/^[0-9a-f]+$/.test(x)))fail();
+ }
+ return true;
 }
