@@ -12,32 +12,40 @@
 
 ## 2. PR身份解析是独立、无写入的硬停止步骤
 
-将下面代码保存到本次证据目录的`validate-pr.py`，然后单独执行：
+将下面唯一Python代码块逐字节保存到本次证据目录的`validate-pr.py`（UTF-8、LF、恰好一个末尾换行），然后单独执行。先核对文件与经独立审查的本提交内固定SHA256，不运行任意复制/变更版本；固定摘要不是自行批准新版本的权限：
 
 ```bash
 set -euo pipefail
+printf '%s  %s\n' '1b27fde9d4f23915bb9854cfa0d0ca0755c1271d552c042b69381e33a075e026' /workspace/atm-preflight/validate-pr.py | sha256sum --check --strict --status
 python3 -B /workspace/atm-preflight/validate-pr.py /workspace/atm-preflight/pr-before.json
 ```
+
+身份/大小检查使用显式require/异常，不使用可被Python优化编译删除的assert。保留PYTHONOPTIMIZE或使用-O/-OO时仍必须正确拒绝；不能靠删环境变量掩盖。安全判断不依赖__debug__。
 
 成功必须退出0且**只有**`PREFLIGHT_PR_IDENTITY_OK`。任何非零/解析错误/包装/缺字段都停止，禁止继续vars或push。不要凭先前部分可见文本推断“应该通过”。
 
 ```python
 import json, sys
+
+def require(ok):
+    if not ok:
+        raise ValueError('rejected')
+
 try:
     with open(sys.argv[1], encoding='utf-8') as f:
         raw = f.read(1048577)
-    assert len(raw) <= 1048576
+    require(len(raw) <= 1048576)
     p = json.loads(raw)
-    assert type(p) is dict and type(p['number']) is int and p['number'] == 2
-    assert p['state'] == 'open' and p['merged'] is False
+    require(type(p) is dict and type(p['number']) is int and p['number'] == 2)
+    require(p['state'] == 'open' and p['merged'] is False)
     for side in ['head', 'base']:
         repo = p[side]['repo']
-        assert type(repo['id']) is int and repo['id'] == 1461122513
-        assert repo['full_name'] == 'shadow-qw/AI-Turn-Meter'
-    assert p['head']['ref'] == 'docs/issue-autopilot-design-20261119'
-    assert p['head']['sha'] == 'c6c5d4fd0a6ba167f3a2cbcf1fa123ee712656f8'
-    assert p['base']['ref'] == 'main'
-    assert p['base']['sha'] == '759f3ea525b64281060b14ed43c6f35ae15705c8'
+        require(type(repo['id']) is int and repo['id'] == 1461122513)
+        require(repo['full_name'] == 'shadow-qw/AI-Turn-Meter')
+    require(p['head']['ref'] == 'docs/issue-autopilot-design-20261119')
+    require(p['head']['sha'] == 'c6c5d4fd0a6ba167f3a2cbcf1fa123ee712656f8')
+    require(p['base']['ref'] == 'main')
+    require(p['base']['sha'] == '759f3ea525b64281060b14ed43c6f35ae15705c8')
 except Exception:
     print('PREFLIGHT_PR_REJECTED', file=sys.stderr)
     sys.exit(1)

@@ -4,6 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,rmSync,copyF
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 const source='87d3d39d40e63f18752443a6aee10e6797e75adb';
 const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthetic.yml',import.meta.url)));
 const job=wf.jobs['synthetic-only'];
@@ -51,14 +52,61 @@ test('actual byte-verifier checks pinned fixture bytes and rejects altered drive
  writeFileSync(target,"import{writeFileSync}from'node:fs';writeFileSync('PR_DRIVER_HOST_MARKER','tampered');");
  assert.notEqual(run(step.run,cwd).status,0);assert.equal(existsSync(join(cwd,'PR_DRIVER_HOST_MARKER')),false);
 });
-test('documented preflight requires complete strict PR identity before any external write',t=>{
+test('documented preflight rejects every bad identity before marker under all Python optimization modes',t=>{
  const file=new URL('../docs/superpowers/runbooks/synthetic-preflight.md',import.meta.url);
  assert.ok(existsSync(file),'reviewed preflight runbook must exist');
  const text=readFileSync(file,'utf8'),match=text.match(/```python\n([\s\S]*?)\n```/);assert.ok(match);
- const cwd=scratch(t),path=join(cwd,'pr.json');
+ const digest=createHash('sha256').update(match[1]+'\n').digest('hex');assert.ok(text.includes("'"+digest+"'"),'runbook must pin exact tested validator bytes');
+ const cwd=scratch(t),path=join(cwd,'pr.json'),script=join(cwd,'validate-pr.py'),marker=join(cwd,'AFTER_GATE');writeFileSync(script,match[1]+'\n');
  const valid={number:2,state:'open',merged:false,head:{sha:'c6c5d4fd0a6ba167f3a2cbcf1fa123ee712656f8',ref:'docs/issue-autopilot-design-20261119',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}},base:{sha:'759f3ea525b64281060b14ed43c6f35ae15705c8',ref:'main',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}}};
- const check=raw=>{writeFileSync(path,raw);return spawnSync('python3',['-B','-c',match[1],path],{env:{PATH:process.env.PATH,HOME:cwd},encoding:'utf8',timeout:1500});};
- const ok=check(JSON.stringify(valid));assert.equal(ok.status,0,ok.stderr);assert.equal(ok.stdout,'PREFLIGHT_PR_IDENTITY_OK\n');
- const variants=['not-json','<wrapper>'+JSON.stringify(valid),JSON.stringify(valid).slice(0,-10),JSON.stringify({...valid,state:'closed'}),JSON.stringify({...valid,merged:0}),JSON.stringify({...valid,number:3}),JSON.stringify({...valid,head:{...valid.head,sha:'a'.repeat(40)}}),JSON.stringify({...valid,head:{...valid.head,ref:'main'}}),JSON.stringify({...valid,base:{...valid.base,sha:'a'.repeat(40)}}),JSON.stringify({...valid,head:{...valid.head,repo:{id:1,full_name:'untrusted/repo'}}})];
- for(const raw of variants){const r=check(raw);assert.equal(r.status,1);assert.equal(r.stdout,'');assert.equal(r.stderr,'PREFLIGHT_PR_REJECTED\n');}
+ const bad=['not-json','<wrapper>'+JSON.stringify(valid),JSON.stringify(valid).slice(0,-10),'null','[]','"unknown"',JSON.stringify(valid)+' '.repeat(1048577),Buffer.from([255])];
+ const fields={'number':999,'state':'unknown','merged':true,'head.sha':'a'.repeat(40),'head.ref':'main','head.repo.id':1,'head.repo.full_name':'evil/repo','base.sha':'a'.repeat(40),'base.ref':'other','base.repo.id':1,'base.repo.full_name':'evil/base'};
+ for(const [key,value] of Object.entries(fields)){
+  const parts=key.split('.'),leaf=parts.pop();
+  for(const action of ['wrong','missing','type']){
+   const p=structuredClone(valid);let obj=p;for(const part of parts)obj=obj[part];
+   if(action==='missing')delete obj[leaf];else obj[leaf]=action==='type'?[]:value;
+   bad.push(JSON.stringify(p));
+  }
+ }
+ for(const key of ['head','base']){const p=structuredClone(valid);p[key]=null;bad.push(JSON.stringify(p));const q=structuredClone(valid);q[key].repo=[];bad.push(JSON.stringify(q));}
+ const modes=[{name:'normal',flags:[],env:{}},{name:'env1',flags:[],env:{PYTHONOPTIMIZE:'1'}},{name:'env2',flags:[],env:{PYTHONOPTIMIZE:'2'}},{name:'-O',flags:['-O'],env:{}},{name:'-OO',flags:['-OO'],env:{}}];
+ let negatives=0;
+ for(const mode of modes){
+  const check=(raw,input=path)=>{
+   rmSync(marker,{force:true});writeFileSync(path,raw);
+   return spawnSync('/bin/bash',['-c',`set -euo pipefail\nprintf '%s  %s\\n' "$GUARD_SHA" "$GUARD_FILE" | sha256sum --check --strict --status\npython3 "$@"\nprintf local-only > "$MARKER"`,'preflight','-B',...mode.flags,script,input],{env:{PATH:process.env.PATH,HOME:cwd,MARKER:marker,GUARD_SHA:digest,GUARD_FILE:script,...mode.env},encoding:'utf8',timeout:3000});
+  };
+  const ok=check(JSON.stringify(valid));assert.equal(ok.status,0,mode.name+': '+ok.stderr);assert.equal(ok.stdout,'PREFLIGHT_PR_IDENTITY_OK\n');assert.equal(existsSync(marker),true);
+  for(const raw of bad){const r=check(raw);assert.equal(r.status,1,mode.name);assert.equal(r.stdout,'');assert.equal(r.stderr,'PREFLIGHT_PR_REJECTED\n');assert.equal(existsSync(marker),false,mode.name+': marker must not run');negatives++;}
+  for(const input of [join(cwd,'missing.json'),cwd]){const r=check('{}',input);assert.equal(r.status,1);assert.equal(r.stdout,'');assert.equal(r.stderr,'PREFLIGHT_PR_REJECTED\n');assert.equal(existsSync(marker),false);negatives++;}
+  for(const altered of [match[1]+"\nprint('UNREVIEWED_COPY')\n",null]){
+   if(altered===null)rmSync(script);else writeFileSync(script,altered);
+   const r=check(JSON.stringify(valid));assert.notEqual(r.status,0);assert.equal(r.stdout,'');assert.equal(existsSync(marker),false);negatives++;
+   writeFileSync(script,match[1]+'\n');
+  }
+ }
+ t.diagnostic('5 positive modes; '+negatives+' negative mode-cases rejected before local marker');
+});
+test('related Python safety paths have no removable assert and explicit guards survive optimization',t=>{
+ const cwd=scratch(t),snippet=join(cwd,'validator.py');
+ const doc=readFileSync(new URL('../docs/superpowers/runbooks/synthetic-preflight.md',import.meta.url),'utf8');
+ writeFileSync(snippet,doc.match(/```python\n([\s\S]*?)\n```/)[1]+'\n');
+ const guard=new URL('../tools/autopilot/deployment_guard.py',import.meta.url).pathname;
+ const audit=`import ast, pathlib, runpy, sys
+for path in sys.argv[1:]:
+    if any(isinstance(n, ast.Assert) for n in ast.walk(ast.parse(pathlib.Path(path).read_text()))):
+        sys.exit('REMOVABLE_SAFETY_ASSERT')
+ns = runpy.run_path(sys.argv[1], run_name='synthetic_audit_only')
+for call in [lambda: ns['require'](False, 'synthetic'), lambda: ns['assert_stopped']({}, {})]:
+    try:
+        call()
+    except RuntimeError:
+        continue
+    sys.exit('GUARD_BYPASSED')
+print('EXPLICIT_GUARDS_REJECTED')`;
+ for(const mode of [{flags:[],env:{}},{flags:[],env:{PYTHONOPTIMIZE:'1'}},{flags:[],env:{PYTHONOPTIMIZE:'2'}},{flags:['-O'],env:{}},{flags:['-OO'],env:{}}]){
+  const r=spawnSync('python3',['-B',...mode.flags,'-c',audit,guard,snippet],{env:{PATH:process.env.PATH,HOME:cwd,...mode.env},encoding:'utf8',timeout:3000});
+  assert.equal(r.status,0,r.stderr);assert.equal(r.stdout,'EXPLICIT_GUARDS_REJECTED\n');
+ }
 });
