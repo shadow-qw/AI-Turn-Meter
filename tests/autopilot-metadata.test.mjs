@@ -5,7 +5,7 @@ import {spawnSync} from 'node:child_process';
 const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthetic.yml',import.meta.url)));
 const job=wf.jobs['synthetic-only'],step=job.steps.find(x=>x.name?.startsWith('Record exact PR metadata'));
 const code=step.run.split("<<'NODE'\n")[1].split('\nNODE')[0];
-const token='ghs_'+'ABCD1234'.repeat(4)+'ABCD',head='a'.repeat(40),base='759f3ea525b64281060b14ed43c6f35ae15705c8';
+const token='ghs_'+'ABCD1234'.repeat(4)+'ABCD',head='a'.repeat(40),base='601e7775e5f9b5748f4426cfd0f741e337c2eeca';
 function probe(scenario,patch={},credential=token) {
  const prelude=`
  const scenario=${JSON.stringify(scenario)},patch=${JSON.stringify(patch)};
@@ -28,7 +28,7 @@ function probe(scenario,patch={},credential=token) {
   if(typeof scenario==='number')return new Response(JSON.stringify({message:patch.large?'x'.repeat(300000):patch.message??'unrecognized '+process.env.ATM_METADATA_TOKEN}),{status:scenario,headers:{'x-github-request-id':'ABC:123','x-ratelimit-limit':'60','x-ratelimit-remaining':'0','x-ratelimit-reset':'123456','x-ratelimit-resource':'core','x-ratelimit-used':'60','authorization':process.env.ATM_METADATA_TOKEN,'x-ratelimit-evil':process.env.ATM_METADATA_TOKEN,...patch.headers}});
   let value;
   if(calls===1)value={state:'open',head:{sha:'${head}',repo:{id:1461122513}},base:{sha:'${base}',repo:{id:1461122513}},merge_commit_sha:'b'.repeat(40),...patch};
-  else value={sha:url.split('/').at(-1),tree:{sha:patch.treeParts?patch.treeParts[calls-2]:'c'.repeat(40)},parents:patch.badParents?[{sha:'d'.repeat(40)},{sha:'${head}'}]:[{sha:'${base}'},{sha:'${head}'}]};
+  else value={sha:url.split('/').at(-1),tree:{sha:patch.treeParts?patch.treeParts[calls-2]:'c'.repeat(40)},parents:patch.badParents?[{sha:'d'.repeat(40)},{sha:'${head}'}]:[{sha:patch.base?.sha??'${base}'},{sha:'${head}'}]};
   return new Response(JSON.stringify(value));
  };
  `;
@@ -53,7 +53,7 @@ test('untrusted error text cannot classify 403 as rate limit or be echoed',()=>{
 for(const scenario of ['redirect','transport','timeout','body-timeout','oversize','bad-json'])test(`${scenario} fails closed without printing raw error/body/token`,()=>{
  const r=probe(scenario);assert.notEqual(r.status,0);assert.equal(r.signal,null,'bounded completion');assert.match(r.stderr,/METADATA_REJECTED/);assert.doesNotMatch(r.stderr+r.stdout,new RegExp(token+'|publicMetadataOnly|untrusted.invalid'));
 });
-for(const patch of [{state:'closed'},{head:{sha:'d'.repeat(40),repo:{id:1461122513}}},{base:{sha:'d'.repeat(40),repo:{id:1461122513}}},{merge_commit_sha:null},{head:{sha:head,repo:{id:1}}}])test('exact metadata offsets rejected '+JSON.stringify(patch),()=>{
+for(const patch of [{base:{sha:'759f3ea525b64281060b14ed43c6f35ae15705c8',repo:{id:1461122513}}},{state:'closed'},{head:{sha:'d'.repeat(40),repo:{id:1461122513}}},{base:{sha:'d'.repeat(40),repo:{id:1461122513}}},{merge_commit_sha:null},{head:{sha:head,repo:{id:1}}}])test('exact metadata offsets rejected '+JSON.stringify(patch),()=>{
  const r=probe('success',patch);assert.notEqual(r.status,0);assert.doesNotMatch(r.stdout,/publicMetadataOnly/);
 });
 

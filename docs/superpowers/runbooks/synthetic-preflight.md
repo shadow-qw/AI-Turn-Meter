@@ -5,7 +5,7 @@
 
 ## 1. 固定本次身份，先取完整快照
 
-- source固定`773bb92fb59e865071e91e884c4824a4af709ac1`；next-before固定`42bb66fb37373a707a8d6c2aa891906be4c4c533`；main/base固定`759f3ea525b64281060b14ed43c6f35ae15705c8`。
+- source固定`55114549a4f6841789bc3ac14218de0d2641c62b`；next-before固定`42bb66fb37373a707a8d6c2aa891906be4c4c533`；main/base固定`601e7775e5f9b5748f4426cfd0f741e337c2eeca`。
 - reviewed-head由**独立审查结果**提供完整40hex值，不从当前branch或workflow自动批准。若变化，重新审查；本文不是对未来HEAD的批准。
 - 用live GitHub只读工具get_pull_request(owner=shadow-qw, repo=AI-Turn-Meter, pull_number=2)。保存**完整JSON对象**到`/workspace/atm-preflight/pr-before.json`。工具展示/围栏/省略号/截断及工具结果包装不是JSON；必须先读取工具提供的完整原始文件，不能靠正则抽取几段字段或用旧快照补齐。
 - 快照必须来自本次live读取，保留来源、时间与原文件。下面检查JSON身份，不证明文件新鲜度或来源，不代替操作者核对live provenance。
@@ -20,7 +20,7 @@ node --input-type=commonjs -e '
 const fs=require("node:fs"),crypto=require("node:crypto"),p="/workspace/atm-preflight/validate-pr.py";
 const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
 try {
- if(!fs.fstatSync(fd).isFile()||crypto.createHash("sha256").update(fs.readFileSync(fd)).digest("hex")!=="15f7ff5f329c36794f9af099eb35d73d5c3318e89317fd5560f7770260508c4f")process.exitCode=1;
+ if(!fs.fstatSync(fd).isFile()||crypto.createHash("sha256").update(fs.readFileSync(fd)).digest("hex")!=="ddcf50dc5f675a1910f90bddb923402c4f48354671c07059371d5bdd383fe1c6")process.exitCode=1;
 } finally {fs.closeSync(fd);}
 '
 python3 -B /workspace/atm-preflight/validate-pr.py /workspace/atm-preflight/pr-before.json
@@ -51,7 +51,7 @@ try:
     require(p['head']['ref'] == 'docs/issue-autopilot-design-20261119')
     require(p['head']['sha'] == '42bb66fb37373a707a8d6c2aa891906be4c4c533')
     require(p['base']['ref'] == 'main')
-    require(p['base']['sha'] == '759f3ea525b64281060b14ed43c6f35ae15705c8')
+    require(p['base']['sha'] == '601e7775e5f9b5748f4426cfd0f741e337c2eeca')
 except Exception:
     print('PREFLIGHT_PR_REJECTED', file=sys.stderr)
     sys.exit(1)
@@ -64,11 +64,12 @@ print('PREFLIGHT_PR_IDENTITY_OK')
 
 每个Shell从`set -euo pipefail`开始；上一步失败就不要发下一步。不要使用`; true`、`|| true`、`echo exit=$?`后继续写，或在不同工具调用间假定Shell失败会自动阻止后续调用。
 
-- branch必须为`docs/issue-autopilot-design-20261119`；HEAD必须与独立reviewed-head完整相等，index空。
-- `git status --porcelain=v1`只能为既有` D dist/ai-turn-meter.vsix`；保留该删除，不restore/stage。出现其他变化停止。
+- 本地整合worktree必须为`/workspace/AI-Turn-Meter-integration`、branch为`integration/issue-autopilot-main-601e777`；HEAD必须与独立reviewed-head完整相等，index空。未来获批推送目的仍固定`refs/heads/docs/issue-autopilot-design-20261119`，不是自动取本地branch；只允许普通HEAD到该目的分支的快进。
+- 整合worktree的`git status --porcelain=v1`必须为空；原`/workspace/AI-Turn-Meter`仍停在fb19，且只能有既有` D dist/ai-turn-meter.vsix`。保留原删除，不restore/stash/stage，也不把原工作树改到整合HEAD。任一worktree出现其他变化停止。
 - `git ls-remote origin refs/heads/main refs/heads/docs/issue-autopilot-design-20261119`必须恰好返回上述base与before；before必须是reviewed-head祖先。
 - 对workflow固定九摘要，分别比较source Git blob、最终HEAD Git blob和工作树SHA256；每项都相等。不能仅自算当前树或读旧测试报告。
-- 核对最终workflow字节：固定action SHA、contents:read、source87d/beforec6、非force/delete、GITHUB_SHA/GITHUB_WORKFLOW_SHA/外置批准相等、单步metadata token env、checkout不持久、driver env-i不变；发布硬失败保持。
+- 核对最终workflow字节：固定action SHA、contents:read、source`55114549a4f6841789bc3ac14218de0d2641c62b`/before`42bb66fb37373a707a8d6c2aa891906be4c4c533`、非force/delete、GITHUB_SHA/GITHUB_WORKFLOW_SHA/外置批准相等、单步metadata token env、checkout不持久、driver env-i不变；发布硬失败保持。
+- 正常只读核对GitHub当前actor必须是`shadow-qw`，不读取token/认证日志。
 - 运行目标`node --test tests/autopilot-bootstrap.test.mjs tests/autopilot-metadata.test.mjs`和`git diff --check`；保存真实退出码及完整证据。
 - 正常只读列出repo vars；本次两个临时名称都必须不存在。已有任何值（即使恰好相同）也停止，不擅自覆盖/删除他人配置。不要读取secret/token/认证日志。
 - 在写入前再次live核对PR及remote身份。如果刚才工具展示/原文件/解析状态有疑问，停在只读阶段，不补一个“推送后再确认”。
@@ -78,6 +79,8 @@ print('PREFLIGHT_PR_IDENTITY_OK')
 只有以上每项已成功且准确reviewed-head另获本次批准，父助手才可单独安排临时双vars、读回、一次普通push最终HEAD、真实run采证和finally清理。中间旧commit不单独推、不force、不自动rerun。新代码或remote变化即停止复用批准。
 
 任何设置/推送/读回失败，先清理**本次确已新建且值仍匹配**的变量并验证，不能删除别人配置。实时metadata失败保持fail-closed；不扩权、不用共享box/其他凭据/跳过SHA门替代。该人工检查表不能消除网络检查与写入之间的竞态，更不是生产Task8/9原子授权门。
+
+本次source是正常merge提交`55114549a4f6841789bc3ac14218de0d2641c62b`，含main `601e7775e5f9b5748f4426cfd0f741e337c2eeca`，九个执行文件字节与历史773一致但仍需要对新source/final独立审查；没有自动批准。写前live PR的base字段也必须已经准确等于上述main；旧API快照B759/dirty/null不得代用。若尚未刷新或任一远端再变化，停止而非放宽门。
 
 ## 5. Podman 4.9.3 兼容合同（待新revision独立审查/真实采证）
 

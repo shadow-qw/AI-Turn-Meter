@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-const source='773bb92fb59e865071e91e884c4824a4af709ac1';
+const source='55114549a4f6841789bc3ac14218de0d2641c62b';
 const wf=JSON.parse(readFileSync(new URL('../.github/workflows/autopilot-synthetic.yml',import.meta.url)));
 const job=wf.jobs['synthetic-only'];
 const scratch=t=>{const p=mkdtempSync(join(tmpdir(),'atm-bootstrap-boundary-'));t.after(()=>rmSync(p,{recursive:true,force:true}));return p;};
@@ -60,8 +60,9 @@ test('documented preflight rejects every bad identity before marker under all Py
  const digest=createHash('sha256').update(match[1]+'\n').digest('hex');assert.ok((text.includes("'"+digest+"'")||text.includes('"'+digest+'"')),'runbook must pin exact tested validator bytes');
  const cwd=scratch(t),path=join(cwd,'pr-before.json'),script=join(cwd,'validate-pr.py'),marker=join(cwd,'AFTER_GATE');writeFileSync(script,match[1]+'\n');
  const bin=join(cwd,'bin');mkdirSync(bin);writeFileSync(join(bin,'sha256sum'),'#!/bin/sh\nexit 64\n',{mode:0o755}); // No GNU CLI dependency on macOS.
- const valid={number:2,state:'open',merged:false,head:{sha:'42bb66fb37373a707a8d6c2aa891906be4c4c533',ref:'docs/issue-autopilot-design-20261119',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}},base:{sha:'759f3ea525b64281060b14ed43c6f35ae15705c8',ref:'main',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}}};
+ const valid={number:2,state:'open',merged:false,head:{sha:'42bb66fb37373a707a8d6c2aa891906be4c4c533',ref:'docs/issue-autopilot-design-20261119',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}},base:{sha:'601e7775e5f9b5748f4426cfd0f741e337c2eeca',ref:'main',repo:{id:1461122513,full_name:'shadow-qw/AI-Turn-Meter'}}};
  const bad=['not-json','<wrapper>'+JSON.stringify(valid),JSON.stringify(valid).slice(0,-10),'null','[]','"unknown"',JSON.stringify(valid)+' '.repeat(1048577),Buffer.from([255])];
+ bad.push(JSON.stringify({...valid,base:{...valid.base,sha:'759f3ea525b64281060b14ed43c6f35ae15705c8'}}));
  const fields={'number':999,'state':'unknown','merged':true,'head.sha':'a'.repeat(40),'head.ref':'main','head.repo.id':1,'head.repo.full_name':'evil/repo','base.sha':'a'.repeat(40),'base.ref':'other','base.repo.id':1,'base.repo.full_name':'evil/base'};
  for(const [key,value] of Object.entries(fields)){
   const parts=key.split('.'),leaf=parts.pop();
@@ -113,4 +114,14 @@ print('EXPLICIT_GUARDS_REJECTED')`;
   const r=spawnSync('python3',['-B',...mode.flags,'-c',audit,guard,snippet],{env:{PATH:process.env.PATH,HOME:cwd,...mode.env},encoding:'utf8',timeout:3000});
   assert.equal(r.status,0,r.stderr);assert.equal(r.stdout,'EXPLICIT_GUARDS_REJECTED\n');
  }
+});
+
+test('current integration runbook pins match the reviewed bootstrap and exact new main without stale checklist',()=>{
+ const doc=readFileSync(new URL('../docs/superpowers/runbooks/synthetic-preflight.md',import.meta.url),'utf8');
+ assert.ok(doc.includes(source));
+ assert.ok(doc.includes('601e7775e5f9b5748f4426cfd0f741e337c2eeca'));
+ assert.ok(!doc.includes('source87d/beforec6'));
+ assert.ok(doc.includes('integration/issue-autopilot-main-601e777'));
+ const metadata=job.steps.find(s=>s.name==='Record exact PR metadata (data only; no checkout)').run;
+ assert.ok(metadata.includes("assert.equal(p.base.sha,'601e7775e5f9b5748f4426cfd0f741e337c2eeca')"));
 });

@@ -24,9 +24,9 @@ inspect在start之前核验镜像、65534用户、空capabilities、NNP、只读
 
 五项：baseline伪secret/只读/空HOME/网络/内核NNP-seccomp/cgroup精确值；有界CPU节流；最多12个有限寿命子进程验证pids；最多192MiB分配验证128MiB cgroup OOM；超时子进程late-write及cgroup空。额度128MiB/32pids/0.25CPU仅合成预检，不偷换生产2GiB/128pids/2CPU。输出写入仅可信fixture固定小文件；此bind输出方式**没有生产磁盘配额**，绝不能接候选。未实现完整mountinfo/fd/namespace审计、生产资源、真实取消/失联/VM销毁证明或H/B/T无.git快照传输。
 
-`.github/workflows/autopilot-synthetic.yml`现在仅是固定维护分支的一次性push诊断，**不响应PR/Issue，不是常驻候选门**。外置仓库variables `ATM_SYNTHETIC_APPROVED_SOURCE_SHA`须等于待本轮独立复审的源773bb92fb59e865071e91e884c4824a4af709ac1，`ATM_SYNTHETIC_APPROVED_WORKFLOW_SHA`须由独立复审后固定为包含本定义的准确最终commit；默认未配置、不启动job。下一次push before必须为42bb66fb37373a707a8d6c2aa891906be4c4c533，仓库ID/维护分支/actor/event after/github.sha/github.workflow_sha严格一致，强推/删除/未知值拒绝。这是人工bootstrap身份限制，不改变未来全作者Issue接入。
+`.github/workflows/autopilot-synthetic.yml`现在仅是固定维护分支的一次性push诊断，**不响应PR/Issue，不是常驻候选门**。外置仓库variables `ATM_SYNTHETIC_APPROVED_SOURCE_SHA`须等于待本轮独立复审的源55114549a4f6841789bc3ac14218de0d2641c62b，`ATM_SYNTHETIC_APPROVED_WORKFLOW_SHA`须由独立复审后固定为包含本定义的准确最终commit；默认未配置、不启动job。下一次push before必须为42bb66fb37373a707a8d6c2aa891906be4c4c533，仓库ID/维护分支/actor/event after/github.sha/github.workflow_sha严格一致，强推/删除/未知值拒绝。这是人工bootstrap身份限制，不改变未来全作者Issue接入。
 
-checkout只取独立批准的源773bb92到trusted-bootstrap，绝不checkout待审PR/github.sha；九个实际执行器/harness/fixture的固定SHA256在inline builtin校验后才允许运行。没有npm/package scripts或PR测试宿主执行。checkout/setup-node固定SHA、contents:read、不持久化凭据。job条件在动作前检查外置批准，inline事件门在checkout前再检查。公开只读API核对PR2当前head/base/merge及tree元数据，不下载或执行它们；head不是准确workflow批准值、base变化、merge未知或API失败则停止。driver source与workflow/PR SHA分别记录，不能将driver结果说成验证了PR合并树。
+checkout只取待独立批准的源55114549到trusted-bootstrap，绝不checkout待审PR/github.sha；九个实际执行器/harness/fixture的固定SHA256在inline builtin校验后才允许运行。没有npm/package scripts或PR测试宿主执行。checkout/setup-node固定SHA、contents:read、不持久化凭据。job条件在动作前检查外置批准，inline事件门在checkout前再检查。公开只读API核对PR2当前head/base/merge及tree元数据，不下载或执行它们；head不是准确workflow批准值、base变化、merge未知或API失败则停止。driver source与workflow/PR SHA分别记录，不能将driver结果说成验证了PR合并树。
 
 本临时机制不是对有仓库写权限者任意改写/新增workflow的生产防线；未来可信默认workflow/规则隔离仍属Task8/9。下一次只可在独立复审和两个外置准确批准值设置后，普通push最终head获取固定bootstrap的有限诊断；不可单独push中间source commit（它不是最终受审workflow context），不可接任意候选。真实原始inspect全字段、完整cgroup统计/递归清理/VM销毁证据仍缺，不给完整安全证书。现有Mac CI及发布硬禁用不变。
 
@@ -48,3 +48,7 @@ CPU修复：NanoCpus/CpuQuota/CpuPeriod每个已出现字段必须非负安全�
 外置批准缺失/不符导致job skipped时，不能把绿色/跳过的check UI视为canary通过。需要实际执行日志与明确结果；没有任何生产gate消费本诊断check。
 
 Podman4.9.3兼容修复详见运行册第5节：不使用与none网络冲突的DNS参数，不继承宿主DNS；显式只读空resolver与严格三绑定、无外部接口/路由及有界DNS/TCP canary均未获新source真实运行证明。跨平台checksum使用Node内建SHA256、拒symlink，不能把本地158项绿灯叫Mac/容器通过。
+
+## main 0.2.27前向整合边界
+
+本次在独立worktree正常merge main601e777，外部provider/GUI/版本/Homebrew指向均保留，不代表自动化获取导入插件的执行权。原工作树fb19及VSIX删除保持不动；只读预检的本地分支与远端目的分支分开，详见synthetic-preflight。九执行文件与773相同，新source为上述含main的merge提交；workflow最终HEAD必须另审，不沿用fb19批准。ci/release定义相对原fb19未改，发布硬停未解锁；main上的v0.2.27版本/公式是原作者变更，不是本自动维护发布，也未更改外部main发布策略。

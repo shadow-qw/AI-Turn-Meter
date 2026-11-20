@@ -72,4 +72,4 @@ DB v1升级v2只增加hold_reason/hold_generation/blocked_reason，从历史人�
 
 历史记录（不是当前批准值）：2026-11-20 N-I1/N-I2修复：新预检不再响应PR/不运行PR宿主测试；只在外置准确workflow/source SHA批准后，对固定维护分支push运行受审87d3d39源的九文件bootstrap。不是常驻可信候选门。CPU每种表示严格判型、负值/无限制/不完整pair/矛盾全拒绝；采证范围与外部依赖见deployment-and-hosted.md。F1及生产沙箱仍阻断。
 
-当前本地Podman4.9.3兼容source为773bb92fb59e865071e91e884c4824a4af709ac1，九摘要及next-before42已前向更新，尚未独立复审/批准/推送；当前采证只读门及运行边界以synthetic-preflight运行册、deployment-and-hosted为准。历史87d/42批准不得移用。
+当前本地Podman4.9.3兼容source为55114549a4f6841789bc3ac14218de0d2641c62b，九摘要及next-before42已前向更新，尚未独立复审/批准/推送；当前采证只读门及运行边界以synthetic-preflight运行册、deployment-and-hosted为准。历史87d/42批准不得移用。
