@@ -328,25 +328,44 @@ export function inspectLocalCodexConfig(codexHome = process.env.CODEX_HOME?.trim
     wireApi = providers[modelProvider].wire_api || null;
   }
 
-  let accessToken = null;
-  let accountId = null;
-  let apiKey = null;
+  let rawAccessToken = null;
+  let rawAccountId = null;
+  let authOpenAiApiKey = null;
   if (existsSync(authPath)) {
     try {
       const auth = JSON.parse(readFileSync(authPath, 'utf8'));
-      accessToken = auth?.tokens?.access_token || null;
-      accountId = auth?.tokens?.account_id || null;
+      rawAccessToken = auth?.tokens?.access_token || null;
+      rawAccountId = auth?.tokens?.account_id || null;
       if (typeof auth?.OPENAI_API_KEY === 'string' && auth.OPENAI_API_KEY.trim()) {
-        apiKey = auth.OPENAI_API_KEY.trim();
+        authOpenAiApiKey = auth.OPENAI_API_KEY.trim();
       }
     } catch {}
   }
-  if (!apiKey && providerEnvKey && process.env[providerEnvKey]) {
-    apiKey = process.env[providerEnvKey].trim();
+
+  let apiKey = null;
+  if (providerBaseUrl) {
+    // Custom third-party provider: never reuse ChatGPT OAuth tokens or accountId.
+    // When env_key is explicitly configured, only resolve that env var so OPENAI_API_KEY isn't leaked either.
+    if (providerEnvKey) {
+      if (process.env[providerEnvKey] && process.env[providerEnvKey].trim()) {
+        apiKey = process.env[providerEnvKey].trim();
+      }
+    } else {
+      apiKey = authOpenAiApiKey || (process.env.OPENAI_API_KEY ? process.env.OPENAI_API_KEY.trim() : null);
+    }
+  } else {
+    apiKey = authOpenAiApiKey;
+    if (!apiKey && providerEnvKey && process.env[providerEnvKey]) {
+      apiKey = process.env[providerEnvKey].trim();
+    }
+    if (!apiKey && process.env.OPENAI_API_KEY) {
+      apiKey = process.env.OPENAI_API_KEY.trim();
+    }
   }
-  if (!apiKey && process.env.OPENAI_API_KEY) {
-    apiKey = process.env.OPENAI_API_KEY.trim();
-  }
+
+  // Never send official ChatGPT OAuth token or ChatGPT-Account-Id to a custom third-party providerBaseUrl.
+  const accessToken = providerBaseUrl ? null : rawAccessToken;
+  const accountId = providerBaseUrl ? null : rawAccountId;
 
   const { baseUrl: chatgptBaseUrl } = resolveCodexUsageUrl(codexHome, configText);
   const effectiveBaseUrl = providerBaseUrl || (accessToken ? `${chatgptBaseUrl}/codex` : 'https://api.openai.com/v1');
@@ -359,13 +378,15 @@ export function inspectLocalCodexConfig(codexHome = process.env.CODEX_HOME?.trim
       : apiKey
         ? 'openai_api_key'
         : 'none';
+  const configured = authMode !== 'none' && authMode !== 'custom_provider_no_key';
 
   return {
     codexHome,
-    configured: authMode !== 'none',
+    configured,
     authMode,
     model: model || 'gpt-5-codex',
     modelProvider: modelProvider || (accessToken ? 'chatgpt-oauth' : 'openai'),
+    providerEnvKey: providerEnvKey || null,
     baseUrl: effectiveBaseUrl,
     wireApi: wireApi || (accessToken && !providerBaseUrl ? 'responses' : 'chat'),
     hasAccessToken: Boolean(accessToken),
@@ -695,6 +716,15 @@ export function evaluateCodexProtocolSignals({
   };
 }
 
+function formatCodexUnavailableSummary(cfg) {
+  if (cfg.authMode === 'custom_provider_no_key') {
+    return cfg.providerEnvKey
+      ? `自定义 Codex 提供商 (${cfg.modelProvider}) 缺少 API Key（请设置环境变量 ${cfg.providerEnvKey}）`
+      : `自定义 Codex 提供商 (${cfg.modelProvider}) 缺少 API Key，已拒绝发送官方 ChatGPT OAuth 凭证`;
+  }
+  return '未在 ~/.codex 找到有效登录凭证（auth.json 或 API Key）';
+}
+
 /**
  * L0.5: Probe local Codex endpoint headers & routing state.
  */
@@ -706,13 +736,17 @@ export async function probeCodexProtocol({ codexHome, modelOverride = null, fetc
       ok: false,
       mode: 'codex_protocol',
       targetType: 'codex',
-      targetName: 'Codex 本地配置',
+      targetName: cfg.authMode === 'custom_provider_no_key' ? `Codex (${cfg.modelProvider})` : 'Codex 本地配置',
       requestedModel,
       responseModel: null,
       verdict: 'unavailable',
       score: null,
-      summary: '未在 ~/.codex 找到有效登录凭证（auth.json 或 API Key）',
-      details: { authMode: cfg.authMode, baseUrl: cfg.baseUrl },
+      summary: formatCodexUnavailableSummary(cfg),
+      details: {
+        authMode: cfg.authMode,
+        baseUrl: cfg.baseUrl,
+        ...(cfg.providerEnvKey ? { providerEnvKey: cfg.providerEnvKey } : {}),
+      },
     };
   }
 
@@ -952,13 +986,18 @@ export async function runQuickCapabilityProbes({
         ok: false,
         mode: 'quick',
         targetType: 'codex',
-        targetName: 'Codex 本地配置',
-        requestedModel: cfg.model,
+        targetName: cfg.authMode === 'custom_provider_no_key' ? `Codex (${cfg.modelProvider})` : 'Codex 本地配置',
+        requestedModel: endpointConfig?.model || cfg.model,
         responseModel: null,
         verdict: 'unavailable',
         score: null,
-        summary: '未在 ~/.codex 找到有效登录凭证',
-        details: { probes: [] },
+        summary: formatCodexUnavailableSummary(cfg),
+        details: {
+          authMode: cfg.authMode,
+          baseUrl: cfg.baseUrl,
+          ...(cfg.providerEnvKey ? { providerEnvKey: cfg.providerEnvKey } : {}),
+          probes: [],
+        },
       };
     }
     conn = {
@@ -1295,14 +1334,18 @@ export async function runTokenDistributionFingerprint({
         ok: false,
         mode: 'deep',
         targetType: 'codex',
-        targetName: 'Codex 本地配置',
-        requestedModel: cfg.model,
+        targetName: cfg.authMode === 'custom_provider_no_key' ? `Codex (${cfg.modelProvider})` : 'Codex 本地配置',
+        requestedModel: endpointConfig?.model || cfg.model,
         responseModel: null,
         verdict: 'unavailable',
         score: null,
         jsDistance: null,
-        summary: '未在 ~/.codex 找到有效登录凭证',
-        details: {},
+        summary: formatCodexUnavailableSummary(cfg),
+        details: {
+          authMode: cfg.authMode,
+          baseUrl: cfg.baseUrl,
+          ...(cfg.providerEnvKey ? { providerEnvKey: cfg.providerEnvKey } : {}),
+        },
       };
     }
     conn = {

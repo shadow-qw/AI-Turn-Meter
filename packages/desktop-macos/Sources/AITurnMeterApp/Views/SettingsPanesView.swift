@@ -18,21 +18,28 @@ struct ProviderSettingsDetailView: View {
   @ViewBuilder
   private var builtInBody: some View {
     let entry = vm.apps[key]
-    let installed = entry?.installed ?? false
-    let enabled = vm.isToolEnabled(key)
-    let active = installed && vm.isActiveOverall && enabled
-    let isDimmed = !installed || !enabled || !vm.masterEnabled
-    let needsInline = installed && vm.isActiveOverall && enabled && entry?.cdpPort == nil
     let card = vm.usageData?.cards?[key]
     let latestTurn = entry?.latestTurn
     let windows = card?.quotaWindows ?? []
+    let appInstalled = entry?.installed ?? false
+    let hasCliActivity = !windows.isEmpty
+      || card?.accountEmail != nil
+      || latestTurn != nil
+      || (card?.today.turnCount ?? 0) > 0
+      || (card?.days30.turnCount ?? 0) > 0
+    let isAvailable = appInstalled || hasCliActivity
+    let enabled = vm.isToolEnabled(key)
+    let active = isAvailable && vm.isActiveOverall && enabled
+    let isDimmed = !isAvailable || !enabled || !vm.masterEnabled
+    let needsInline = appInstalled && vm.isActiveOverall && enabled && entry?.cdpPort == nil
 
     let statusText: String = {
-      if !installed { return "未安装" }
+      if !isAvailable { return "未安装" }
       if !vm.daemonOnline { return "后台未启动" }
       if !vm.masterEnabled { return "全局暂停" }
       if !enabled { return "已关闭" }
       if let port = entry?.cdpPort { return "正常运行 · CDP:\(port)" }
+      if !appInstalled { return "正常运行 · CLI 模式" }
       return "未开启调试口"
     }()
 
@@ -42,12 +49,12 @@ struct ProviderSettingsDetailView: View {
         SettingsGroupCard {
           HStack(spacing: 10) {
             ToolGlyph.iconView(for: key, size: 20)
-              .foregroundColor(installed && enabled && vm.masterEnabled ? .primary : .secondary)
+              .foregroundColor(isAvailable && enabled && vm.masterEnabled ? .primary : .secondary)
               .frame(width: 24, height: 24)
 
             Text(vm.displayTitle(for: key))
               .font(.system(size: 14.5, weight: .semibold))
-              .foregroundColor(enabled && vm.masterEnabled ? .primary : .secondary)
+              .foregroundColor(isAvailable && enabled && vm.masterEnabled ? .primary : .secondary)
 
             Spacer()
 
@@ -63,13 +70,13 @@ struct ProviderSettingsDetailView: View {
             .help("刷新")
 
             Toggle("", isOn: Binding(
-              get: { installed && enabled && vm.isActiveOverall },
+              get: { isAvailable && enabled && vm.isActiveOverall },
               set: { vm.setToolEnabled(key, enabled: $0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()
             .controlSize(.small)
-            .disabled(!installed || vm.busy || vm.runtime.runningFromDmg)
+            .disabled(!isAvailable || vm.busy || vm.runtime.runningFromDmg)
           }
           .padding(.horizontal, 14)
           .padding(.vertical, 11)
@@ -89,7 +96,7 @@ struct ProviderSettingsDetailView: View {
                 .controlSize(.mini)
                 .disabled(vm.busy)
                 .help("温和退出并带调试口重新打开 \(vm.displayTitle(for: key))，以显示消息旁 TPS")
-              } else if installed, let appPath = entry?.appPath {
+              } else if appInstalled, let appPath = entry?.appPath {
                 Button("打开") {
                   NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
                 }
@@ -106,13 +113,14 @@ struct ProviderSettingsDetailView: View {
             Divider().padding(.leading, 14)
             settingsControlRow(title: "软件内置 TPS 显示") {
               Toggle("", isOn: Binding(
-                get: { installed && vm.inlineMasterEnabled && vm.isInlineToolEnabled(key) && vm.isActiveOverall },
+                get: { appInstalled && vm.inlineMasterEnabled && vm.isInlineToolEnabled(key) && vm.isActiveOverall },
                 set: { vm.setInlineToolEnabled(key, enabled: $0) }
               ))
               .toggleStyle(.switch)
               .labelsHidden()
               .controlSize(.small)
-              .disabled(!installed || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
+              .disabled(!appInstalled || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
+              .help(appInstalled ? "在桌面客户端消息旁显示 TPS" : "仅桌面客户端支持内置 TPS 显示")
             }
 
             if card?.accountEmail != nil || card?.planTitle != nil {
@@ -243,6 +251,22 @@ struct ProviderSettingsDetailView: View {
                 settingsKVRow(title: "按需超额用量", value: resetCredits)
               }
               Divider().padding(.leading, 14)
+            } else if let hint = card?.quotaHint, !hint.isEmpty {
+              HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text("套餐剩余额度")
+                    .font(.system(size: 12.5))
+                    .foregroundColor(.primary)
+                  Text(hint)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 10)
+              Divider().padding(.leading, 14)
             }
             settingsKVRow(
               title: "今日",
@@ -262,10 +286,19 @@ struct ProviderSettingsDetailView: View {
     }
   }
 
+  private func quotaBarColor(for level: QuotaHealthLevel) -> Color {
+    switch level {
+    case .normal: return CodexBarPalette.tealBar
+    case .warning: return Color(red: 0.94, green: 0.56, blue: 0.14)
+    case .critical: return Color(red: 0.88, green: 0.24, blue: 0.24)
+    }
+  }
+
   private func providerQuotaRow(win: CardQuotaWindow) -> some View {
     let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
     let clamped = min(1.0, max(0.0, pct / 100.0))
     let pctRounded = Int(pct.rounded())
+    let barColor = quotaBarColor(for: win.healthLevel)
 
     return VStack(alignment: .leading, spacing: 6) {
       HStack {
@@ -287,7 +320,7 @@ struct ProviderSettingsDetailView: View {
             .fill(Color.primary.opacity(0.09))
           if clamped > 0 {
             Capsule()
-              .fill(CodexBarPalette.tealBar)
+              .fill(barColor)
               .frame(width: max(5, geo.size.width * CGFloat(clamped)))
           }
           if let pacePct = vm.quotaDisplayMode.displayPacePct(fromRemainingPace: win.pacePct) {
@@ -524,7 +557,10 @@ struct ExternalProviderDetailView: View {
             if !windows.isEmpty {
               ForEach(Array(windows.enumerated()), id: \.element.id) { idx, win in
                 if idx > 0 { Divider().padding(.leading, 14) }
-                externalQuotaRow(win: win)
+                externalQuotaRow(
+                  win: win,
+                  isPrimaryBillingWindow: windows.count == 1 || win.id == windows.first?.id
+                )
               }
               Divider().padding(.leading, 14)
             } else if let hint = card?.quotaHint ?? meta?.error, !hint.isEmpty {
@@ -545,12 +581,35 @@ struct ExternalProviderDetailView: View {
 
             let b = card?.billingSummary
             let periodLabel = b?.periodLabel ?? "本月"
+            let periodUsed: Double? = b?.periodCost ?? {
+              if let limit = b?.periodLimit, let rem = b?.periodRemaining {
+                return max(0, limit - rem)
+              }
+              return nil
+            }()
             if let rem = b?.periodRemaining {
-              settingsKVRow(
-                title: "\(periodLabel)剩余余额",
-                value: MeterFormat.money(rem, symbol: curSym),
-                valueColor: .primary
-              )
+              if vm.quotaDisplayMode == .used, let used = periodUsed {
+                settingsKVRow(
+                  title: "\(periodLabel)已消耗",
+                  value: MeterFormat.money(used, symbol: curSym),
+                  valueColor: .primary
+                )
+                Divider().padding(.leading, 14)
+                settingsKVRow(
+                  title: "\(periodLabel)剩余余额",
+                  value: MeterFormat.money(rem, symbol: curSym)
+                )
+              } else {
+                settingsKVRow(
+                  title: "\(periodLabel)剩余余额",
+                  value: MeterFormat.money(rem, symbol: curSym),
+                  valueColor: .primary
+                )
+                if let used = periodUsed {
+                  Divider().padding(.leading, 14)
+                  settingsKVRow(title: "\(periodLabel)已消耗", value: MeterFormat.money(used, symbol: curSym))
+                }
+              }
               if let limit = b?.periodLimit, limit > 0 {
                 Divider().padding(.leading, 14)
                 settingsKVRow(title: "\(periodLabel)限额", value: MeterFormat.money(limit, symbol: curSym))
@@ -567,8 +626,8 @@ struct ExternalProviderDetailView: View {
               )
               Divider().padding(.leading, 14)
               settingsKVRow(
-                title: "\(periodLabel)已用",
-                value: MeterFormat.money(b?.periodCost ?? card?.days30.costUsd, symbol: curSym)
+                title: "\(periodLabel)已消耗",
+                value: MeterFormat.money(periodUsed ?? card?.days30.costUsd, symbol: curSym)
               )
               if let limit = b?.periodLimit, limit > 0 {
                 Divider().padding(.leading, 14)
@@ -787,10 +846,19 @@ struct ExternalProviderDetailView: View {
     }
   }
 
-  private func externalQuotaRow(win: CardQuotaWindow) -> some View {
+  private func externalQuotaBarColor(for level: QuotaHealthLevel) -> Color {
+    switch level {
+    case .normal: return CodexBarPalette.tealBar
+    case .warning: return Color(red: 0.94, green: 0.56, blue: 0.14)
+    case .critical: return Color(red: 0.88, green: 0.24, blue: 0.24)
+    }
+  }
+
+  private func externalQuotaRow(win: CardQuotaWindow, isPrimaryBillingWindow: Bool) -> some View {
     let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
     let clamped = min(1.0, max(0.0, pct / 100.0))
     let pctRounded = Int(pct.rounded())
+    let barColor = externalQuotaBarColor(for: win.healthLevel)
 
     return VStack(alignment: .leading, spacing: 6) {
       HStack {
@@ -811,7 +879,7 @@ struct ExternalProviderDetailView: View {
           Capsule().fill(Color.primary.opacity(0.09))
           if clamped > 0 {
             Capsule()
-              .fill(CodexBarPalette.tealBar)
+              .fill(barColor)
               .frame(width: max(5, geo.size.width * CGFloat(clamped)))
           }
           if let pacePct = vm.quotaDisplayMode.displayPacePct(fromRemainingPace: win.pacePct) {
@@ -831,7 +899,19 @@ struct ExternalProviderDetailView: View {
       }
       .frame(height: 6)
 
-      if let sub = win.subtitle, !sub.isEmpty {
+      let resolvedSub: String? = {
+        let card = vm.usageData?.cards?[key]
+        if isPrimaryBillingWindow,
+           vm.quotaDisplayMode == .used,
+           let b = card?.billingSummary,
+           let limit = b.periodLimit, limit > 0,
+           let used = b.periodCost ?? b.periodRemaining.map({ max(0, limit - $0) }) {
+          let curSym = card?.resolvedCurrencySymbol ?? "$"
+          return "已用 \(MeterFormat.money(used, symbol: curSym)) / 限额 \(MeterFormat.money(limit, symbol: curSym))"
+        }
+        return win.subtitle
+      }()
+      if let sub = resolvedSub, !sub.isEmpty {
         Text(sub)
           .font(.system(size: 11))
           .monospacedDigit()
@@ -1254,6 +1334,16 @@ struct GeneralSettingsPaneView: View {
             Toggle("", isOn: Binding(
               get: { vm.hideDockIcon },
               set: { vm.setHideDockIcon($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+          }
+
+          Divider().padding(.leading, 14)
+          settingsControlRow(title: "配额与预算通知提醒") {
+            Toggle("", isOn: Binding(
+              get: { vm.alertsEnabled },
+              set: { vm.setAlertsEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()

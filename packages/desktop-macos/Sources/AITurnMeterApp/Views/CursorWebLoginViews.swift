@@ -3,6 +3,16 @@ import SwiftUI
 import WebKit
 
 struct CursorAuthWebView: NSViewRepresentable {
+  private static let sessionCookieNames: Set<String> = [
+    "WorkosCursorSessionToken",
+    "__Secure-next-auth.session-token",
+    "next-auth.session-token",
+    "wos-session",
+    "__Secure-wos-session",
+    "authjs.session-token",
+    "__Secure-authjs.session-token",
+  ]
+
   let clearExistingCookies: Bool
   let manualCheckToken: Int
   let onStatusChanged: (String) -> Void
@@ -51,20 +61,11 @@ struct CursorAuthWebView: NSViewRepresentable {
 
       store.getAllCookies { [weak self] cookies in
         guard let self = self, !self.didCapture else { return }
-        let sessionNames: Set<String> = [
-          "WorkosCursorSessionToken",
-          "__Secure-next-auth.session-token",
-          "next-auth.session-token",
-          "wos-session",
-          "__Secure-wos-session",
-          "authjs.session-token",
-          "__Secure-authjs.session-token",
-        ]
         let cursorCookies = cookies.filter {
           let dom = $0.domain.lowercased()
           return (dom.contains("cursor.com") || dom.contains("cursor.sh")) && !$0.value.isEmpty
         }
-        let hasSession = cursorCookies.contains { sessionNames.contains($0.name) }
+        let hasSession = cursorCookies.contains { CursorAuthWebView.sessionCookieNames.contains($0.name) }
         guard hasSession else {
           if force {
             DispatchQueue.main.async {
@@ -125,7 +126,9 @@ struct CursorAuthWebView: NSViewRepresentable {
       let cookieStore = cfg.websiteDataStore.httpCookieStore
       cookieStore.getAllCookies { cookies in
         let toDelete = cookies.filter {
-          $0.domain.lowercased().contains("cursor.com") && $0.name == "WorkosCursorSessionToken"
+          let dom = $0.domain.lowercased()
+          return (dom.contains("cursor.com") || dom.contains("cursor.sh")) &&
+            Self.sessionCookieNames.contains($0.name)
         }
         let group = DispatchGroup()
         for c in toDelete {
@@ -161,7 +164,13 @@ struct CursorWebLoginSheetView: View {
   @ObservedObject var vm: MeterViewModel
   @State private var statusText: String = "正在加载 cursor.com 登录页…"
   @State private var manualCheckToken: Int = 0
-  @State private var clearOnOpen: Bool = false
+  @State private var clearOnOpen: Bool
+
+  @MainActor
+  init(vm: MeterViewModel) {
+    self.vm = vm
+    self._clearOnOpen = State(initialValue: vm.hasCursorCookie)
+  }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -213,8 +222,5 @@ struct CursorWebLoginSheetView: View {
       )
     }
     .frame(width: 720, height: 560)
-    .onAppear {
-      clearOnOpen = vm.hasCursorCookie
-    }
   }
 }

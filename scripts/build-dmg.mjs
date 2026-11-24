@@ -12,6 +12,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -21,8 +22,65 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
-const version = pkg.version;
+
+export function parseSemverTuple(raw) {
+  const m = String(raw || '').trim().match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+  if (!m) return null;
+  return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0];
+}
+
+export function sortSemverDesc(versions) {
+  return [...versions].sort((a, b) => {
+    const ta = parseSemverTuple(a);
+    const tb = parseSemverTuple(b);
+    if (ta && tb) {
+      for (let i = 0; i < 3; i += 1) {
+        if (tb[i] !== ta[i]) return tb[i] - ta[i];
+      }
+      return String(b).localeCompare(String(a));
+    }
+    if (ta) return -1;
+    if (tb) return 1;
+    return String(b).localeCompare(String(a));
+  });
+}
+
+export function shouldCopyBundlePath(src) {
+  const normalized = String(src || '').replace(/\\/g, '/');
+  return basename(normalized) !== '.DS_Store';
+}
+
+export function assertVersionParity(rootDir = ROOT, { warn = (msg) => console.warn(msg) } = {}) {
+  const rootPkg = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
+  const extPkgPath = join(rootDir, 'packages', 'vscode-extension', 'package.json');
+  const extPkg = JSON.parse(readFileSync(extPkgPath, 'utf8'));
+  const rootVersion = String(rootPkg.version || '').trim();
+  const vsixVersion = String(extPkg.version || '').trim();
+  if (!rootVersion || rootVersion !== vsixVersion) {
+    throw new Error(
+      `Version mismatch: package.json (${rootVersion || 'missing'}) !== packages/vscode-extension/package.json (${vsixVersion || 'missing'}). Align both versions before building.`
+    );
+  }
+  const vmSwiftPath = join(
+    rootDir,
+    'packages',
+    'desktop-macos',
+    'Sources',
+    'AITurnMeterApp',
+    'Runtime',
+    'MeterViewModel.swift'
+  );
+  if (existsSync(vmSwiftPath)) {
+    const swiftSrc = readFileSync(vmSwiftPath, 'utf8');
+    const m = swiftSrc.match(/CFBundleShortVersionString[^\n]*\?\?\s*"([^"]+)"/);
+    if (m && m[1] !== rootVersion) {
+      warn(
+        `[WARN] MeterViewModel.swift fallback version (${m[1]}) differs from package.json (${rootVersion})`
+      );
+    }
+  }
+  return { rootVersion, vsixVersion };
+}
 
 function isStandaloneNodeBinary(binPath) {
   if (!binPath || !existsSync(binPath)) return false;
@@ -58,7 +116,7 @@ function findStandaloneNode() {
 
   const nvmDir = join(homedir(), '.nvm', 'versions', 'node');
   if (existsSync(nvmDir)) {
-    for (const v of readdirSync(nvmDir).sort().reverse()) {
+    for (const v of sortSemverDesc(readdirSync(nvmDir))) {
       candidates.push(join(nvmDir, v, 'bin', 'node'));
     }
   }
@@ -167,59 +225,63 @@ for (name, px) in sizes {
   execFileSync('/usr/bin/iconutil', ['-c', 'icns', iconsetDir, '-o', icnsOut], { stdio: 'inherit' });
 }
 
-const nodeBin = findStandaloneNode();
-console.log(`Using standalone Node runtime: ${nodeBin}`);
+function main() {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  const { rootVersion: version } = assertVersionParity(ROOT);
 
-execFileSync(process.execPath, [join(ROOT, 'scripts', 'package-vsix.mjs')], { stdio: 'inherit' });
+  const nodeBin = findStandaloneNode();
+  console.log(`Using standalone Node runtime: ${nodeBin}`);
 
-const distDir = join(ROOT, 'dist');
-mkdirSync(distDir, { recursive: true });
-for (const f of readdirSync(distDir)) {
-  if (/^AI-Turn-Meter-.*\.dmg(\.sha256)?$/.test(f)) {
-    rmSync(join(distDir, f), { force: true });
+  execFileSync(process.execPath, [join(ROOT, 'scripts', 'package-vsix.mjs')], { stdio: 'inherit' });
+
+  const distDir = join(ROOT, 'dist');
+  mkdirSync(distDir, { recursive: true });
+  for (const f of readdirSync(distDir)) {
+    if (/^AI-Turn-Meter-.*\.dmg(\.sha256)?$/.test(f)) {
+      rmSync(join(distDir, f), { force: true });
+    }
   }
-}
-const stageDir = join(distDir, '.dmg-stage');
-const appDir = join(stageDir, 'AI Turn Meter.app');
-const contentsDir = join(appDir, 'Contents');
-const macosDir = join(contentsDir, 'MacOS');
-const resDir = join(contentsDir, 'Resources');
-const runtimeDir = join(resDir, 'runtime');
-const iconsetDir = join(distDir, '.AppIcon.iconset');
-const outDmg = join(distDir, `AI-Turn-Meter-${version}-arm64.dmg`);
+  const stageDir = join(distDir, '.dmg-stage');
+  const appDir = join(stageDir, 'AI Turn Meter.app');
+  const contentsDir = join(appDir, 'Contents');
+  const macosDir = join(contentsDir, 'MacOS');
+  const resDir = join(contentsDir, 'Resources');
+  const runtimeDir = join(resDir, 'runtime');
+  const iconsetDir = join(distDir, '.AppIcon.iconset');
+  const outDmg = join(distDir, `AI-Turn-Meter-${version}-arm64.dmg`);
 
-rmSync(stageDir, { recursive: true, force: true });
-rmSync(iconsetDir, { recursive: true, force: true });
-mkdirSync(macosDir, { recursive: true });
-mkdirSync(join(runtimeDir, 'packages'), { recursive: true });
-mkdirSync(join(runtimeDir, 'dist'), { recursive: true });
+  rmSync(stageDir, { recursive: true, force: true });
+  rmSync(iconsetDir, { recursive: true, force: true });
+  mkdirSync(macosDir, { recursive: true });
+  mkdirSync(join(runtimeDir, 'packages'), { recursive: true });
+  mkdirSync(join(runtimeDir, 'dist'), { recursive: true });
 
-// 1. Compile native Swift Package binary (release arm64)
-const desktopPkgDir = join(ROOT, 'packages', 'desktop-macos');
-const appExe = join(macosDir, 'AITurnMeter');
-const swiftEnv = { ...process.env };
-delete swiftEnv.TOOLCHAINS;
-execFileSync('/usr/bin/swift', ['build', '-c', 'release', '--arch', 'arm64', '--package-path', desktopPkgDir], {
-  stdio: 'inherit',
-  env: swiftEnv,
-});
-const swiftBinDir = execFileSync(
-  '/usr/bin/swift',
-  ['build', '-c', 'release', '--arch', 'arm64', '--package-path', desktopPkgDir, '--show-bin-path'],
-  { encoding: 'utf8', env: swiftEnv }
-).trim();
-const builtExe = join(swiftBinDir, 'AITurnMeterApp');
-if (!existsSync(builtExe)) {
-  throw new Error(`SwiftPM release binary not found: ${builtExe}`);
-}
-cpSync(builtExe, appExe);
-chmodSync(appExe, 0o755);
+  // 1. Compile native Swift Package binary (release arm64)
+  const desktopPkgDir = join(ROOT, 'packages', 'desktop-macos');
+  const appExe = join(macosDir, 'AITurnMeter');
+  const swiftEnv = { ...process.env };
+  delete swiftEnv.TOOLCHAINS;
+  execFileSync('/usr/bin/swift', ['build', '-c', 'release', '--arch', 'arm64', '--package-path', desktopPkgDir], {
+    stdio: 'inherit',
+    env: swiftEnv,
+  });
+  const swiftBinDir = execFileSync(
+    '/usr/bin/swift',
+    ['build', '-c', 'release', '--arch', 'arm64', '--package-path', desktopPkgDir, '--show-bin-path'],
+    { encoding: 'utf8', env: swiftEnv }
+  ).trim();
+  const builtExe = join(swiftBinDir, 'AITurnMeterApp');
+  if (!existsSync(builtExe)) {
+    throw new Error(`SwiftPM release binary not found: ${builtExe}`);
+  }
+  cpSync(builtExe, appExe);
+  chmodSync(appExe, 0o755);
 
-// 2. Icon + Info.plist
-generateAppIcon(iconsetDir, join(resDir, 'AppIcon.icns'));
-rmSync(iconsetDir, { recursive: true, force: true });
+  // 2. Icon + Info.plist
+  generateAppIcon(iconsetDir, join(resDir, 'AppIcon.icns'));
+  rmSync(iconsetDir, { recursive: true, force: true });
 
-const infoPlist = `<?xml version="1.0" encoding="UTF-8"?>
+  const infoPlist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -252,50 +314,68 @@ const infoPlist = `<?xml version="1.0" encoding="UTF-8"?>
 </dict>
 </plist>
 `;
-writeFileSync(join(contentsDir, 'Info.plist'), infoPlist);
+  writeFileSync(join(contentsDir, 'Info.plist'), infoPlist);
 
-// 3. Copy standalone Node runtime + JS packages + packaged VSIX
-const bundledNode = join(runtimeDir, 'node');
-cpSync(nodeBin, bundledNode);
-chmodSync(bundledNode, 0o755);
+  // 3. Copy standalone Node runtime + JS packages + packaged VSIX
+  const bundledNode = join(runtimeDir, 'node');
+  cpSync(nodeBin, bundledNode);
+  chmodSync(bundledNode, 0o755);
 
-const repoArg = process.argv.find((a) => a.startsWith('--repo='));
-const updateUrlArg = process.argv.find((a) => a.startsWith('--update-url='));
-const resolvedFeedUrl = updateUrlArg
-  ? updateUrlArg.split('=')[1].trim()
-  : repoArg
-    ? `https://github.com/${repoArg.split('=')[1].trim()}/releases/latest`
-    : pkg.updateFeedUrl || null;
-const runtimePkg = resolvedFeedUrl ? { ...pkg, updateFeedUrl: resolvedFeedUrl } : pkg;
-writeFileSync(join(runtimeDir, 'package.json'), `${JSON.stringify(runtimePkg, null, 2)}\n`);
+  const repoArg = process.argv.find((a) => a.startsWith('--repo='));
+  const updateUrlArg = process.argv.find((a) => a.startsWith('--update-url='));
+  const resolvedFeedUrl = updateUrlArg
+    ? updateUrlArg.split('=')[1].trim()
+    : repoArg
+      ? `https://github.com/${repoArg.split('=')[1].trim()}/releases/latest`
+      : pkg.updateFeedUrl || null;
+  const runtimePkg = resolvedFeedUrl ? { ...pkg, updateFeedUrl: resolvedFeedUrl } : pkg;
+  writeFileSync(join(runtimeDir, 'package.json'), `${JSON.stringify(runtimePkg, null, 2)}\n`);
 
-cpSync(join(ROOT, 'packages', 'daemon'), join(runtimeDir, 'packages', 'daemon'), { recursive: true });
-cpSync(join(ROOT, 'packages', 'vscode-extension'), join(runtimeDir, 'packages', 'vscode-extension'), {
-  recursive: true,
-});
-cpSync(join(distDir, 'ai-turn-meter.vsix'), join(runtimeDir, 'dist', 'ai-turn-meter.vsix'));
-chmodSync(join(runtimeDir, 'packages', 'daemon', 'bin', 'cli.mjs'), 0o755);
-chmodSync(join(runtimeDir, 'packages', 'daemon', 'bin', 'daemon.mjs'), 0o755);
-chmodSync(join(runtimeDir, 'packages', 'daemon', 'bin', 'cursor-hook.mjs'), 0o755);
+  cpSync(join(ROOT, 'packages', 'daemon'), join(runtimeDir, 'packages', 'daemon'), {
+    recursive: true,
+    filter: shouldCopyBundlePath,
+  });
+  cpSync(join(ROOT, 'packages', 'vscode-extension'), join(runtimeDir, 'packages', 'vscode-extension'), {
+    recursive: true,
+    filter: shouldCopyBundlePath,
+  });
+  cpSync(join(distDir, 'ai-turn-meter.vsix'), join(runtimeDir, 'dist', 'ai-turn-meter.vsix'));
+  chmodSync(join(runtimeDir, 'packages', 'daemon', 'bin', 'cli.mjs'), 0o755);
+  chmodSync(join(runtimeDir, 'packages', 'daemon', 'bin', 'daemon.mjs'), 0o755);
+  chmodSync(join(runtimeDir, 'packages', 'daemon', 'bin', 'cursor-hook.mjs'), 0o755);
 
-// 4. Ad-hoc sign inside-out and verify bundle signature
-execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', bundledNode], { stdio: 'inherit' });
-execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', appExe], { stdio: 'inherit' });
-execFileSync('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', appDir], { stdio: 'inherit' });
-execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', appDir], { stdio: 'inherit' });
+  // 4. Ad-hoc sign inside-out and verify bundle signature
+  execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', bundledNode], { stdio: 'inherit' });
+  execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', appExe], { stdio: 'inherit' });
+  execFileSync('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', appDir], { stdio: 'inherit' });
+  execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', appDir], { stdio: 'inherit' });
 
-// 5. Add Applications drag-drop link and create compressed DMG
-symlinkSync('/Applications', join(stageDir, 'Applications'));
-rmSync(outDmg, { force: true });
-execFileSync(
-  '/usr/bin/hdiutil',
-  ['create', '-volname', 'AI Turn Meter', '-srcfolder', stageDir, '-ov', '-format', 'UDZO', outDmg],
-  { stdio: 'inherit' }
-);
+  // 5. Add Applications drag-drop link and create compressed DMG
+  symlinkSync('/Applications', join(stageDir, 'Applications'));
+  rmSync(outDmg, { force: true });
+  execFileSync(
+    '/usr/bin/hdiutil',
+    ['create', '-volname', 'AI Turn Meter', '-srcfolder', stageDir, '-ov', '-format', 'UDZO', outDmg],
+    { stdio: 'inherit' }
+  );
 
-const dmgSha256 = createHash('sha256').update(readFileSync(outDmg)).digest('hex');
-writeFileSync(`${outDmg}.sha256`, `${dmgSha256}  ${basename(outDmg)}\n`);
+  const dmgSha256 = createHash('sha256').update(readFileSync(outDmg)).digest('hex');
+  writeFileSync(`${outDmg}.sha256`, `${dmgSha256}  ${basename(outDmg)}\n`);
 
-rmSync(stageDir, { recursive: true, force: true });
-console.log(`Built DMG: ${outDmg}`);
-console.log(`SHA-256:   ${dmgSha256}`);
+  rmSync(stageDir, { recursive: true, force: true });
+  console.log(`Built DMG: ${outDmg}`);
+  console.log(`SHA-256:   ${dmgSha256}`);
+}
+
+function isDirectExecution() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]));
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectExecution()) {
+  main();
+}

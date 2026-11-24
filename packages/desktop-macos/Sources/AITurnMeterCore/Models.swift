@@ -7,9 +7,11 @@ public struct TurnSummary: Decodable, Identifiable {
   public let toolLabel: String?
   public let model: String?
   public let workspacePath: String?
+  public let callCount: Int?
   public let totalInputTokens: Int?
   public let cacheReadTokens: Int?
   public let outputTokens: Int?
+  public let thinkingTokens: Int?
   public let cacheRatePct: Double?
   public let inlineText: String?
   public let tps: Double?
@@ -17,6 +19,44 @@ public struct TurnSummary: Decodable, Identifiable {
   public let estimatedCostUsd: Double?
   public let cacheSavingsUsd: Double?
   public let replyPreview: String?
+
+  public init(
+    turnUid: String? = nil,
+    tool: String? = nil,
+    toolLabel: String? = nil,
+    model: String? = nil,
+    workspacePath: String? = nil,
+    callCount: Int? = nil,
+    totalInputTokens: Int? = nil,
+    cacheReadTokens: Int? = nil,
+    outputTokens: Int? = nil,
+    thinkingTokens: Int? = nil,
+    cacheRatePct: Double? = nil,
+    inlineText: String? = nil,
+    tps: Double? = nil,
+    completedAtMs: Double? = nil,
+    estimatedCostUsd: Double? = nil,
+    cacheSavingsUsd: Double? = nil,
+    replyPreview: String? = nil
+  ) {
+    self.turnUid = turnUid
+    self.tool = tool
+    self.toolLabel = toolLabel
+    self.model = model
+    self.workspacePath = workspacePath
+    self.callCount = callCount
+    self.totalInputTokens = totalInputTokens
+    self.cacheReadTokens = cacheReadTokens
+    self.outputTokens = outputTokens
+    self.thinkingTokens = thinkingTokens
+    self.cacheRatePct = cacheRatePct
+    self.inlineText = inlineText
+    self.tps = tps
+    self.completedAtMs = completedAtMs
+    self.estimatedCostUsd = estimatedCostUsd
+    self.cacheSavingsUsd = cacheSavingsUsd
+    self.replyPreview = replyPreview
+  }
 }
 
 public struct TurnsListResponse: Decodable {
@@ -39,6 +79,40 @@ public struct UsageTotals: Decodable {
   public let cacheSavingsUsd: Double?
   public let pricedTurnCount: Int
   public let unpricedTurnCount: Int
+
+  public init(
+    turnCount: Int = 0,
+    callCount: Int = 0,
+    totalInputTokens: Int = 0,
+    uncachedInputTokens: Int = 0,
+    cacheReadTokens: Int = 0,
+    cacheWriteTokens: Int = 0,
+    outputTokens: Int = 0,
+    thinkingTokens: Int = 0,
+    totalTokens: Int = 0,
+    cacheRatePct: Double? = nil,
+    avgTps: Double? = nil,
+    estimatedCostUsd: Double? = nil,
+    cacheSavingsUsd: Double? = nil,
+    pricedTurnCount: Int = 0,
+    unpricedTurnCount: Int = 0
+  ) {
+    self.turnCount = turnCount
+    self.callCount = callCount
+    self.totalInputTokens = totalInputTokens
+    self.uncachedInputTokens = uncachedInputTokens
+    self.cacheReadTokens = cacheReadTokens
+    self.cacheWriteTokens = cacheWriteTokens
+    self.outputTokens = outputTokens
+    self.thinkingTokens = thinkingTokens
+    self.totalTokens = totalTokens
+    self.cacheRatePct = cacheRatePct
+    self.avgTps = avgTps
+    self.estimatedCostUsd = estimatedCostUsd
+    self.cacheSavingsUsd = cacheSavingsUsd
+    self.pricedTurnCount = pricedTurnCount
+    self.unpricedTurnCount = unpricedTurnCount
+  }
 }
 
 public struct UsageToolRow: Decodable, Identifiable {
@@ -51,6 +125,7 @@ public struct UsageToolRow: Decodable, Identifiable {
   public let totalInputTokens: Int
   public let cacheReadTokens: Int
   public let outputTokens: Int
+  public let thinkingTokens: Int?
   public let totalTokens: Int
   public let cacheRatePct: Double?
   public let avgTps: Double?
@@ -70,6 +145,7 @@ public struct UsageModelRow: Decodable, Identifiable {
   public let totalInputTokens: Int
   public let cacheReadTokens: Int
   public let outputTokens: Int
+  public let thinkingTokens: Int?
   public let totalTokens: Int
   public let cacheRatePct: Double?
   public let avgTps: Double?
@@ -218,6 +294,26 @@ public struct CardBillingSummary: Decodable {
   public let periodRemaining: Double?
   public let periodTokens: Int?
   public let updatedAtMs: Double?
+
+  public init(
+    todayCost: Double? = nil,
+    todayTokens: Int? = nil,
+    periodLabel: String? = nil,
+    periodCost: Double? = nil,
+    periodLimit: Double? = nil,
+    periodRemaining: Double? = nil,
+    periodTokens: Int? = nil,
+    updatedAtMs: Double? = nil
+  ) {
+    self.todayCost = todayCost
+    self.todayTokens = todayTokens
+    self.periodLabel = periodLabel
+    self.periodCost = periodCost
+    self.periodLimit = periodLimit
+    self.periodRemaining = periodRemaining
+    self.periodTokens = periodTokens
+    self.updatedAtMs = updatedAtMs
+  }
 }
 
 public struct CardBreakdownItem: Decodable, Identifiable {
@@ -244,6 +340,12 @@ public struct CardQuotaWindow: Decodable, Identifiable {
   public let resetText: String?
   public let pacePct: Double?
   public let subtitle: String?
+  public let group: String?
+  public let windowKind: String?
+
+  public var healthLevel: QuotaHealthLevel {
+    QuotaHealthLevel.quotaHealth(remainingPct: remainingPct)
+  }
 
   public init(
     id: String,
@@ -251,7 +353,9 @@ public struct CardQuotaWindow: Decodable, Identifiable {
     remainingPct: Double,
     resetText: String? = nil,
     pacePct: Double? = nil,
-    subtitle: String? = nil
+    subtitle: String? = nil,
+    group: String? = nil,
+    windowKind: String? = nil
   ) {
     self.id = id
     self.title = title
@@ -259,6 +363,55 @@ public struct CardQuotaWindow: Decodable, Identifiable {
     self.resetText = resetText
     self.pacePct = pacePct
     self.subtitle = subtitle
+    self.group = group
+    self.windowKind = windowKind
+  }
+}
+
+public struct CardSessionSummary: Decodable, Identifiable, Equatable {
+  public var id: String { "\(tool):\(sessionId)" }
+  public let sessionId: String
+  public let tool: String
+  public let title: String
+  public let workspacePath: String?
+  public let model: String?
+  public let modelCount: Int?
+  public let subagentCount: Int?
+  public let totalTokens: Int
+  public let thinkingTokens: Int?
+  public let estimatedCostUsd: Double?
+  public let turnCount: Int?
+  public let lastActiveAtMs: Double?
+  public let isActive: Bool?
+
+  public init(
+    sessionId: String,
+    tool: String,
+    title: String,
+    workspacePath: String? = nil,
+    model: String? = nil,
+    modelCount: Int? = nil,
+    subagentCount: Int? = nil,
+    totalTokens: Int,
+    thinkingTokens: Int? = nil,
+    estimatedCostUsd: Double? = nil,
+    turnCount: Int? = nil,
+    lastActiveAtMs: Double? = nil,
+    isActive: Bool? = nil
+  ) {
+    self.sessionId = sessionId
+    self.tool = tool
+    self.title = title
+    self.workspacePath = workspacePath
+    self.model = model
+    self.modelCount = modelCount
+    self.subagentCount = subagentCount
+    self.totalTokens = totalTokens
+    self.thinkingTokens = thinkingTokens
+    self.estimatedCostUsd = estimatedCostUsd
+    self.turnCount = turnCount
+    self.lastActiveAtMs = lastActiveAtMs
+    self.isActive = isActive
   }
 }
 
@@ -346,6 +499,7 @@ public struct CodexBarCardSnapshot: Decodable {
   public let recentWindows: [CardRecentWindow]
   public let breakdowns: [CardBreakdownSection]?
   public let topModel: String?
+  public let recentSessions: [CardSessionSummary]?
 
   public var resolvedCurrencySymbol: String {
     if let sym = currencySymbol, !sym.isEmpty { return sym }
@@ -382,7 +536,8 @@ public struct CodexBarCardSnapshot: Decodable {
     stale: Bool? = nil,
     billingSummary: CardBillingSummary? = nil,
     breakdowns: [CardBreakdownSection]? = nil,
-    needsAuth: Bool? = nil
+    needsAuth: Bool? = nil,
+    recentSessions: [CardSessionSummary]? = nil
   ) {
     self.needsAuth = needsAuth
     self.isExternal = isExternal
@@ -413,6 +568,42 @@ public struct CodexBarCardSnapshot: Decodable {
     self.recentWindows = recentWindows
     self.breakdowns = breakdowns
     self.topModel = topModel
+    self.recentSessions = recentSessions
+  }
+}
+
+public struct UsageWorkspaceRow: Decodable, Identifiable, Equatable {
+  public var id: String { workspacePath }
+  public let workspacePath: String
+  public let workspaceName: String
+  public let turnCount: Int
+  public let totalTokens: Int
+  public let thinkingTokens: Int?
+  public let outputTokens: Int?
+  public let estimatedCostUsd: Double?
+  public let sharePct: Double
+  public let tools: [String]?
+
+  public init(
+    workspacePath: String,
+    workspaceName: String,
+    turnCount: Int,
+    totalTokens: Int,
+    thinkingTokens: Int? = nil,
+    outputTokens: Int? = nil,
+    estimatedCostUsd: Double? = nil,
+    sharePct: Double,
+    tools: [String]? = nil
+  ) {
+    self.workspacePath = workspacePath
+    self.workspaceName = workspaceName
+    self.turnCount = turnCount
+    self.totalTokens = totalTokens
+    self.thinkingTokens = thinkingTokens
+    self.outputTokens = outputTokens
+    self.estimatedCostUsd = estimatedCostUsd
+    self.sharePct = sharePct
+    self.tools = tools
   }
 }
 
@@ -441,10 +632,39 @@ public struct UsageSummaryResponse: Decodable {
   public let byTool: [UsageToolRow]
   public let byModel: [UsageModelRow]
   public let byProject: [UsageProjectRow]?
+  public let byWorkspace: [UsageWorkspaceRow]?
   public let daily: [UsageDailyPoint]
   public let cards: [String: CodexBarCardSnapshot]?
   public let externalProviders: [ExternalProviderMeta]?
   public let providersDir: String?
+
+  public init(
+    days: Int = 7,
+    tool: String? = nil,
+    today: UsageTotals = UsageTotals(),
+    totals: UsageTotals = UsageTotals(),
+    byTool: [UsageToolRow] = [],
+    byModel: [UsageModelRow] = [],
+    byProject: [UsageProjectRow]? = nil,
+    byWorkspace: [UsageWorkspaceRow]? = nil,
+    daily: [UsageDailyPoint] = [],
+    cards: [String: CodexBarCardSnapshot]? = nil,
+    externalProviders: [ExternalProviderMeta]? = nil,
+    providersDir: String? = nil
+  ) {
+    self.days = days
+    self.tool = tool
+    self.today = today
+    self.totals = totals
+    self.byTool = byTool
+    self.byModel = byModel
+    self.byProject = byProject
+    self.byWorkspace = byWorkspace
+    self.daily = daily
+    self.cards = cards
+    self.externalProviders = externalProviders
+    self.providersDir = providersDir
+  }
 }
 
 public struct DaemonStateResponse: Decodable {
@@ -681,5 +901,354 @@ public struct CommandResult {
     self.exitCode = exitCode
     self.stdout = stdout
     self.stderr = stderr
+  }
+}
+
+public enum QuotaHealthLevel: Equatable, Sendable {
+  case normal
+  case warning
+  case critical
+
+  public static func quotaHealth(remainingPct: Double) -> QuotaHealthLevel {
+    guard remainingPct.isFinite else { return .normal }
+    if remainingPct <= 5.0 { return .critical }
+    if remainingPct <= 20.0 { return .warning }
+    return .normal
+  }
+}
+
+public struct QuotaAlertEvent: Equatable, Sendable {
+  public let dedupeKey: String
+  public let title: String
+  public let body: String
+
+  public init(dedupeKey: String, title: String, body: String) {
+    self.dedupeKey = dedupeKey
+    self.title = title
+    self.body = body
+  }
+}
+
+public struct QuotaAlertEvaluator: Sendable {
+  public static let warningThresholdPct: Double = 20.0
+  public static let criticalThresholdPct: Double = 5.0
+  public static let rearmQuotaThresholdPct: Double = 25.0
+  public static let resetPreviousMaxPct: Double = 50.0
+  public static let resetRefillMinPct: Double = 95.0
+  public static let budgetWarningRatio: Double = 0.80
+  public static let budgetCriticalRatio: Double = 0.90
+  public static let budgetRearmRatio: Double = 0.70
+  public static let longContextThresholdTokens: Int = 200_000
+
+  public let cooldownSeconds: TimeInterval
+  public let maxLongContextTurnAgeSeconds: TimeInterval?
+
+  private var hasSeededBaseline: Bool = false
+  private var hasSeededAppsBaseline: Bool = false
+  private var lastRemainingByWindow: [String: Double] = [:]
+  private var alertedQuotaTiersByWindow: [String: Set<String>] = [:]
+  private var alertedBudgetTiersByKey: [String: Set<String>] = [:]
+  private var alertedLongContextTurnUids: Set<String> = []
+  private var lastSentAtByDedupeKey: [String: Date] = [:]
+
+  public init(
+    cooldownSeconds: TimeInterval = 0,
+    maxLongContextTurnAgeSeconds: TimeInterval? = nil
+  ) {
+    self.cooldownSeconds = max(0, cooldownSeconds)
+    self.maxLongContextTurnAgeSeconds = maxLongContextTurnAgeSeconds
+  }
+
+  public static func quotaHealth(remainingPct: Double) -> QuotaHealthLevel {
+    QuotaHealthLevel.quotaHealth(remainingPct: remainingPct)
+  }
+
+  public mutating func reset() {
+    hasSeededBaseline = false
+    hasSeededAppsBaseline = false
+    lastRemainingByWindow.removeAll()
+    alertedQuotaTiersByWindow.removeAll()
+    alertedBudgetTiersByKey.removeAll()
+    alertedLongContextTurnUids.removeAll()
+    lastSentAtByDedupeKey.removeAll()
+  }
+
+  private mutating func seedUsageBaseline(cards: [String: CodexBarCardSnapshot]) {
+    for providerKey in cards.keys.sorted() {
+      guard providerKey != "all", let card = cards[providerKey] else { continue }
+
+      for win in card.quotaWindows ?? [] {
+        guard win.remainingPct.isFinite else { continue }
+        let windowKey = "\(providerKey):\(win.id)"
+        lastRemainingByWindow[windowKey] = win.remainingPct
+        switch QuotaHealthLevel.quotaHealth(remainingPct: win.remainingPct) {
+        case .critical:
+          alertedQuotaTiersByWindow[windowKey] = ["warning", "critical"]
+        case .warning:
+          alertedQuotaTiersByWindow[windowKey] = ["warning"]
+        case .normal:
+          alertedQuotaTiersByWindow[windowKey] = []
+        }
+      }
+
+      if let billing = card.billingSummary,
+         let limit = billing.periodLimit,
+         limit.isFinite,
+         limit > 0 {
+        let used: Double? = {
+          if let cost = billing.periodCost, cost.isFinite { return max(0, cost) }
+          if let rem = billing.periodRemaining, rem.isFinite { return max(0, limit - rem) }
+          return nil
+        }()
+        if let used = used {
+          let ratio = used / limit
+          let periodTag = (billing.periodLabel?.isEmpty == false ? billing.periodLabel! : "period")
+          let budgetKey = "\(providerKey):\(periodTag)"
+          if ratio >= Self.budgetCriticalRatio {
+            alertedBudgetTiersByKey[budgetKey] = ["80", "90"]
+          } else if ratio >= Self.budgetWarningRatio {
+            alertedBudgetTiersByKey[budgetKey] = ["80"]
+          } else {
+            alertedBudgetTiersByKey[budgetKey] = []
+          }
+        }
+      }
+    }
+  }
+
+  private mutating func seedAppsBaseline(apps: [String: StatusAppEntry]) {
+    for app in apps.values {
+      if let turnUid = app.latestTurn?.turnUid, !turnUid.isEmpty {
+        alertedLongContextTurnUids.insert(turnUid)
+      }
+    }
+  }
+
+  private mutating func shouldEmit(dedupeKey: String, now: Date) -> Bool {
+    if cooldownSeconds > 0, let prev = lastSentAtByDedupeKey[dedupeKey] {
+      if now.timeIntervalSince(prev) < cooldownSeconds {
+        return false
+      }
+    }
+    lastSentAtByDedupeKey[dedupeKey] = now
+    return true
+  }
+
+  public mutating func evaluate(
+    usage: UsageSummaryResponse?,
+    apps: [String: StatusAppEntry],
+    displayNames: [String: String] = [:],
+    now: Date = Date(),
+    masterEnabled: Bool = true,
+    enabledTools: Set<String>? = nil
+  ) -> [QuotaAlertEvent] {
+    let cards = usage?.cards
+    let hasRealCards = cards?.keys.contains(where: { $0 != "all" }) ?? false
+
+    if !hasSeededBaseline && hasRealCards, let cards = cards {
+      seedUsageBaseline(cards: cards)
+      hasSeededBaseline = true
+      if !hasSeededAppsBaseline && !apps.isEmpty {
+        seedAppsBaseline(apps: apps)
+        hasSeededAppsBaseline = true
+      }
+      return []
+    }
+
+    var seededAppsThisCall = false
+    if !hasSeededAppsBaseline && !apps.isEmpty {
+      seedAppsBaseline(apps: apps)
+      hasSeededAppsBaseline = true
+      seededAppsThisCall = true
+    }
+
+    guard masterEnabled else {
+      return []
+    }
+
+    var events: [QuotaAlertEvent] = []
+
+    if let cards = cards {
+      for providerKey in cards.keys.sorted() {
+        guard providerKey != "all", let card = cards[providerKey] else { continue }
+        if let enabledTools = enabledTools, !enabledTools.contains(providerKey) {
+          continue
+        }
+        let providerTitle = displayNames[providerKey]
+          ?? card.providerName
+          ?? card.providerShortName
+          ?? providerKey
+
+        for win in card.quotaWindows ?? [] {
+          guard win.remainingPct.isFinite else { continue }
+          let windowKey = "\(providerKey):\(win.id)"
+          let previousRemaining = lastRemainingByWindow[windowKey]
+          lastRemainingByWindow[windowKey] = win.remainingPct
+
+          if let prev = previousRemaining,
+             prev < Self.resetPreviousMaxPct,
+             win.remainingPct >= Self.resetRefillMinPct {
+            alertedQuotaTiersByWindow[windowKey] = []
+            let dedupeKey = "quota-reset:\(providerKey):\(win.id)"
+            if shouldEmit(dedupeKey: dedupeKey, now: now) {
+              events.append(QuotaAlertEvent(
+                dedupeKey: dedupeKey,
+                title: "\(providerTitle) 配额已重置",
+                body: "\(win.title) 已恢复至 \(MeterFormat.pct(win.remainingPct))"
+              ))
+            }
+            continue
+          }
+
+          if win.remainingPct > Self.rearmQuotaThresholdPct {
+            alertedQuotaTiersByWindow[windowKey] = []
+            continue
+          }
+
+          let level = QuotaHealthLevel.quotaHealth(remainingPct: win.remainingPct)
+          var alertedTiers = alertedQuotaTiersByWindow[windowKey] ?? []
+          let resetSuffix: String = {
+            if let rt = win.resetText, !rt.isEmpty { return "（\(rt)）" }
+            return ""
+          }()
+
+          switch level {
+          case .critical:
+            if !alertedTiers.contains("critical") {
+              alertedTiers.insert("warning")
+              alertedTiers.insert("critical")
+              alertedQuotaTiersByWindow[windowKey] = alertedTiers
+              let dedupeKey = "quota:\(providerKey):\(win.id):critical"
+              if shouldEmit(dedupeKey: dedupeKey, now: now) {
+                events.append(QuotaAlertEvent(
+                  dedupeKey: dedupeKey,
+                  title: "\(providerTitle) 配额告急",
+                  body: "\(win.title) 仅剩 \(MeterFormat.pct(win.remainingPct))\(resetSuffix)"
+                ))
+              }
+            }
+          case .warning:
+            if !alertedTiers.contains("warning") {
+              alertedTiers.insert("warning")
+              alertedQuotaTiersByWindow[windowKey] = alertedTiers
+              let dedupeKey = "quota:\(providerKey):\(win.id):warning"
+              if shouldEmit(dedupeKey: dedupeKey, now: now) {
+                events.append(QuotaAlertEvent(
+                  dedupeKey: dedupeKey,
+                  title: "\(providerTitle) 配额偏低",
+                  body: "\(win.title) 剩余 \(MeterFormat.pct(win.remainingPct))\(resetSuffix)"
+                ))
+              }
+            }
+          case .normal:
+            break
+          }
+        }
+
+        if let billing = card.billingSummary,
+           let limit = billing.periodLimit,
+           limit.isFinite,
+           limit > 0 {
+          let used: Double? = {
+            if let cost = billing.periodCost, cost.isFinite { return max(0, cost) }
+            if let rem = billing.periodRemaining, rem.isFinite { return max(0, limit - rem) }
+            return nil
+          }()
+
+          if let used = used {
+            let ratio = used / limit
+            let periodTag = (billing.periodLabel?.isEmpty == false ? billing.periodLabel! : "period")
+            let budgetKey = "\(providerKey):\(periodTag)"
+            let periodDisplay = (billing.periodLabel?.isEmpty == false ? billing.periodLabel! : "本期")
+            let sym = card.resolvedCurrencySymbol
+            let usedStr = MeterFormat.money(used, symbol: sym)
+            let limitStr = MeterFormat.money(limit, symbol: sym)
+            let pctStr = MeterFormat.pct(ratio * 100.0)
+
+            if ratio < Self.budgetRearmRatio {
+              alertedBudgetTiersByKey[budgetKey] = []
+            } else {
+              var alerted = alertedBudgetTiersByKey[budgetKey] ?? []
+              if ratio >= Self.budgetCriticalRatio {
+                if !alerted.contains("90") {
+                  alerted.insert("80")
+                  alerted.insert("90")
+                  alertedBudgetTiersByKey[budgetKey] = alerted
+                  let dedupeKey = "budget:\(providerKey):\(periodTag):90"
+                  if shouldEmit(dedupeKey: dedupeKey, now: now) {
+                    events.append(QuotaAlertEvent(
+                      dedupeKey: dedupeKey,
+                      title: "\(providerTitle) 预算即将用尽",
+                      body: "\(periodDisplay)已用 \(usedStr) / \(limitStr)（\(pctStr)）"
+                    ))
+                  }
+                }
+              } else if ratio >= Self.budgetWarningRatio {
+                if !alerted.contains("80") {
+                  alerted.insert("80")
+                  alertedBudgetTiersByKey[budgetKey] = alerted
+                  let dedupeKey = "budget:\(providerKey):\(periodTag):80"
+                  if shouldEmit(dedupeKey: dedupeKey, now: now) {
+                    events.append(QuotaAlertEvent(
+                      dedupeKey: dedupeKey,
+                      title: "\(providerTitle) 预算预警",
+                      body: "\(periodDisplay)已用 \(usedStr) / \(limitStr)（\(pctStr)）"
+                    ))
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if !seededAppsThisCall {
+      for toolKey in apps.keys.sorted() {
+        if let enabledTools = enabledTools, !enabledTools.contains(toolKey) {
+          continue
+        }
+        guard let app = apps[toolKey],
+              let turn = app.latestTurn,
+              let turnUid = turn.turnUid, !turnUid.isEmpty,
+              let totalIn = turn.totalInputTokens, totalIn > 0 else {
+          continue
+        }
+        let calls = max(1, turn.callCount ?? 1)
+        let avgContextTokens = totalIn / calls
+        guard avgContextTokens > Self.longContextThresholdTokens else { continue }
+        guard !alertedLongContextTurnUids.contains(turnUid) else { continue }
+
+        if let maxAge = maxLongContextTurnAgeSeconds,
+           let completedMs = turn.completedAtMs,
+           completedMs > 0 {
+          let age = now.timeIntervalSince1970 - (completedMs / 1000.0)
+          if age > maxAge {
+            alertedLongContextTurnUids.insert(turnUid)
+            continue
+          }
+        }
+
+        alertedLongContextTurnUids.insert(turnUid)
+        if alertedLongContextTurnUids.count > 500 {
+          var retained = Set(apps.values.compactMap { $0.latestTurn?.turnUid })
+          retained.insert(turnUid)
+          alertedLongContextTurnUids = retained
+        }
+
+        let dedupeKey = "context200k:\(toolKey):\(turnUid)"
+        if shouldEmit(dedupeKey: dedupeKey, now: now) {
+          let toolTitle = displayNames[toolKey] ?? turn.toolLabel ?? app.name
+          let modelPart = (turn.model?.isEmpty == false) ? "（\(turn.model!)）" : ""
+          events.append(QuotaAlertEvent(
+            dedupeKey: dedupeKey,
+            title: "\(toolTitle) 触发 200k 长上下文档",
+            body: "单次平均上下文约 \(MeterFormat.tokens(avgContextTokens)) tokens\(modelPart)"
+          ))
+        }
+      }
+    }
+
+    return events
   }
 }

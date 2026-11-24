@@ -13,8 +13,9 @@
  *   ai-turn-meter daemon [--port=47831]
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   APP_SPECS,
   DEFAULT_DAEMON_PORT,
@@ -30,7 +31,6 @@ import {
 } from '../src/apps.mjs';
 import { formatTokens, formatTps } from '../src/format.mjs';
 import { AUTH_TOKEN_HEADER, readDaemonToken } from '../src/auth.mjs';
-import { ExternalProviderRegistry } from '../src/external-providers.mjs';
 import {
   applyLocalSshConfig,
   applyRemoteCursorHooks,
@@ -66,7 +66,7 @@ Usage:
   ai-turn-meter providers [import|remove] 管理本地外部数据源插件（列表、导入 .mjs 或移除）
   ai-turn-meter cost [--days=7]         查看今日/本周/历史 Token 用量与 API 等效费用估算
   ai-turn-meter receipt [--date=...]    打印超市小票风每日账单（支持 --scope=day|week|month --group=model|tool|project --currency=both|usd|cny --rate=7 --svg=out.svg）
-  ai-turn-meter fingerprint [--mode=.]  运行模型指纹与降智检测（passive|codex_protocol|quick|deep，支持 --target=codex|<id> --record-baseline）
+  ai-turn-meter fingerprint [--mode=.]  运行模型指纹与降智检测（one_click|passive|codex_protocol|manual_score|quick|deep，支持 --target=codex|<id> --record-baseline）
   ai-turn-meter doctor                  检查 Node、LaunchAgent、Cursor Hooks、VSIX 与 CDP 状态
   ai-turn-meter install                 安装或更新 LaunchAgent、Cursor Hooks、VSIX 与 CLI 软链
     --dry-run                           仅预览安装步骤，不写入文件
@@ -153,39 +153,103 @@ async function cmdStatus(jsonMode = false) {
   }
 }
 
-async function cmdDoctor(jsonMode = false) {
-  const report = await runDoctor({ port: PORT });
-  if (jsonMode) {
-    console.log(JSON.stringify({ version: getPkgVersion(), ...report }));
-    return;
-  }
+export function formatDoctorReport(report, cliVersion = getPkgVersion()) {
   const mark = (ok) => (ok ? 'OK  ' : 'FAIL');
-  console.log(`AI Turn Meter v${getPkgVersion()} Doctor`);
-  console.log(`- [${mark(report.node.ok)}] Node.js v${report.node.version} (node:sqlite=${report.node.sqlite})`);
-  console.log(
-    `- [${mark(report.daemon.ok)}] Daemon http://127.0.0.1:${report.daemon.port}${report.daemon.pid ? ` (pid ${report.daemon.pid})` : ''}`
+  const resolvedCliVersion = report.cliVersion || cliVersion;
+  const lines = [];
+  lines.push(`AI Turn Meter v${resolvedCliVersion} Doctor`);
+  lines.push(`- [${mark(report.node.ok)}] Node.js v${report.node.version} (node:sqlite=${report.node.sqlite})`);
+
+  const daemonVersion = report.daemon?.version || null;
+  const daemonMismatch = Boolean(
+    report.daemon?.ok &&
+      (report.daemonVersionMismatch ?? daemonVersion !== resolvedCliVersion)
   );
-  console.log(
-    `- [${mark(report.launchAgent.plistExists && report.launchAgent.launchAgentLoaded)}] LaunchAgent (${report.launchAgent.plistPath})`
+  const daemonMark = !report.daemon?.ok ? 'FAIL' : daemonMismatch ? 'WARN' : 'OK  ';
+  const daemonDetail = report.daemon?.pid
+    ? ` (pid ${report.daemon.pid}${daemonVersion ? `, v${daemonVersion}` : ''})`
+    : daemonVersion
+      ? ` (v${daemonVersion})`
+      : '';
+  const daemonWarnSuffix = daemonMismatch
+    ? ` [版本不一致: CLI v${resolvedCliVersion}，请运行 ai-turn-meter install 更新]`
+    : '';
+  lines.push(
+    `- [${daemonMark}] Daemon http://127.0.0.1:${report.daemon.port}${daemonDetail}${daemonWarnSuffix}`
   );
-  console.log(
+
+  const laReady = Boolean(report.launchAgent?.plistExists && report.launchAgent?.launchAgentLoaded);
+  const laRootDrift = Boolean(
+    laReady && !report.launchAgent?.pointsToCurrentRoot && !report.launchAgent?.managedByApp
+  );
+  const laMark = !laReady ? 'FAIL' : laRootDrift ? 'WARN' : 'OK  ';
+  const laWarnSuffix = laRootDrift
+    ? ` [指向其他路径: ${report.launchAgent.programDaemonPath || 'unknown'}，非当前 ${report.packageRoot || ''}]`
+    : '';
+  lines.push(`- [${laMark}] LaunchAgent (${report.launchAgent.plistPath})${laWarnSuffix}`);
+
+  lines.push(
     `- [${mark(report.cursorHooks.validVersion && report.cursorHooks.configured)}] Cursor Hooks (${report.cursorHooks.path}, versionOk=${report.cursorHooks.validVersion})`
   );
-  for (const [key, app] of Object.entries(report.apps)) {
+  for (const [key, app] of Object.entries(report.apps || {})) {
     const parts = [app.installed ? app.appPath : '未安装'];
+    let appMark = app.installed ? 'INFO' : 'SKIP';
     if (app.installed) {
       parts.push(app.cdpPort ? `CDP:${app.cdpPort}` : 'CDP未启用');
       if (key === 'cursor' || key === 'codebuddy') {
-        parts.push(app.vsixVersion ? `VSIX:${app.vsixVersion}` : 'VSIX未安装');
+        const vsixMismatch = Boolean(
+          app.vsixVersionMismatch ?? (app.vsixVersion && app.vsixVersion !== resolvedCliVersion)
+        );
+        if (vsixMismatch) {
+          appMark = 'WARN';
+          parts.push(`VSIX:${app.vsixVersion} (CLI:${resolvedCliVersion}，请运行 ai-turn-meter install 更新)`);
+        } else {
+          parts.push(app.vsixVersion ? `VSIX:${app.vsixVersion}` : 'VSIX未安装');
+        }
       }
     }
-    console.log(`- [${app.installed ? 'INFO' : 'SKIP'}] ${key.padEnd(11)} ${parts.join(' | ')}`);
+    lines.push(`- [${appMark}] ${key.padEnd(11)} ${parts.join(' | ')}`);
   }
+  return lines;
+}
+
+async function cmdDoctor(jsonMode = false) {
+  const report = await runDoctor({ port: PORT });
+  if (jsonMode) {
+    console.log(JSON.stringify({ version: report.cliVersion || getPkgVersion(), ...report }));
+    return;
+  }
+  for (const line of formatDoctorReport(report)) {
+    console.log(line);
+  }
+}
+
+export function buildCleanLaunchEnv(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  delete env.AI_TURN_METER_STABLE_ROOT;
+  delete env.AI_TURN_METER_NODE_BIN;
+  delete env.AI_TURN_METER_MANAGED_BY;
+  return env;
 }
 
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function openSingleApp(target, { exitOnError = true } = {}) {
+export async function openSingleApp(
+  target,
+  {
+    exitOnError = true,
+    execFileSyncFn = execFileSync,
+    resolveAppPathsFn = resolveAppPaths,
+    readActivePortFn = readActivePort,
+    isCdpHttpReadyFn = isCdpHttpReady,
+    readRunningProcessArgsFn = readRunningProcessArgs,
+    isAppRunningFn = isAppRunning,
+    hasAppHelpersRunningFn = hasAppHelpersRunning,
+    isPortListeningFn = isPortListening,
+    sleepFn = sleepMs,
+    baseEnv = process.env,
+  } = {}
+) {
   const fail = (message) => {
     console.error(message);
     if (exitOnError) process.exit(1);
@@ -196,25 +260,26 @@ async function openSingleApp(target, { exitOnError = true } = {}) {
   if (!baseSpec) {
     return fail(`Unknown app "${target}". Choose: codex | cursor | codebuddy | antigravity | all`);
   }
-  const spec = resolveAppPaths(baseSpec);
+  const spec = resolveAppPathsFn(baseSpec);
   if (!spec.installed || !spec.appPath) {
     return fail(`Not installed: ${spec.bundleName}`);
   }
-  const activePort = readActivePort(spec);
-  if (activePort && (await isCdpHttpReady(activePort))) {
-    execFileSync('open', ['-a', spec.appPath]);
+  const launchEnv = buildCleanLaunchEnv(baseEnv);
+  const activePort = readActivePortFn(spec);
+  if (activePort && (await isCdpHttpReadyFn(activePort))) {
+    execFileSyncFn('open', ['-a', spec.appPath], { env: launchEnv });
     console.log(`Focused ${spec.name}`);
     return true;
   }
 
   // Capture existing launch flags (e.g. --mute-audio) before quitting so guards or user switches survive restart.
-  const preservedArgs = readRunningProcessArgs(spec);
-  let running = isAppRunning(spec);
+  const preservedArgs = readRunningProcessArgsFn(spec);
+  let running = isAppRunningFn(spec);
 
   if (running) {
     let quitErr = '';
     try {
-      execFileSync('osascript', ['-e', `tell application "${spec.name}" to quit`], {
+      execFileSyncFn('osascript', ['-e', `tell application "${spec.name}" to quit`], {
         encoding: 'utf8',
         stdio: ['ignore', 'ignore', 'pipe'],
       });
@@ -223,11 +288,11 @@ async function openSingleApp(target, { exitOnError = true } = {}) {
     }
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      if (!isAppRunning(spec)) {
+      if (!isAppRunningFn(spec)) {
         running = false;
         break;
       }
-      await sleepMs(250);
+      await sleepFn(250);
     }
     if (running) {
       const hint = quitErr
@@ -238,34 +303,35 @@ async function openSingleApp(target, { exitOnError = true } = {}) {
       );
     }
     const helperDeadline = Date.now() + 2000;
-    while (Date.now() < helperDeadline && hasAppHelpersRunning(spec)) {
-      await sleepMs(150);
+    while (Date.now() < helperDeadline && hasAppHelpersRunningFn(spec)) {
+      await sleepFn(150);
     }
-    await sleepMs(250);
+    await sleepFn(250);
   }
 
   const launchArgs = [...preservedArgs, `--remote-debugging-port=${spec.port}`];
-  execFileSync('open', ['-na', spec.appPath, '--args', ...launchArgs], {
+  execFileSyncFn('open', ['-na', spec.appPath, '--args', ...launchArgs], {
     stdio: 'ignore',
+    env: launchEnv,
   });
 
   const cdpDeadline = Date.now() + 10000;
   let ready = false;
   while (Date.now() < cdpDeadline) {
-    if (isPortListening(spec.port) && (await isCdpHttpReady(spec.port))) {
+    if (isPortListeningFn(spec.port) && (await isCdpHttpReadyFn(spec.port))) {
       ready = true;
       break;
     }
-    await sleepMs(250);
+    await sleepFn(250);
   }
   if (ready) {
     // Re-check after 1.6s so a background watchdog relaunch that drops `--remote-debugging-port` is caught honestly.
-    await sleepMs(1600);
-    ready = isPortListening(spec.port) && (await isCdpHttpReady(spec.port));
+    await sleepFn(1600);
+    ready = isPortListeningFn(spec.port) && (await isCdpHttpReadyFn(spec.port));
   }
   if (!ready) {
-    const postArgs = readRunningProcessArgs(spec);
-    const detail = isAppRunning(spec)
+    const postArgs = readRunningProcessArgsFn(spec);
+    const detail = isAppRunningFn(spec)
       ? `${spec.name} 启动后调试口 ${spec.port} 未保持开启（当前进程参数：${postArgs.join(' ') || '无'}，可能被其他守护脚本重启覆盖）`
       : `${spec.name} 未能开启调试口 ${spec.port}`;
     return fail(detail);
@@ -419,6 +485,58 @@ async function cmdReceipt(flags, jsonMode = false) {
   console.log(renderReceiptAscii(receipt, { currency, usdToCny, hideProjects }));
 }
 
+export function formatFingerprintOutput(out) {
+  const lines = [];
+  if (out?.passive) {
+    const p = out.passive;
+    lines.push(`模型降智被动诊断（近 ${p.days} 天 · 扫描 ${p.totalTurnsScanned} 轮 · 状态: ${p.overallStatus}）`);
+    for (const info of Object.values(p.byTool || {})) {
+      lines.push(
+        `- ${info.toolLabel.padEnd(11)} [${info.status}]  ${info.turnCount} 轮 | 异常 ${info.anomalyCount} 条${info.latestModel ? ` | 最新模型: ${info.latestModel}` : ''}`
+      );
+    }
+    if (Array.isArray(p.anomalies) && p.anomalies.length > 0) {
+      lines.push('\n可疑轮次:');
+      for (const a of p.anomalies.slice(0, 10)) {
+        lines.push(`  ! [${a.toolLabel}/${a.model}] ${a.title} — ${a.detail}`);
+      }
+    }
+  }
+
+  if (out?.codexProto) {
+    const cp = out.codexProto;
+    if (lines.length > 0) lines.push('');
+    lines.push(
+      `Codex 路由核验: ${cp.verdict || (cp.ok ? 'healthy' : 'error')}${cp.responseModel ? ` (模型: ${cp.responseModel})` : ''}`
+    );
+    if (cp.summary) {
+      lines.push(`  摘要: ${cp.summary}`);
+    }
+  }
+
+  const r = out?.run;
+  const shouldPrintRun = Boolean(
+    r && (!out?.passive || out?.mode === 'one_click' || r.mode === 'one_click' || out?.codexProto)
+  );
+  if (shouldPrintRun) {
+    if (lines.length > 0) lines.push('');
+    lines.push(
+      `[${r.mode}] ${r.targetName} | 结论: ${r.verdict}${r.score !== null && r.score !== undefined ? ` (${r.score}/100)` : ''}`
+    );
+    lines.push(`摘要: ${r.summary}`);
+    if (Array.isArray(r.details?.probes)) {
+      for (const p of r.details.probes) {
+        lines.push(`  - [${p.passed ? 'PASS' : 'FAIL'}] ${p.name}: ${p.reason}`);
+      }
+    }
+    if (r.jsDistance !== null && r.jsDistance !== undefined) {
+      lines.push(`JS 散度: ${r.jsDistance} (基线: ${r.details?.baselineName || '无'})`);
+    }
+  }
+
+  return lines;
+}
+
 async function cmdFingerprint(flags, jsonMode = false) {
   const getVal = (prefix) => {
     const f = flags.find((a) => a.startsWith(prefix));
@@ -426,6 +544,8 @@ async function cmdFingerprint(flags, jsonMode = false) {
   };
   const mode = getVal('--mode=') || 'passive';
   const target = getVal('--target=') || 'codex';
+  const tool = getVal('--tool=') || null;
+  const replyText = getVal('--reply=') || null;
   const days = Math.max(1, Number(getVal('--days=')) || 7);
   const sampleCount = Math.max(10, Number(getVal('--samples=')) || 50);
   const recordBaseline = flags.includes('--record-baseline');
@@ -434,6 +554,7 @@ async function cmdFingerprint(flags, jsonMode = false) {
   const model = getVal('--model=') || null;
 
   let out = null;
+  let daemonHttpError = null;
   try {
     const token = readDaemonToken();
     const res = await fetch(`http://127.0.0.1:${PORT}/v1/fingerprint/run`, {
@@ -445,6 +566,8 @@ async function cmdFingerprint(flags, jsonMode = false) {
       body: JSON.stringify({
         mode,
         target,
+        ...(tool ? { tool } : {}),
+        ...(replyText ? { replyText } : {}),
         days,
         sampleCount,
         recordBaseline,
@@ -454,8 +577,32 @@ async function cmdFingerprint(flags, jsonMode = false) {
       }),
       signal: AbortSignal.timeout(120_000),
     });
-    if (res.ok) out = await res.json();
-  } catch {}
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {}
+    if (res.ok) {
+      out = data;
+    } else {
+      daemonHttpError = {
+        status: res.status,
+        error: data?.error || `Daemon 返回 HTTP ${res.status}`,
+      };
+    }
+  } catch {
+    // Connection error (e.g. ECONNREFUSED / daemon offline): fall back to offline execution below
+  }
+
+  if (daemonHttpError) {
+    if (jsonMode) {
+      console.log(
+        JSON.stringify({ ok: false, status: daemonHttpError.status, error: daemonHttpError.error }, null, 2)
+      );
+    } else {
+      console.error(`Daemon 检测请求失败 (HTTP ${daemonHttpError.status}): ${daemonHttpError.error}`);
+    }
+    process.exit(1);
+  }
 
   if (!out) {
     const { TurnStore } = await import('../src/store.mjs');
@@ -474,22 +621,30 @@ async function cmdFingerprint(flags, jsonMode = false) {
         const run = await probeCodexProtocol({ modelOverride: model });
         out = { ok: run.ok, mode: 'codex_protocol', run: store.saveFingerprintRun(run) };
       } else if (mode === 'quick') {
-        const run = await runQuickCapabilityProbes({
-          targetType: 'codex',
-          endpointConfig: model ? { model } : undefined,
-        });
-        out = { ok: run.ok, mode: 'quick', run: store.saveFingerprintRun(run) };
+        if (target !== 'codex') {
+          out = { ok: false, error: `离线模式暂不支持自定义端点 target=${target}，请先启动守护进程` };
+        } else {
+          const run = await runQuickCapabilityProbes({
+            targetType: 'codex',
+            endpointConfig: model ? { model } : undefined,
+          });
+          out = { ok: run.ok, mode: 'quick', run: store.saveFingerprintRun(run) };
+        }
       } else if (mode === 'deep') {
-        const run = await runTokenDistributionFingerprint({
-          targetType: 'codex',
-          endpointConfig: model ? { model } : undefined,
-          sampleCount,
-          recordBaseline,
-          baselineName,
-          baselineId,
-          store,
-        });
-        out = { ok: run.ok, mode: 'deep', run: store.saveFingerprintRun(run) };
+        if (target !== 'codex') {
+          out = { ok: false, error: `离线模式暂不支持自定义端点 target=${target}，请先启动守护进程` };
+        } else {
+          const run = await runTokenDistributionFingerprint({
+            targetType: 'codex',
+            endpointConfig: model ? { model } : undefined,
+            sampleCount,
+            recordBaseline,
+            baselineName,
+            baselineId,
+            store,
+          });
+          out = { ok: run.ok, mode: 'deep', run: store.saveFingerprintRun(run) };
+        }
       } else {
         out = { ok: false, error: `离线模式暂不支持 ${mode}` };
       }
@@ -503,37 +658,13 @@ async function cmdFingerprint(flags, jsonMode = false) {
     return;
   }
 
-  if (out.passive) {
-    const p = out.passive;
-    console.log(`模型降智被动诊断（近 ${p.days} 天 · 扫描 ${p.totalTurnsScanned} 轮 · 状态: ${p.overallStatus}）`);
-    for (const info of Object.values(p.byTool || {})) {
-      console.log(
-        `- ${info.toolLabel.padEnd(11)} [${info.status}]  ${info.turnCount} 轮 | 异常 ${info.anomalyCount} 条${info.latestModel ? ` | 最新模型: ${info.latestModel}` : ''}`
-      );
-    }
-    if (Array.isArray(p.anomalies) && p.anomalies.length > 0) {
-      console.log('\n可疑轮次:');
-      for (const a of p.anomalies.slice(0, 10)) {
-        console.log(`  ! [${a.toolLabel}/${a.model}] ${a.title} — ${a.detail}`);
-      }
-    }
-    return;
-  }
-
-  const r = out.run;
-  if (!r) {
-    console.error(out.error || '检测执行失败');
+  const lines = formatFingerprintOutput(out);
+  if (lines.length === 0) {
+    console.error(out?.error || '检测执行失败');
     process.exit(1);
   }
-  console.log(`[${r.mode}] ${r.targetName} | 结论: ${r.verdict}${r.score !== null && r.score !== undefined ? ` (${r.score}/100)` : ''}`);
-  console.log(`摘要: ${r.summary}`);
-  if (Array.isArray(r.details?.probes)) {
-    for (const p of r.details.probes) {
-      console.log(`  - [${p.passed ? 'PASS' : 'FAIL'}] ${p.name}: ${p.reason}`);
-    }
-  }
-  if (r.jsDistance !== null && r.jsDistance !== undefined) {
-    console.log(`JS 散度: ${r.jsDistance} (基线: ${r.details?.baselineName || '无'})`);
+  for (const line of lines) {
+    console.log(line);
   }
 }
 
@@ -577,19 +708,50 @@ function cmdSshApply(host, flags, dryRun = false, jsonMode = false) {
   }
 }
 
+export const APP_AUTOSTART_USAGE =
+  'Usage: ai-turn-meter app-autostart <enable|disable|status> (also accepts on|true or off|false)';
+
+export function parseAppAutostartAction(action) {
+  const normalized = String(action ?? '').trim().toLowerCase();
+  if (!normalized || normalized === 'status') {
+    return { kind: 'status' };
+  }
+  if (normalized === 'enable' || normalized === 'on' || normalized === 'true') {
+    return { kind: 'set', enabled: true };
+  }
+  if (normalized === 'disable' || normalized === 'off' || normalized === 'false') {
+    return { kind: 'set', enabled: false };
+  }
+  return { kind: 'invalid', action: String(action) };
+}
+
 function cmdAppAutostart(action = 'status', flags = [], dryRun = false, jsonMode = false) {
+  const fail = (message) => {
+    if (jsonMode) {
+      console.log(JSON.stringify({ ok: false, error: message, usage: APP_AUTOSTART_USAGE }));
+    } else {
+      console.error(message);
+      console.error(APP_AUTOSTART_USAGE);
+    }
+    process.exit(1);
+  };
+
+  const parsed = parseAppAutostartAction(action);
+  if (parsed.kind === 'invalid') {
+    return fail(`Invalid app-autostart action "${parsed.action}".`);
+  }
+
   const appFlag = flags.find((a) => a.startsWith('--app='));
   const appPath = appFlag ? appFlag.split('=')[1].trim() : null;
   const appExe = appPath ? join(appPath, 'Contents', 'MacOS', 'AITurnMeter') : resolveInstalledAppExe();
 
-  if (action === 'status') {
+  if (parsed.kind === 'status') {
     const enabled = isAppAutostartEnabled();
     if (jsonMode) console.log(JSON.stringify({ enabled }));
     else console.log(`App autostart: ${enabled ? 'enabled' : 'disabled'}`);
     return;
   }
-  const enable = action === 'enable' || action === 'on';
-  const res = setAppAutostart(enable, { appExe, dryRun });
+  const res = setAppAutostart(parsed.enabled, { appExe, dryRun });
   if (jsonMode) {
     console.log(JSON.stringify({ ok: true, ...res }));
   } else {
@@ -610,6 +772,7 @@ async function cmdProviders(args = [], flags = [], jsonMode = false) {
     const fileName = basename(srcPath);
     const token = readDaemonToken();
     let result = null;
+    let daemonError = null;
     if (token) {
       try {
         const res = await fetch(`http://127.0.0.1:${PORT}/v1/providers/import`, {
@@ -619,16 +782,28 @@ async function cmdProviders(args = [], flags = [], jsonMode = false) {
           signal: AbortSignal.timeout(10_000),
         });
         if (res.status !== 404) {
-          const data = await res.json();
-          if (!res.ok || !data.ok) {
-            console.error(data?.error || `导入失败 (HTTP ${res.status})`);
-            process.exit(1);
+          let data = null;
+          try {
+            data = await res.json();
+          } catch {}
+          if (!res.ok || data?.ok === false) {
+            daemonError = { status: res.status, error: data?.error || `导入失败 (HTTP ${res.status})` };
+          } else {
+            result = data;
           }
-          result = data;
         }
       } catch {}
     }
+    if (daemonError) {
+      if (jsonMode) {
+        console.log(JSON.stringify({ ok: false, status: daemonError.status, error: daemonError.error }, null, 2));
+      } else {
+        console.error(daemonError.error);
+      }
+      process.exit(1);
+    }
     if (!result) {
+      const { ExternalProviderRegistry } = await import('../src/external-providers.mjs');
       const reg = new ExternalProviderRegistry();
       try {
         const imp = await reg.importPluginSource({ fileName, content });
@@ -657,6 +832,7 @@ async function cmdProviders(args = [], flags = [], jsonMode = false) {
       : `fileName=${encodeURIComponent(target)}`;
     const token = readDaemonToken();
     let result = null;
+    let daemonError = null;
     if (token) {
       try {
         const res = await fetch(`http://127.0.0.1:${PORT}/v1/providers?${qs}`, {
@@ -665,11 +841,28 @@ async function cmdProviders(args = [], flags = [], jsonMode = false) {
           signal: AbortSignal.timeout(6_000),
         });
         if (res.status !== 404) {
-          result = await res.json();
+          let data = null;
+          try {
+            data = await res.json();
+          } catch {}
+          if (!res.ok || data?.ok === false) {
+            daemonError = { status: res.status, error: data?.error || `移除插件失败 (HTTP ${res.status})` };
+          } else {
+            result = data;
+          }
         }
       } catch {}
     }
+    if (daemonError) {
+      if (jsonMode) {
+        console.log(JSON.stringify({ ok: false, status: daemonError.status, error: daemonError.error }, null, 2));
+      } else {
+        console.error(`移除插件失败 (HTTP ${daemonError.status}): ${daemonError.error}`);
+      }
+      process.exit(1);
+    }
     if (!result) {
+      const { ExternalProviderRegistry } = await import('../src/external-providers.mjs');
       const reg = new ExternalProviderRegistry();
       const rmRes = await reg.removePlugin(target.startsWith('ext:') ? { key: target } : { fileName: target });
       result = { ok: true, ...rmRes };
@@ -698,6 +891,7 @@ async function cmdProviders(args = [], flags = [], jsonMode = false) {
   } catch {}
 
   if (!payload) {
+    const { ExternalProviderRegistry } = await import('../src/external-providers.mjs');
     const reg = new ExternalProviderRegistry();
     const out = await reg.fetchAll({ forceRefresh: refresh });
     payload = { providersDir: out.providersDir, providers: out.providers, cards: out.cards };
@@ -723,72 +917,128 @@ async function cmdProviders(args = [], flags = [], jsonMode = false) {
 async function cmdDaemon(flags) {
   const portFlag = flags.find((a) => a.startsWith('--port='));
   const port = portFlag ? Number(portFlag.split('=')[1]) : PORT;
+  const ts = () => new Date().toISOString();
   const { createMeterServer } = await import('../src/server.mjs');
   const meter = createMeterServer({ port });
-  await meter.start();
-  console.log(`[ai-turn-meter] daemon listening on http://127.0.0.1:${port}`);
-  for (const sig of ['SIGINT', 'SIGTERM']) {
-    process.on(sig, async () => {
+
+  let fatalHandled = false;
+  const handleServerError = (err) => {
+    if (fatalHandled) return;
+    fatalHandled = true;
+    if (err?.code === 'EADDRINUSE') {
+      console.error(
+        `[${ts()}] [ai-turn-meter] port 127.0.0.1:${port} is already in use (EADDRINUSE); another daemon may already be running. Exiting.`
+      );
+    } else {
+      console.error(`[${ts()}] [ai-turn-meter] daemon server error: ${err?.message || err}`);
+    }
+    try {
+      meter.store?.close?.();
+    } catch {}
+    process.exit(1);
+  };
+
+  meter.server.on('error', handleServerError);
+  try {
+    await meter.start();
+  } catch (err) {
+    handleServerError(err);
+    return;
+  }
+  console.log(`[${ts()}] [ai-turn-meter] daemon listening on http://127.0.0.1:${port} (pid ${process.pid})`);
+
+  let shuttingDown = false;
+  const shutdown = async (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[${ts()}] [ai-turn-meter] received ${sig}, shutting down daemon (pid ${process.pid})...`);
+    try {
       await meter.stop();
+      console.log(`[${ts()}] [ai-turn-meter] daemon stopped cleanly.`);
       process.exit(0);
+    } catch (err) {
+      console.error(`[${ts()}] [ai-turn-meter] error during shutdown: ${err?.message || err}`);
+      process.exit(1);
+    }
+  };
+
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      shutdown(sig);
     });
   }
 }
 
-const argv = process.argv.slice(2);
-const cmd = argv.find((a) => !a.startsWith('-'));
-const flags = argv.filter((a) => a.startsWith('-'));
-const dryRun = flags.includes('--dry-run');
-const jsonMode = flags.includes('--json');
+function isDirectExecution() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]));
+  } catch {
+    return false;
+  }
+}
 
-if (flags.includes('--version') || flags.includes('-v')) {
-  console.log(getPkgVersion());
-} else if (flags.includes('--help') || flags.includes('-h') || cmd === 'help') {
-  printHelp();
-} else if (cmd === 'status' || !cmd) {
-  await cmdStatus(jsonMode);
-} else if (cmd === 'providers') {
-  const pIdx = argv.indexOf('providers');
-  const posArgs = argv.slice(pIdx + 1).filter((a) => !a.startsWith('-'));
-  await cmdProviders(posArgs, flags, jsonMode);
-} else if (cmd === 'cost') {
-  await cmdCost(flags, jsonMode);
-} else if (cmd === 'receipt') {
-  await cmdReceipt(flags, jsonMode);
-} else if (cmd === 'fingerprint') {
-  await cmdFingerprint(flags, jsonMode);
-} else if (cmd === 'doctor') {
-  await cmdDoctor(jsonMode);
-} else if (cmd === 'install' || cmd === 'setup') {
-  await installAll({
-    dryRun,
-    skipCliLink: flags.includes('--no-link'),
-    skipLaunchAgent: flags.includes('--no-daemon'),
-  });
-} else if (cmd === 'uninstall') {
-  uninstallAll({ dryRun });
-} else if (cmd === 'start-daemon') {
-  installLaunchAgent({ dryRun });
-} else if (cmd === 'stop-daemon') {
-  uninstallLaunchAgent({ dryRun });
-} else if (cmd === 'app-autostart') {
-  const idx = argv.indexOf('app-autostart');
-  const action = argv[idx + 1] && !argv[idx + 1].startsWith('-') ? argv[idx + 1] : 'status';
-  cmdAppAutostart(action, flags, dryRun, jsonMode);
-} else if (cmd === 'open') {
-  const target = argv[argv.indexOf('open') + 1];
-  await cmdOpen(target);
-} else if (cmd === 'ssh-info') {
-  const idx = argv.indexOf('ssh-info');
-  const host = argv[idx + 1] && !argv[idx + 1].startsWith('-') ? argv[idx + 1] : undefined;
-  cmdSshInfo(host, jsonMode);
-} else if (cmd === 'ssh-apply') {
-  const idx = argv.indexOf('ssh-apply');
-  const host = argv[idx + 1] && !argv[idx + 1].startsWith('-') ? argv[idx + 1] : undefined;
-  cmdSshApply(host, flags, dryRun, jsonMode);
-} else if (cmd === 'daemon') {
-  await cmdDaemon(flags);
-} else {
-  printHelp();
-  process.exit(1);
+async function main() {
+  const argv = process.argv.slice(2);
+  const cmd = argv.find((a) => !a.startsWith('-'));
+  const flags = argv.filter((a) => a.startsWith('-'));
+  const dryRun = flags.includes('--dry-run');
+  const jsonMode = flags.includes('--json');
+
+  if (flags.includes('--version') || flags.includes('-v')) {
+    console.log(getPkgVersion());
+  } else if (flags.includes('--help') || flags.includes('-h') || cmd === 'help') {
+    printHelp();
+  } else if (cmd === 'status' || !cmd) {
+    await cmdStatus(jsonMode);
+  } else if (cmd === 'providers') {
+    const pIdx = argv.indexOf('providers');
+    const posArgs = argv.slice(pIdx + 1).filter((a) => !a.startsWith('-'));
+    await cmdProviders(posArgs, flags, jsonMode);
+  } else if (cmd === 'cost') {
+    await cmdCost(flags, jsonMode);
+  } else if (cmd === 'receipt') {
+    await cmdReceipt(flags, jsonMode);
+  } else if (cmd === 'fingerprint') {
+    await cmdFingerprint(flags, jsonMode);
+  } else if (cmd === 'doctor') {
+    await cmdDoctor(jsonMode);
+  } else if (cmd === 'install' || cmd === 'setup') {
+    await installAll({
+      dryRun,
+      skipCliLink: flags.includes('--no-link'),
+      skipLaunchAgent: flags.includes('--no-daemon'),
+    });
+  } else if (cmd === 'uninstall') {
+    uninstallAll({ dryRun });
+  } else if (cmd === 'start-daemon') {
+    installLaunchAgent({ dryRun });
+  } else if (cmd === 'stop-daemon') {
+    uninstallLaunchAgent({ dryRun });
+  } else if (cmd === 'app-autostart') {
+    const idx = argv.indexOf('app-autostart');
+    const posArgs = argv.slice(idx + 1).filter((a) => !a.startsWith('-'));
+    const action = posArgs.length > 0 ? posArgs[0] : 'status';
+    cmdAppAutostart(action, flags, dryRun, jsonMode);
+  } else if (cmd === 'open') {
+    const target = argv[argv.indexOf('open') + 1];
+    await cmdOpen(target);
+  } else if (cmd === 'ssh-info') {
+    const idx = argv.indexOf('ssh-info');
+    const host = argv[idx + 1] && !argv[idx + 1].startsWith('-') ? argv[idx + 1] : undefined;
+    cmdSshInfo(host, jsonMode);
+  } else if (cmd === 'ssh-apply') {
+    const idx = argv.indexOf('ssh-apply');
+    const host = argv[idx + 1] && !argv[idx + 1].startsWith('-') ? argv[idx + 1] : undefined;
+    cmdSshApply(host, flags, dryRun, jsonMode);
+  } else if (cmd === 'daemon') {
+    await cmdDaemon(flags);
+  } else {
+    printHelp();
+    process.exit(1);
+  }
+}
+
+if (isDirectExecution()) {
+  await main();
 }

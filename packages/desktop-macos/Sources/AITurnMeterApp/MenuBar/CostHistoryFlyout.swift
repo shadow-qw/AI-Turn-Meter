@@ -15,6 +15,7 @@ final class CostHistoryFlyoutController: NSObject {
   private var isFlyoutHovered: Bool = false
   private var hideWorkItem: DispatchWorkItem?
   private var showWorkItem: DispatchWorkItem?
+  private var lastMeasuredContentHeight: CGFloat = 0
 
   func setCardHovered(_ hovered: Bool, vm: MeterViewModel, card: CodexBarCardSnapshot, selection: String) {
     isCardHovered = hovered
@@ -130,19 +131,19 @@ final class CostHistoryFlyoutController: NSObject {
     }
     guard !card.daily30.isEmpty || !(card.projects ?? []).isEmpty || !(card.breakdowns ?? []).isEmpty else { return }
 
+    lastMeasuredContentHeight = 0
     let view = CostHistoryDetailFlyoutView(
       selection: selection,
       card: card,
       onHoverChanged: { [weak self] inside in
         self?.setFlyoutHovered(inside)
+      },
+      onContentHeightChanged: { [weak self] height in
+        self?.updatePanelHeight(height)
       }
     )
     let p = ensurePanel(rootView: view)
     guard let hosting = hostingView else { return }
-    hosting.layoutSubtreeIfNeeded()
-    let fitSize = hosting.fittingSize
-    let panelWidth: CGFloat = 286
-    let panelHeight = min(max(fitSize.height, 200), 620)
 
     let visiblePopRect: NSRect = {
       if let cv = pop.contentViewController?.view, cv.window === popWindow {
@@ -152,6 +153,12 @@ final class CostHistoryFlyoutController: NSObject {
     }()
     let screenFrame = (popWindow.screen ?? NSScreen.main)?.visibleFrame
       ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let maxH = min(620, max(240, screenFrame.height - 24))
+
+    hosting.layoutSubtreeIfNeeded()
+    let rawHeight = lastMeasuredContentHeight > 40 ? lastMeasuredContentHeight : hosting.fittingSize.height
+    let panelWidth: CGFloat = 286
+    let panelHeight = min(max(ceil(rawHeight), 200), maxH)
 
     let gap: CGFloat = 4
     let x: CGFloat = (visiblePopRect.minX - panelWidth - gap >= screenFrame.minX)
@@ -172,17 +179,35 @@ final class CostHistoryFlyoutController: NSObject {
     p.orderFront(nil)
   }
 
-  func refreshPanelHeightPreservingTop() {
-    guard let p = panel, p.isVisible, let hosting = hostingView else { return }
-    hosting.layoutSubtreeIfNeeded()
-    let fitSize = hosting.fittingSize
-    let panelHeight = min(max(fitSize.height, 180), 640)
+  func updatePanelHeight(_ rawHeight: CGFloat) {
+    guard rawHeight.isFinite, rawHeight > 40 else { return }
+    lastMeasuredContentHeight = rawHeight
+    guard let p = panel, p.isVisible else { return }
+    let screenFrame = (p.screen ?? NSScreen.main)?.visibleFrame
+      ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let maxH = min(620, max(240, screenFrame.height - 24))
+    let panelHeight = min(max(ceil(rawHeight), 180), maxH)
     var frame = p.frame
     if abs(frame.height - panelHeight) < 1 { return }
     let topY = frame.maxY
     frame.size.height = panelHeight
-    frame.origin.y = max((p.screen ?? NSScreen.main)?.visibleFrame.minY ?? 8, topY - panelHeight)
+    frame.origin.y = max(screenFrame.minY + 8, topY - panelHeight)
     p.setFrame(frame, display: true)
+  }
+
+  func refreshPanelHeightPreservingTop() {
+    guard let p = panel, p.isVisible, let hosting = hostingView else { return }
+    hosting.layoutSubtreeIfNeeded()
+    let rawHeight = lastMeasuredContentHeight > 40 ? lastMeasuredContentHeight : hosting.fittingSize.height
+    updatePanelHeight(rawHeight)
+  }
+}
+
+private struct FlyoutContentHeightKey: PreferenceKey {
+  static var defaultValue: CGFloat = 0
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+    let next = nextValue()
+    if next > 0 { value = next }
   }
 }
 
@@ -195,6 +220,7 @@ private struct CostHistoryDetailFlyoutView: View {
   let selection: String
   let card: CodexBarCardSnapshot
   let onHoverChanged: (Bool) -> Void
+  let onContentHeightChanged: (CGFloat) -> Void
 
   @State private var metric: FlyoutChartMetric = .tokens
   @State private var hoveredDate: String? = nil
@@ -239,8 +265,9 @@ private struct CostHistoryDetailFlyoutView: View {
     let projects = Array((card.projects ?? []).prefix(5))
     let breakdowns = card.breakdowns ?? []
 
-    VStack(alignment: .leading, spacing: 10) {
-      // 30-day vertical bar chart with Y-axis + yellow peak cap + continuous bar scrubbing
+    ScrollView(.vertical, showsIndicators: false) {
+      VStack(alignment: .leading, spacing: 10) {
+        // 30-day vertical bar chart with Y-axis + yellow peak cap + continuous bar scrubbing
       if !points.isEmpty {
         VStack(alignment: .leading, spacing: 4) {
           HStack(alignment: .bottom, spacing: 6) {
@@ -458,10 +485,21 @@ private struct CostHistoryDetailFlyoutView: View {
         }
       }
     }
-    .padding(16)
-    .frame(width: 286, alignment: .leading)
+      .padding(16)
+      .frame(width: 286, alignment: .leading)
+      .fixedSize(horizontal: false, vertical: true)
+      .background(
+        GeometryReader { geo in
+          Color.clear.preference(key: FlyoutContentHeightKey.self, value: geo.size.height)
+        }
+      )
+    }
+    .frame(minWidth: 286, idealWidth: 286, maxWidth: 286, maxHeight: .infinity, alignment: .top)
     .contentShape(Rectangle())
     .onHover { onHoverChanged($0) }
+    .onPreferenceChange(FlyoutContentHeightKey.self) { height in
+      onContentHeightChanged(height)
+    }
     .onChange(of: selectedPt?.date) { _ in
       DispatchQueue.main.async {
         CostHistoryFlyoutController.shared.refreshPanelHeightPreservingTop()

@@ -105,6 +105,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @MainActor
   @objc private func openControlPanelFromMenu() {
+    if let sb = statusBarController, sb.isPopoverShown, let vm = vm {
+      let targetPane: SettingsPane = vm.popoverSelection == "all"
+        ? .general
+        : .provider(vm.popoverSelection)
+      sb.closePopover()
+      vm.openSettingsPane(targetPane)
+    }
     showControlPanel(tab: nil)
   }
 

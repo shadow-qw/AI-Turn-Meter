@@ -6,7 +6,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { zstdDecompressSync } from 'node:zlib';
-import { discoverAntigravityLanguageServers } from './adapters/antigravity.mjs';
+import {
+  buildLanguageServerEndpoints,
+  inspectAntigravityLanguageServers,
+} from './adapters/antigravity.mjs';
 import {
   httpRequestJson,
   parseSystemProxyInfo,
@@ -26,6 +29,8 @@ let cachedAtMs = 0;
 let cachedCacheKey = '';
 let cachedTtlMs = CACHE_TTL_MS;
 let inflightPromise = null;
+let inflightCacheKey = '';
+let quotaRequestSeq = 0;
 let lastGoodByTool = {
   codex: null,
   cursor: null,
@@ -38,6 +43,8 @@ export function resetQuotaCacheForTests() {
   cachedCacheKey = '';
   cachedTtlMs = CACHE_TTL_MS;
   inflightPromise = null;
+  inflightCacheKey = '';
+  quotaRequestSeq += 1;
   lastGoodByTool = { codex: null, cursor: null, antigravity: null };
   resetNetProxyCacheForTests();
 }
@@ -70,6 +77,8 @@ export function computeQuotaWindow({
   resetAtMs = null,
   nowMs = Date.now(),
   extraNote = null,
+  group = null,
+  windowKind = null,
 }) {
   let rem = clampPct(remainingPct);
   if (rem === null) {
@@ -138,6 +147,9 @@ export function computeQuotaWindow({
     subtitle = subtitle ? `${extraNote} · ${subtitle}` : extraNote;
   }
 
+  const resolvedGroup = typeof group === 'string' && group.trim() ? group.trim() : null;
+  const resolvedWindowKind = typeof windowKind === 'string' && windowKind.trim() ? windowKind.trim() : null;
+
   return {
     id,
     title,
@@ -145,6 +157,8 @@ export function computeQuotaWindow({
     resetText,
     pacePct,
     subtitle,
+    ...(resolvedGroup ? { group: resolvedGroup } : {}),
+    ...(resolvedWindowKind ? { windowKind: resolvedWindowKind } : {}),
   };
 }
 
@@ -193,9 +207,9 @@ function classifyCodexWindowRole(w, fallbackRole) {
 export function normalizeCodexRateWindows(rateLimit, nowMs = Date.now()) {
   if (!rateLimit || typeof rateLimit !== 'object') return [];
   const roleMeta = {
-    session: { id: 'codex-session', title: '会话', defaultSecs: 18000 },
-    weekly: { id: 'codex-weekly', title: '每周', defaultSecs: 604800 },
-    monthly: { id: 'codex-monthly', title: '每月', defaultSecs: 2592000 },
+    session: { id: 'codex-session', title: '会话', defaultSecs: 18000, group: 'Codex', windowKind: '5h' },
+    weekly: { id: 'codex-weekly', title: '每周', defaultSecs: 604800, group: 'Codex', windowKind: 'weekly' },
+    monthly: { id: 'codex-monthly', title: '每月', defaultSecs: 2592000, group: 'Codex', windowKind: 'monthly' },
   };
 
   const rawEntries = [
@@ -252,6 +266,8 @@ export function normalizeCodexRateWindows(rateLimit, nowMs = Date.now()) {
           : meta.defaultSecs,
       resetAtMs,
       nowMs,
+      group: meta.group,
+      windowKind: meta.windowKind,
     });
     if (win) quotaWindows.push(win);
   }
@@ -310,6 +326,9 @@ export function resolveCodexUsageUrl(codexHome, configContents = null) {
   };
 }
 
+const MAX_CODEX_RATE_LIMIT_FILES = 15;
+const MAX_CODEX_RATE_LIMIT_BYTES = 20 * 1024 * 1024;
+
 function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
   try {
     const maxAgeMs = 30 * 86400 * 1000;
@@ -324,7 +343,7 @@ function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
           try {
             const st = statSync(p);
             if (nowMs - st.mtimeMs <= maxAgeMs) {
-              candidates.push({ p, mtimeMs: st.mtimeMs });
+              candidates.push({ p, mtimeMs: st.mtimeMs, size: st.size });
             }
           } catch {}
         }
@@ -336,7 +355,8 @@ function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
       walk(join(codexHome, 'archived_sessions'), 0);
     }
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    for (const { p } of candidates.slice(0, 40)) {
+    for (const { p, size } of candidates.slice(0, MAX_CODEX_RATE_LIMIT_FILES)) {
+      if (size > MAX_CODEX_RATE_LIMIT_BYTES) continue;
       let raw;
       try {
         raw = p.endsWith('.jsonl.zst')
@@ -552,51 +572,85 @@ function parseIsoMs(str) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-export async function fetchAntigravityQuota(nowMs = Date.now()) {
-  const empty = { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null };
+export async function fetchAntigravityQuota(
+  nowMs = Date.now(),
+  { inspectServers = inspectAntigravityLanguageServers } = {}
+) {
+  const empty = {
+    accountEmail: null,
+    planTitle: null,
+    quotaWindows: [],
+    resetCreditsText: null,
+    quotaHint: null,
+    _ok: false,
+    _errorKind: null,
+  };
   try {
-    const servers = await discoverAntigravityLanguageServers();
-    if (!servers || servers.length === 0) return empty;
+    const inspected = await inspectServers();
+    const servers = Array.isArray(inspected) ? inspected : inspected?.servers || [];
+    const runningWithoutCsrfToken = Boolean(!Array.isArray(inspected) && inspected?.runningWithoutCsrfToken);
+    const detectedVersion = !Array.isArray(inspected) ? inspected?.detectedVersion || null : null;
+
+    if (servers.length === 0) {
+      return {
+        ...empty,
+        quotaHint: runningWithoutCsrfToken
+          ? detectedVersion
+            ? `Antigravity ${detectedVersion} 已关闭本地令牌探测 · 请在客户端内查看剩余额度`
+            : 'Antigravity 新版本已关闭本地令牌探测 · 请在客户端内查看剩余额度'
+          : '未检测到运行中的 Antigravity · 打开客户端后自动同步',
+      };
+    }
 
     for (const srv of servers.slice(0, 3)) {
-      for (const port of srv.ports) {
-        for (const useHttps of [true, false]) {
+      for (const { port, useHttps } of buildLanguageServerEndpoints(srv)) {
+        try {
+          const uRes = await postLocalLsJson(
+            port,
+            srv.csrf,
+            '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+            useHttps
+          );
+          if (uRes.status !== 200) continue;
+          const uJson = JSON.parse(uRes.body);
+          const us = uJson?.userStatus;
+          if (!us) continue;
+
+          const accountEmail = us.email || null;
+          const planTitle = us.userTier?.name || us.planStatus?.planInfo?.planName || null;
+
+          let quotaWindows = [];
           try {
-            const uRes = await postLocalLsJson(
+            const qRes = await postLocalLsJson(
               port,
               srv.csrf,
-              '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+              '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary',
               useHttps
             );
-            if (uRes.status !== 200) continue;
-            const uJson = JSON.parse(uRes.body);
-            const us = uJson?.userStatus;
-            if (!us) continue;
-
-            const accountEmail = us.email || null;
-            const planTitle = us.userTier?.name || us.planStatus?.planInfo?.planName || null;
-
-            let quotaWindows = [];
-            try {
-              const qRes = await postLocalLsJson(
-                port,
-                srv.csrf,
-                '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary',
-                useHttps
-              );
             if (qRes.status === 200) {
               const qJson = JSON.parse(qRes.body);
               const groups = qJson?.response?.groups || qJson?.groups || [];
               const bucketMap = new Map();
               for (const g of groups) {
                 for (const b of g.buckets || []) {
-                  if (!b.disabled && typeof b.remainingFraction === 'number') {
-                    bucketMap.set(b.bucketId || b.id, b);
-                  }
+                  if (!b || b.disabled) continue;
+                  const hasFrac =
+                    typeof b.remainingFraction === 'number' && Number.isFinite(b.remainingFraction);
+                  const hasResetTime = typeof b.resetTime === 'string' && b.resetTime.trim().length > 0;
+                  if (!hasFrac && !hasResetTime) continue;
+                  // Proto3 omits zero-valued float scalars (`remainingFraction: 0`), leaving only `resetTime` when exhausted.
+                  const normalizedBucket = hasFrac ? b : { ...b, remainingFraction: 0 };
+                  bucketMap.set(normalizedBucket.bucketId || normalizedBucket.id, normalizedBucket);
                 }
               }
 
-              const addBucket = (bucketId, id, title, defaultSecs) => {
+              const addBucket = (
+                bucketId,
+                id,
+                title,
+                defaultSecs,
+                { group = null, windowKind = null } = {}
+              ) => {
                 const b = bucketMap.get(bucketId);
                 if (!b) return null;
                 const wSec = b.window === 'weekly' ? 604800 : b.window === '5h' ? 18000 : defaultSecs;
@@ -607,36 +661,37 @@ export async function fetchAntigravityQuota(nowMs = Date.now()) {
                   windowSeconds: wSec,
                   resetAtMs: parseIsoMs(b.resetTime),
                   nowMs,
+                  group,
+                  windowKind,
                 });
               };
 
-              const g5h = addBucket('gemini-5h', 'ag-gemini-5h', 'Gemini 会话', 18000);
+              const g5h = addBucket('gemini-5h', 'ag-gemini-5h', 'Gemini 会话', 18000, {
+                group: 'Gemini',
+                windowKind: '5h',
+              });
               if (g5h) quotaWindows.push(g5h);
-              const gWk = addBucket('gemini-weekly', 'ag-gemini-weekly', 'Gemini 每周', 604800);
+              const gWk = addBucket('gemini-weekly', 'ag-gemini-weekly', 'Gemini 每周', 604800, {
+                group: 'Gemini',
+                windowKind: 'weekly',
+              });
               if (gWk) quotaWindows.push(gWk);
 
-              const p5h = bucketMap.get('3p-5h');
-              const pWk = bucketMap.get('3p-weekly');
-              if (p5h && pWk) {
-                const chosen = p5h.remainingFraction <= pWk.remainingFraction ? p5h : pWk;
-                const wSec = chosen.window === '5h' ? 18000 : 604800;
-                const win = computeQuotaWindow({
-                  id: 'ag-claude-gpt',
-                  title: 'Claude / GPT',
-                  remainingPct: chosen.remainingFraction * 100,
-                  windowSeconds: wSec,
-                  resetAtMs: parseIsoMs(chosen.resetTime),
-                  nowMs,
-                });
-                if (win) quotaWindows.push(win);
-              } else {
-                const cWin =
-                  addBucket('3p-5h', 'ag-claude-gpt', 'Claude / GPT', 18000) ||
-                  addBucket('3p-weekly', 'ag-claude-gpt', 'Claude / GPT', 604800);
-                if (cWin) quotaWindows.push(cWin);
-              }
+              const p5h = addBucket('3p-5h', 'ag-claude-gpt-5h', 'Claude / GPT 会话', 18000, {
+                group: 'Claude / GPT',
+                windowKind: '5h',
+              });
+              if (p5h) quotaWindows.push(p5h);
+              const pWk = addBucket('3p-weekly', 'ag-claude-gpt-weekly', 'Claude / GPT 每周', 604800, {
+                group: 'Claude / GPT',
+                windowKind: 'weekly',
+              });
+              if (pWk) quotaWindows.push(pWk);
 
-              const argon = addBucket('gemini-argon-wtu-weekly', 'ag-argon-weekly', 'Gemini 4 Argon', 604800);
+              const argon = addBucket('gemini-argon-wtu-weekly', 'ag-argon-weekly', 'Gemini 4 Argon', 604800, {
+                group: 'Gemini 4 Argon',
+                windowKind: 'weekly',
+              });
               if (argon) quotaWindows.push(argon);
             }
           } catch {}
@@ -647,10 +702,16 @@ export async function fetchAntigravityQuota(nowMs = Date.now()) {
             let bestGemini = null;
             let bestClaude = null;
             for (const c of configs) {
-              const frac = c?.quotaInfo?.remainingFraction;
-              if (typeof frac !== 'number') continue;
+              if (!c || c.disabled) continue;
+              const qi = c.quotaInfo;
+              if (!qi || typeof qi !== 'object') continue;
+              const hasFrac =
+                typeof qi.remainingFraction === 'number' && Number.isFinite(qi.remainingFraction);
+              const hasResetTime = typeof qi.resetTime === 'string' && qi.resetTime.trim().length > 0;
+              if (!hasFrac && !hasResetTime) continue;
+              const frac = hasFrac ? qi.remainingFraction : 0;
               const label = String(c.label || '').toLowerCase();
-              const item = { frac, resetAtMs: parseIsoMs(c?.quotaInfo?.resetTime) };
+              const item = { frac, resetAtMs: parseIsoMs(qi.resetTime) };
               if (label.includes('claude') || label.includes('gpt')) {
                 if (!bestClaude || item.frac < bestClaude.frac) bestClaude = item;
               } else if (label.includes('gemini')) {
@@ -658,38 +719,65 @@ export async function fetchAntigravityQuota(nowMs = Date.now()) {
               }
             }
             if (bestGemini) {
-              quotaWindows.push(
-                computeQuotaWindow({
-                  id: 'ag-gemini',
-                  title: 'Gemini Models',
-                  remainingPct: bestGemini.frac * 100,
-                  windowSeconds: 18000,
-                  resetAtMs: bestGemini.resetAtMs,
-                  nowMs,
-                })
-              );
+              const win = computeQuotaWindow({
+                id: 'ag-gemini',
+                title: 'Gemini Models',
+                remainingPct: bestGemini.frac * 100,
+                windowSeconds: 18000,
+                resetAtMs: bestGemini.resetAtMs,
+                nowMs,
+                group: 'Gemini',
+                windowKind: '5h',
+              });
+              if (win) quotaWindows.push(win);
             }
             if (bestClaude) {
-              quotaWindows.push(
-                computeQuotaWindow({
-                  id: 'ag-claude-gpt',
-                  title: 'Claude / GPT',
-                  remainingPct: bestClaude.frac * 100,
-                  windowSeconds: 18000,
-                  resetAtMs: bestClaude.resetAtMs,
-                  nowMs,
-                })
-              );
+              const win = computeQuotaWindow({
+                id: 'ag-claude-gpt',
+                title: 'Claude / GPT',
+                remainingPct: bestClaude.frac * 100,
+                windowSeconds: 18000,
+                resetAtMs: bestClaude.resetAtMs,
+                nowMs,
+                group: 'Claude / GPT',
+                windowKind: '5h',
+              });
+              if (win) quotaWindows.push(win);
             }
           }
 
-            return { accountEmail, planTitle, quotaWindows, resetCreditsText: null };
-          } catch {}
-        }
+          return {
+            accountEmail,
+            planTitle,
+            quotaWindows,
+            resetCreditsText: null,
+            quotaHint:
+              quotaWindows.length === 0
+                ? '暂无可用配额窗口 · 请在 Antigravity 内查看剩余额度'
+                : null,
+            _ok: true,
+            _errorKind: null,
+          };
+        } catch {}
       }
     }
-  } catch {}
-  return empty;
+    return {
+      ...empty,
+      quotaHint: runningWithoutCsrfToken
+        ? detectedVersion
+          ? `Antigravity ${detectedVersion} 已关闭本地令牌探测 · 请在客户端内查看剩余额度`
+          : 'Antigravity 新版本已关闭本地令牌探测 · 请在客户端内查看剩余额度'
+        : '暂无法连接 Antigravity 本地服务 · 请点击刷新重试',
+      _ok: false,
+      _errorKind: 'network',
+    };
+  } catch {
+    return {
+      ...empty,
+      _ok: false,
+      _errorKind: 'network',
+    };
+  }
 }
 
 function normalizeCursorCookieInput(raw) {
@@ -1422,7 +1510,7 @@ export function fetchCodeBuddyQuota() {
   }
 }
 
-function assembleAllQuotas(raw, enabledTools = null) {
+export function assembleAllQuotas(raw, enabledTools = null) {
   const isEnabled = (k) => !enabledTools || enabledTools[k] !== false;
   const { codex, antigravity, cursor, codebuddy } = raw;
 
@@ -1430,8 +1518,9 @@ function assembleAllQuotas(raw, enabledTools = null) {
   if (isEnabled('codex') && codex.quotaWindows.length > 0) {
     const cPrimary = codex.quotaWindows[0];
     const cSecondary = codex.quotaWindows[1];
+    const { group: _cg, windowKind: _cwk, ...baseCodex } = cPrimary;
     overviewWindows.push({
-      ...cPrimary,
+      ...baseCodex,
       id: 'overview-codex',
       title: `Codex ${cPrimary.title}`,
       subtitle: cPrimary.subtitle
@@ -1447,21 +1536,31 @@ function assembleAllQuotas(raw, enabledTools = null) {
       .slice(1)
       .map((w) => `${w.title} ${Math.round(w.remainingPct)}%`);
     const curSub = [curWin.subtitle, ...extraSubs].filter(Boolean).join(' · ');
+    const { group: _curg, windowKind: _curwk, ...baseCursor } = curWin;
     overviewWindows.push({
-      ...curWin,
+      ...baseCursor,
       id: 'overview-cursor',
       title: cursor.quotaWindows.length > 1 ? 'Cursor 模型' : 'Cursor',
       subtitle: curSub || null,
     });
   }
   if (isEnabled('antigravity') && antigravity.quotaWindows.length > 0) {
-    const g5h = antigravity.quotaWindows[0];
-    const gWk = antigravity.quotaWindows.find((w) => w.id === 'ag-gemini-weekly');
+    const g5h =
+      antigravity.quotaWindows.find((w) => w.id === 'ag-gemini-5h') ||
+      antigravity.quotaWindows[0];
+    const gWk =
+      antigravity.quotaWindows.find((w) => w.id === 'ag-gemini-weekly' && w.id !== g5h.id) ||
+      (g5h.windowKind === '5h'
+        ? antigravity.quotaWindows.find(
+            (w) => w.id !== g5h.id && w.group && w.group === g5h.group && w.windowKind === 'weekly'
+          )
+        : null);
     const agSub = [g5h.subtitle, gWk ? `每周 ${Math.round(gWk.remainingPct)}%` : null]
       .filter(Boolean)
       .join(' · ');
+    const { group: _agg, windowKind: _agwk, ...baseAg } = g5h;
     overviewWindows.push({
-      ...g5h,
+      ...baseAg,
       id: 'overview-antigravity',
       title: 'Antigravity',
       subtitle: agSub || null,
@@ -1506,7 +1605,7 @@ function reconcileWithStaleGrace(toolKey, fresh, nowMs) {
 
 export async function getAllQuotas(
   nowMs = Date.now(),
-  { forceRefresh = false, allowNetwork = true, cursorCookie = null, enabledTools = null } = {}
+  { forceRefresh = false, allowNetwork = true, cursorCookie = null, enabledTools = null, _fetchers = null } = {}
 ) {
   const isEnabled = (k) => !enabledTools || enabledTools[k] !== false;
   const enabledKey = ['codex', 'antigravity', 'cursor', 'codebuddy']
@@ -1518,21 +1617,29 @@ export async function getAllQuotas(
   if (!forceRefresh && cachedResult && cachedCacheKey === cacheKey && nowMs - cachedAtMs < cachedTtlMs) {
     return assembleAllQuotas(cachedResult, enabledTools);
   }
-  if (!forceRefresh && inflightPromise && cachedCacheKey === cacheKey) {
+  if (!forceRefresh && inflightPromise && inflightCacheKey === cacheKey) {
     const raw = await inflightPromise;
     return assembleAllQuotas(raw, enabledTools);
   }
-  cachedCacheKey = cacheKey;
+
+  const reqCacheKey = cacheKey;
+  const reqSeq = ++quotaRequestSeq;
+  inflightCacheKey = reqCacheKey;
 
   const emptySnap = () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null });
+  const runCodex = _fetchers?.codex || fetchCodexQuota;
+  const runAntigravity = _fetchers?.antigravity || fetchAntigravityQuota;
+  const runCursor = _fetchers?.cursor || fetchCursorQuota;
+  const runCodeBuddy = _fetchers?.codebuddy || fetchCodeBuddyQuota;
 
-  inflightPromise = (async () => {
+  let p;
+  p = (async () => {
     const [codexRaw, antigravityRaw, cursorRaw] = await Promise.all([
-      isEnabled('codex') ? fetchCodexQuota(nowMs, { allowNetwork }) : Promise.resolve(emptySnap()),
-      isEnabled('antigravity') ? fetchAntigravityQuota(nowMs) : Promise.resolve(emptySnap()),
-      isEnabled('cursor') ? fetchCursorQuota(nowMs, { allowNetwork, cursorCookie }) : Promise.resolve(emptySnap()),
+      isEnabled('codex') ? runCodex(nowMs, { allowNetwork }) : Promise.resolve(emptySnap()),
+      isEnabled('antigravity') ? runAntigravity(nowMs) : Promise.resolve(emptySnap()),
+      isEnabled('cursor') ? runCursor(nowMs, { allowNetwork, cursorCookie }) : Promise.resolve(emptySnap()),
     ]);
-    const codebuddy = isEnabled('codebuddy') ? fetchCodeBuddyQuota() : emptySnap();
+    const codebuddy = isEnabled('codebuddy') ? runCodeBuddy() : emptySnap();
     const codex = isEnabled('codex') ? reconcileWithStaleGrace('codex', codexRaw, nowMs) : emptySnap();
     const antigravity = isEnabled('antigravity')
       ? reconcileWithStaleGrace('antigravity', antigravityRaw, nowMs)
@@ -1541,18 +1648,26 @@ export async function getAllQuotas(
 
     const anyTransientFailure = Boolean(
       (isEnabled('codex') && codexRaw?._errorKind === 'network' && !codexRaw.quotaWindows?.length) ||
+        (isEnabled('antigravity') && antigravityRaw?._errorKind === 'network' && !antigravityRaw.quotaWindows?.length) ||
         (isEnabled('cursor') && cursorRaw?._errorKind === 'network' && !cursorRaw.quotaWindows?.length)
     );
-    cachedTtlMs = anyTransientFailure ? ERROR_RETRY_TTL_MS : CACHE_TTL_MS;
 
     const raw = { codex, antigravity, cursor, codebuddy };
-    cachedResult = raw;
-    cachedAtMs = Date.now();
+    if (reqSeq === quotaRequestSeq && inflightCacheKey === reqCacheKey) {
+      cachedTtlMs = anyTransientFailure ? ERROR_RETRY_TTL_MS : CACHE_TTL_MS;
+      cachedResult = raw;
+      cachedAtMs = Date.now();
+      cachedCacheKey = reqCacheKey;
+    }
     return raw;
   })().finally(() => {
-    inflightPromise = null;
+    if (inflightPromise === p) {
+      inflightPromise = null;
+      inflightCacheKey = '';
+    }
   });
 
-  const raw = await inflightPromise;
+  inflightPromise = p;
+  const raw = await p;
   return assembleAllQuotas(raw, enabledTools);
 }

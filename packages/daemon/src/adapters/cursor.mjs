@@ -149,9 +149,11 @@ export function processCursorHookPayload(payload, { stateDir = defaultStateDir()
 
     if (startedAtMs !== null && nowMs >= startedAtMs) {
       durationMs = nowMs - startedAtMs;
-      const net = Math.max(150, durationMs - toolWaitMs);
-      modelActiveMs = net;
-      tpsMethod = toolWaitMs > 0 ? 'e2e_minus_tools' : 'e2e_turn';
+      const net = durationMs - toolWaitMs;
+      if (net >= 150) {
+        modelActiveMs = net;
+        tpsMethod = toolWaitMs > 0 ? 'e2e_minus_tools' : 'e2e_turn';
+      }
     }
 
     state.completedGenIds[dedupKey] = nowMs;
@@ -272,6 +274,14 @@ export function parseCursorApiUsageEvent(ev, overlapIndex = null) {
       if (Math.abs(h.completedAtMs - tsMs) <= 20_000 && h.outputTokens > 0 && h.outputTokens === outputTokens) {
         return null;
       }
+      if (
+        h.startedAtMs &&
+        tsMs >= h.startedAtMs - 60_000 &&
+        tsMs <= h.completedAtMs + 20_000 &&
+        totalInputTokens <= h.totalInputTokens
+      ) {
+        return null;
+      }
     }
   }
 
@@ -377,7 +387,13 @@ export async function syncCursorHistoryEvents(
       const ts = Number(ev?.timestamp);
       if (Number.isFinite(ts) && ts > newestSeenMs) newestSeenMs = ts;
       const parsed = parseCursorApiUsageEvent(ev, overlapIndex);
-      if (!parsed) continue;
+      if (!parsed) {
+        const rawId = typeof ev?.usageEventId === 'string' && ev.usageEventId.trim() ? ev.usageEventId.trim() : null;
+        if (rawId && typeof store.deleteTurnByUid === 'function') {
+          store.deleteTurnByUid(`cursor:api:${rawId}`);
+        }
+        continue;
+      }
       const upserted = store.upsertTurn(parsed);
       if (upserted.changed) {
         totalChanged += 1;

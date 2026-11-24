@@ -3,6 +3,13 @@ import { existsSync, readdirSync, readFileSync, statSync, watch } from 'node:fs'
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
+const OPEN_TURN_FLUSH_MS = 120_000;
+const CLI_TRAILING_META_EVENTS = new Set([
+  'acp-terminal-state',
+  'context-usage',
+  'file-history-snapshot',
+]);
+
 function parseIsoMs(ts) {
   if (typeof ts === 'number' && Number.isFinite(ts)) return ts;
   if (typeof ts !== 'string') return null;
@@ -64,10 +71,27 @@ function extractAssistantText(msgObj) {
  * Parse a CodeBuddy CN IDE conversation directory (index.json + messages/*.json).
  * @param {string} sessionDir
  * @param {string} [workspaceHash]
+ * @param {{ fallbackTimestampMs?: number | null }} [opts]
  */
-export function parseCodeBuddyIdeSessionDir(sessionDir, workspaceHash = null) {
+export function parseCodeBuddyIdeSessionDir(
+  sessionDir,
+  workspaceHash = null,
+  { fallbackTimestampMs = null } = {}
+) {
   const indexPath = join(sessionDir, 'index.json');
   if (!existsSync(indexPath)) return [];
+
+  let resolvedFallbackMs =
+    typeof fallbackTimestampMs === 'number' && Number.isFinite(fallbackTimestampMs)
+      ? Math.round(fallbackTimestampMs)
+      : null;
+  if (resolvedFallbackMs === null) {
+    try {
+      resolvedFallbackMs = Math.round(statSync(indexPath).mtimeMs);
+    } catch {
+      resolvedFallbackMs = null;
+    }
+  }
 
   let idx;
   try {
@@ -143,14 +167,20 @@ export function parseCodeBuddyIdeSessionDir(sessionDir, workspaceHash = null) {
     if (totalInputTokens === 0 && outputTokens === 0) continue;
 
     const startedAtMs = typeof req.startedAt === 'number' ? req.startedAt : null;
-    const completedAtMs = lastCreatedMs ?? (startedAtMs ?? Date.now());
+    const completedAtMs = lastCreatedMs ?? startedAtMs ?? resolvedFallbackMs ?? Date.now();
     const durationMs =
       startedAtMs !== null && completedAtMs >= startedAtMs ? completedAtMs - startedAtMs : null;
 
     const elapsedMs =
       typeof snap.elapsedMs === 'number' && snap.elapsedMs >= 150 ? snap.elapsedMs : null;
-    const modelActiveMs = elapsedMs ?? durationMs;
-    const tpsMethod = elapsedMs !== null ? 'active_model' : durationMs !== null ? 'e2e_turn' : 'unavailable';
+    const validDurationMs = durationMs !== null && durationMs >= 150 ? durationMs : null;
+    const modelActiveMs = elapsedMs ?? validDurationMs;
+    const tpsMethod =
+      elapsedMs !== null
+        ? 'active_model'
+        : validDurationMs !== null
+          ? 'e2e_turn'
+          : 'unavailable';
 
     const assistantMsgCount =
       typeof lastExtra?.agentMessageCount === 'number' && lastExtra.agentMessageCount > 0
@@ -187,11 +217,27 @@ export function parseCodeBuddyIdeSessionDir(sessionDir, workspaceHash = null) {
 }
 
 /**
- * Parse a CodeBuddy CLI (~/.codebuddy/projects JSONL) string into TurnRecords.
+ * Parse a CodeBuddy CLI (~/.codebuddy/projects JSONL) string into TurnRecords plus open-turn status.
  * @param {string} content
  * @param {string} filePath
+ * @param {{ fallbackTimestampMs?: number | null, flushOpenTurns?: boolean }} [opts]
  */
-export function parseCodeBuddyCliContent(content, filePath = '') {
+export function parseCodeBuddyCliDetailed(
+  content,
+  filePath = '',
+  { fallbackTimestampMs = null, flushOpenTurns = false } = {}
+) {
+  let resolvedFallbackMs =
+    typeof fallbackTimestampMs === 'number' && Number.isFinite(fallbackTimestampMs)
+      ? Math.round(fallbackTimestampMs)
+      : null;
+  if (resolvedFallbackMs === null && filePath && existsSync(filePath)) {
+    try {
+      resolvedFallbackMs = Math.round(statSync(filePath).mtimeMs);
+    } catch {
+      resolvedFallbackMs = null;
+    }
+  }
   const lines = content.split(/\r?\n/);
   let sessionId = basename(filePath, '.jsonl') || 'codebuddy-cli';
   let workspacePath = null;
@@ -227,6 +273,7 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
         toolWaitMs: 0,
         lastToolStartMs: null,
         lastEventType: 'user',
+        reachedTerminalState: false,
         replyPreview: null,
       };
       continue;
@@ -234,7 +281,12 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
 
     if (!current) continue;
     if (tsMs !== null) current.lastAtMs = tsMs;
-    current.lastEventType = obj.type;
+    if (obj.type === 'acp-terminal-state') {
+      current.reachedTerminalState = true;
+    }
+    if (!CLI_TRAILING_META_EVENTS.has(obj.type)) {
+      current.lastEventType = obj.type;
+    }
 
     if (
       obj.role === 'assistant' &&
@@ -275,10 +327,15 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
   if (current) rawTurns.push(current);
 
   const completed = [];
+  let hasOpenTurns = false;
   for (const rt of rawTurns) {
     if (rt.calls.size === 0) continue;
-    // Only emit turns closed by next user or ending cleanly on a message
-    if (!rt.closedByNextUser && rt.lastEventType !== 'message') continue;
+    const isClosed =
+      rt.closedByNextUser || rt.reachedTerminalState || rt.lastEventType === 'message';
+    if (!isClosed && !flushOpenTurns) {
+      hasOpenTurns = true;
+      continue;
+    }
 
     let totalInputTokens = 0;
     let cacheReadTokens = 0;
@@ -303,8 +360,19 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
       rt.startedAtMs !== null && rt.lastAtMs !== null && rt.lastAtMs >= rt.startedAtMs
         ? rt.lastAtMs - rt.startedAtMs
         : null;
-    const modelActiveMs =
-      durationMs !== null ? Math.max(150, durationMs - rt.toolWaitMs) : null;
+    let modelActiveMs = null;
+    let tps = null;
+    let tpsMethod = 'unavailable';
+    if (durationMs !== null) {
+      const net = durationMs - rt.toolWaitMs;
+      if (net >= 150) {
+        modelActiveMs = net;
+        if (outputTokens > 0) {
+          tps = Number((outputTokens / (net / 1000)).toFixed(1));
+          tpsMethod = rt.toolWaitMs > 0 ? 'e2e_minus_tools' : 'e2e_turn';
+        }
+      }
+    }
 
     completed.push({
       turnUid: `codebuddy-cli:${sessionId}:${rt.turnId}`,
@@ -316,7 +384,7 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
       workspacePath,
       workspaceHash: workspacePath ? workspaceMd5(workspacePath) : null,
       startedAtMs: rt.startedAtMs,
-      completedAtMs: rt.lastAtMs ?? Date.now(),
+      completedAtMs: rt.lastAtMs ?? rt.startedAtMs ?? resolvedFallbackMs ?? Date.now(),
       callCount: rt.calls.size,
       totalInputTokens,
       uncachedInputTokens: Math.max(0, totalInputTokens - cacheReadTokens - cacheWriteTokens),
@@ -327,12 +395,23 @@ export function parseCodeBuddyCliContent(content, filePath = '') {
       durationMs,
       modelActiveMs,
       ttftMs: null,
-      tpsMethod: rt.toolWaitMs > 0 ? 'e2e_minus_tools' : 'e2e_turn',
+      tps,
+      tpsMethod,
       replyPreview: rt.replyPreview || null,
     });
   }
 
-  return completed;
+  return { turns: completed, hasOpenTurns };
+}
+
+/**
+ * Parse a CodeBuddy CLI (~/.codebuddy/projects JSONL) string into TurnRecords.
+ * @param {string} content
+ * @param {string} filePath
+ * @param {{ fallbackTimestampMs?: number | null, flushOpenTurns?: boolean }} [opts]
+ */
+export function parseCodeBuddyCliContent(content, filePath = '', opts = {}) {
+  return parseCodeBuddyCliDetailed(content, filePath, opts).turns;
 }
 
 export class CodeBuddyAdapter {
@@ -350,6 +429,7 @@ export class CodeBuddyAdapter {
     this.isEnabled = isEnabled;
     this.indexMtimes = new Map();
     this.cliMtimes = new Map();
+    this.pendingOpenCliFiles = new Map();
     this.watchers = [];
     this.timer = null;
     this.backfillTimer = null;
@@ -438,7 +518,7 @@ export class CodeBuddyAdapter {
     return found.sort((a, b) => b.mtimeMs - a.mtimeMs);
   }
 
-  scan({ maxRecent = 25 } = {}) {
+  scan({ maxRecent = 25, nowMs = Date.now() } = {}) {
     if (this.isEnabled && !this.isEnabled()) return [];
     const changed = [];
 
@@ -452,7 +532,7 @@ export class CodeBuddyAdapter {
         continue;
       }
       this.indexMtimes.set(idxFile, mtimeMs);
-      for (const t of parseCodeBuddyIdeSessionDir(sessionDir, workspaceHash)) {
+      for (const t of parseCodeBuddyIdeSessionDir(sessionDir, workspaceHash, { fallbackTimestampMs: mtimeMs })) {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
       }
@@ -462,20 +542,37 @@ export class CodeBuddyAdapter {
     let cliFiles = this.findCliFiles();
     if (Number.isFinite(maxRecent)) cliFiles = cliFiles.slice(0, maxRecent);
     for (const { fp, mtimeMs, sizeBytes } of cliFiles.reverse()) {
-      if (this.cliMtimes.get(fp) === mtimeMs) continue;
-      const cached = this.store.getIngestedFile?.(fp);
-      if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
-        this.cliMtimes.set(fp, mtimeMs);
-        continue;
+      const flushOpenTurns = nowMs - mtimeMs > OPEN_TURN_FLUSH_MS;
+      const pending = this.pendingOpenCliFiles.get(fp);
+      if (pending) {
+        const modified = pending.mtimeMs !== mtimeMs || pending.sizeBytes !== sizeBytes;
+        if (!modified && !flushOpenTurns) continue;
+      } else {
+        if (this.cliMtimes.get(fp) === mtimeMs) continue;
+        const cached = this.store.getIngestedFile?.(fp);
+        if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+          this.cliMtimes.set(fp, mtimeMs);
+          continue;
+        }
       }
-      this.cliMtimes.set(fp, mtimeMs);
       try {
         const content = readFileSync(fp, 'utf8');
-        for (const t of parseCodeBuddyCliContent(content, fp)) {
+        const { turns, hasOpenTurns } = parseCodeBuddyCliDetailed(content, fp, {
+          fallbackTimestampMs: mtimeMs,
+          flushOpenTurns,
+        });
+        for (const t of turns) {
           const res = this.store.upsertTurn(t);
           if (res.changed) changed.push(res.record);
         }
-        this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
+        if (hasOpenTurns && !flushOpenTurns) {
+          this.cliMtimes.delete(fp);
+          this.pendingOpenCliFiles.set(fp, { mtimeMs, sizeBytes });
+        } else {
+          this.pendingOpenCliFiles.delete(fp);
+          this.cliMtimes.set(fp, mtimeMs);
+          this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
+        }
       } catch {
         // ignore
       }

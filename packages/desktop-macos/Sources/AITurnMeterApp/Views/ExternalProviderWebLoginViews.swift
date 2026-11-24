@@ -214,10 +214,20 @@ struct ExternalProviderLoginSheetView: View {
         VStack(alignment: .leading, spacing: 2) {
           Text("登录授权 · \(meta?.name ?? key)")
             .font(.system(size: 13.5, weight: .semibold))
-          Text(meta?.auth?.hint ?? statusText)
-            .font(.system(size: 11))
-            .foregroundColor(.secondary)
-            .lineLimit(1)
+          if !statusText.isEmpty {
+            Text(statusText)
+              .font(.system(size: 11))
+              .foregroundColor(.secondary)
+              .lineLimit(1)
+          }
+          if let hint = meta?.auth?.hint?.trimmingCharacters(in: .whitespacesAndNewlines),
+             !hint.isEmpty, hint != statusText {
+            Text(hint)
+              .font(.system(size: 10.5))
+              .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+              .lineLimit(1)
+              .truncationMode(.tail)
+          }
         }
         Spacer()
         Button("同步当前登录态") { manualCheckToken += 1 }

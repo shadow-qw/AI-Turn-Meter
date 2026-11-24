@@ -164,28 +164,50 @@ export function installVsix({
   root = resolvePackageRoot(),
   homeDir = homedir(),
   log = defaultLog(dryRun),
+  timeoutMs = 15000,
+  execFileSyncFn = execFileSync,
+  resolveAppPathsFn = resolveAppPaths,
 } = {}) {
   const vsixPath = join(root, 'dist', 'ai-turn-meter.vsix');
   if (!existsSync(vsixPath)) {
     throw new Error(`Missing ${vsixPath}. Run "npm run package:vsix" first.`);
   }
+  const results = [];
   for (const key of ['cursor', 'codebuddy']) {
-    const app = resolveAppPaths(APP_SPECS[key], { homeDir });
+    const app = resolveAppPathsFn(APP_SPECS[key], { homeDir });
     if (!app.cliPath) {
       log(`Skip ${app.name} (CLI not found in /Applications or ~/Applications)`);
+      results.push({ key, name: app.name, status: 'skipped' });
       continue;
     }
     log(`Install VSIX into ${app.name}: ${app.cliPath} --install-extension ${vsixPath} --force`);
     if (!dryRun) {
-      execFileSync(app.cliPath, ['--install-extension', vsixPath, '--force'], { stdio: 'inherit' });
+      try {
+        execFileSyncFn(app.cliPath, ['--install-extension', vsixPath, '--force'], {
+          stdio: 'inherit',
+          timeout: timeoutMs,
+        });
+        results.push({ key, name: app.name, status: 'installed' });
+      } catch (err) {
+        const reason =
+          err?.code === 'ETIMEDOUT' || err?.killed
+            ? `timeout after ${timeoutMs}ms`
+            : err?.message || String(err);
+        log(`[WARN] Failed to install VSIX into ${app.name} (continuing): ${reason}`);
+        results.push({ key, name: app.name, status: 'failed', error: reason });
+      }
+    } else {
+      results.push({ key, name: app.name, status: 'dry_run' });
     }
   }
+  return results;
 }
 
 export function uninstallVsix({
   dryRun = false,
   homeDir = homedir(),
   log = defaultLog(dryRun),
+  timeoutMs = 15000,
 } = {}) {
   for (const key of ['cursor', 'codebuddy']) {
     const app = resolveAppPaths(APP_SPECS[key], { homeDir });
@@ -193,7 +215,10 @@ export function uninstallVsix({
     log(`Uninstall VSIX from ${app.name}`);
     if (!dryRun) {
       try {
-        execFileSync(app.cliPath, ['--uninstall-extension', VSIX_EXT_ID], { stdio: 'inherit' });
+        execFileSync(app.cliPath, ['--uninstall-extension', VSIX_EXT_ID], {
+          stdio: 'inherit',
+          timeout: timeoutMs,
+        });
       } catch {
         // Ignore if not installed
       }
@@ -635,8 +660,10 @@ export async function installAll({
   homeDir = homedir(),
   root = resolvePackageRoot(),
   nodeBin = resolveNodeBin(),
+  log = defaultLog(dryRun),
+  vsixTimeoutMs = 15000,
+  resolveAppPathsFn = resolveAppPaths,
 } = {}) {
-  const log = defaultLog(dryRun);
   const rt = await checkNodeRuntime();
   if (!rt.ok) {
     throw new Error(
@@ -644,7 +671,7 @@ export async function installAll({
     );
   }
   patchCursorHooks({ dryRun, homeDir, hookCmd: buildHookCommand({ nodeBin, root }), log });
-  installVsix({ dryRun, root, homeDir, log });
+  installVsix({ dryRun, root, homeDir, log, timeoutMs: vsixTimeoutMs, resolveAppPathsFn });
   removeLegacyApps({ dryRun, homeDir, log });
   if (!skipCliLink) installCliLink({ dryRun, root, nodeBin, homeDir, log });
   if (!skipLaunchAgent) installLaunchAgent({ dryRun, nodeBin, root, homeDir, log });
@@ -669,8 +696,13 @@ export function uninstallAll({ dryRun = false, homeDir = homedir() } = {}) {
 /**
  * Inspect local environment readiness (Node, Daemon, LaunchAgent, Cursor hooks, 4 apps + VSIX + CDP).
  */
-export async function runDoctor({ port = DEFAULT_DAEMON_PORT, homeDir = homedir() } = {}) {
-  const meta = getPackageMeta();
+export async function runDoctor({
+  port = DEFAULT_DAEMON_PORT,
+  homeDir = homedir(),
+  root = resolvePackageRoot(),
+} = {}) {
+  const meta = getPackageMeta(root);
+  const cliVersion = meta.version;
   const node = await checkNodeRuntime();
   let daemon = { ok: false, port };
   try {
@@ -732,16 +764,29 @@ export async function runDoctor({ port = DEFAULT_DAEMON_PORT, homeDir = homedir(
         if (line) vsixVersion = line.split('@')[1] || 'installed';
       } catch {}
     }
+    const appVsixMismatch = Boolean(
+      info.installed &&
+        (key === 'cursor' || key === 'codebuddy') &&
+        vsixVersion &&
+        vsixVersion !== cliVersion
+    );
     apps[key] = {
       name: info.name,
       appPath: info.appPath,
       installed: info.installed,
       cdpPort,
       vsixVersion,
+      ...(key === 'cursor' || key === 'codebuddy' ? { vsixVersionMismatch: appVsixMismatch } : {}),
     };
   }
 
+  const daemonVersionMismatch = Boolean(daemon.ok && daemon.version !== cliVersion);
+  const vsixVersionMismatch = Object.values(apps).some((app) => Boolean(app.vsixVersionMismatch));
+
   return {
+    cliVersion,
+    daemonVersionMismatch,
+    vsixVersionMismatch,
     node,
     packageRoot: meta.root,
     updateFeedUrl: meta.updateFeedUrl,

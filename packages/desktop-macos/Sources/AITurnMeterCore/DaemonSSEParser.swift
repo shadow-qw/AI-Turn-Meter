@@ -1,6 +1,6 @@
 import Foundation
 
-public struct SSEEvent: Equatable {
+public struct SSEEvent: Equatable, Sendable {
   public let event: String
   public let data: String
 
@@ -10,53 +10,71 @@ public struct SSEEvent: Equatable {
   }
 }
 
-public struct DaemonSSEParser {
-  private var buffer: String = ""
+public struct DaemonSSEParser: Sendable {
+  private var rawBuffer = Data()
+  private var currentEventName: String = "message"
+  private var currentDataLines: [String] = []
 
   public init() {}
 
   public mutating func feed(_ chunk: Data) -> [SSEEvent] {
-    guard !chunk.isEmpty, let str = String(data: chunk, encoding: .utf8) else {
+    guard !chunk.isEmpty else {
       return []
     }
-    let normalized = str
-      .replacingOccurrences(of: "\r\n", with: "\n")
-      .replacingOccurrences(of: "\r", with: "\n")
-    buffer.append(normalized)
+    rawBuffer.append(chunk)
 
     var events: [SSEEvent] = []
-    while let range = buffer.range(of: "\n\n") {
-      let block = String(buffer[..<range.lowerBound])
-      buffer.removeSubrange(buffer.startIndex..<range.upperBound)
-      if let ev = parseBlock(block) {
+    var lineStart = rawBuffer.startIndex
+
+    while let newlineIdx = rawBuffer[lineStart...].firstIndex(of: 0x0A) {
+      var lineEnd = newlineIdx
+      if lineEnd > lineStart && rawBuffer[rawBuffer.index(before: lineEnd)] == 0x0D {
+        lineEnd = rawBuffer.index(before: lineEnd)
+      }
+      let lineData = rawBuffer[lineStart..<lineEnd]
+      let line = String(decoding: lineData, as: UTF8.self)
+      if let ev = processLine(line) {
         events.append(ev)
       }
+      lineStart = rawBuffer.index(after: newlineIdx)
     }
+
+    if lineStart == rawBuffer.endIndex {
+      rawBuffer.removeAll(keepingCapacity: rawBuffer.count < 65_536)
+    } else if lineStart > rawBuffer.startIndex {
+      rawBuffer.removeSubrange(rawBuffer.startIndex..<lineStart)
+    }
+
     return events
   }
 
   public mutating func reset() {
-    buffer = ""
+    rawBuffer.removeAll(keepingCapacity: false)
+    currentEventName = "message"
+    currentDataLines.removeAll(keepingCapacity: false)
   }
 
-  private func parseBlock(_ block: String) -> SSEEvent? {
-    var eventName = "message"
-    var dataLines: [String] = []
-
-    for rawLine in block.components(separatedBy: "\n") {
-      if rawLine.isEmpty || rawLine.hasPrefix(":") {
-        continue
+  private mutating func processLine(_ rawLine: String) -> SSEEvent? {
+    if rawLine.isEmpty {
+      defer {
+        currentEventName = "message"
+        currentDataLines.removeAll(keepingCapacity: true)
       }
-      if rawLine.hasPrefix("event:") {
-        eventName = String(rawLine.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-      } else if rawLine.hasPrefix("data:") {
-        var val = String(rawLine.dropFirst(5))
-        if val.hasPrefix(" ") { val.removeFirst() }
-        dataLines.append(val)
-      }
+      guard !currentDataLines.isEmpty else { return nil }
+      let eventName = currentEventName.isEmpty ? "message" : currentEventName
+      return SSEEvent(event: eventName, data: currentDataLines.joined(separator: "\n"))
     }
 
-    guard !dataLines.isEmpty else { return nil }
-    return SSEEvent(event: eventName.isEmpty ? "message" : eventName, data: dataLines.joined(separator: "\n"))
+    if rawLine.hasPrefix(":") {
+      return nil
+    }
+    if rawLine.hasPrefix("event:") {
+      currentEventName = String(rawLine.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+    } else if rawLine.hasPrefix("data:") {
+      var val = String(rawLine.dropFirst(5))
+      if val.hasPrefix(" ") { val.removeFirst() }
+      currentDataLines.append(val)
+    }
+    return nil
   }
 }

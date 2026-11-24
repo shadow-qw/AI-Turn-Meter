@@ -4,23 +4,21 @@ import SwiftUI
 
 private struct ProviderSwitcherBar: View {
   @ObservedObject var vm: MeterViewModel
+  let switcherKeys: [String]
   @Binding var selection: String
   @State private var hoveredKey: String? = nil
 
   private func isToolAvailable(_ key: String) -> Bool {
-    if vm.isExternalProvider(key) { return vm.externalProviderMeta(for: key) != nil }
-    if vm.apps[key]?.installed ?? false { return true }
-    let card = vm.usageData?.cards?[key]
-    return !(card?.quotaWindows?.isEmpty ?? true) || (card?.accountEmail != nil)
-  }
-
-  private var switcherKeys: [String] {
-    let useFallback = vm.apps.isEmpty
-    let ordered = vm.orderedAllProviderKeys.filter { key in
-      let available = useFallback ? true : isToolAvailable(key)
-      return available && vm.isToolEnabled(key)
+    if vm.isExternalProvider(key) {
+      return vm.externalProviderMeta(for: key) != nil || vm.usageData?.cards?[key] != nil
     }
-    return ["all"] + ordered
+    if vm.apps[key]?.installed ?? false { return true }
+    if vm.apps[key]?.latestTurn != nil { return true }
+    let card = vm.usageData?.cards?[key]
+    return !(card?.quotaWindows?.isEmpty ?? true)
+      || (card?.accountEmail != nil)
+      || ((card?.today.turnCount ?? 0) > 0)
+      || ((card?.days30.turnCount ?? 0) > 0)
   }
 
   private func indicatorFraction(for key: String, installed: Bool, active: Bool) -> Double {
@@ -32,19 +30,27 @@ private struct ProviderSwitcherBar: View {
     return 1.0
   }
 
+  private func indicatorHealthColor(for key: String, active: Bool) -> Color {
+    guard active else { return Color.gray.opacity(0.45) }
+    if let firstWin = vm.usageData?.cards?[key]?.quotaWindows?.first {
+      switch firstWin.healthLevel {
+      case .critical: return Color(red: 0.88, green: 0.24, blue: 0.24)
+      case .warning: return Color(red: 0.94, green: 0.56, blue: 0.14)
+      case .normal: break
+      }
+    }
+    return vm.toolAccentColor(for: key)
+  }
+
   @ViewBuilder
-  private func tabButton(for key: String, compactWidth: Bool) -> some View {
+  private func tabButton(for key: String, index: Int, compactWidth: Bool) -> some View {
     let isSelected = selection == key
     let isHovered = hoveredKey == key
     let isAll = key == "all"
     let installed = isAll || isToolAvailable(key)
     let active = !isAll && installed && vm.isActiveOverall && vm.isToolEnabled(key)
     let frac = indicatorFraction(for: key, installed: installed, active: active)
-    let fillColor: Color = {
-      if isSelected { return .white }
-      if active { return vm.toolAccentColor(for: key) }
-      return Color.gray.opacity(0.45)
-    }()
+    let fillColor: Color = isSelected ? .white : indicatorHealthColor(for: key, active: active)
 
     Button {
       selection = key
@@ -90,6 +96,7 @@ private struct ProviderSwitcherBar: View {
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+    .help(index < 9 ? "\(vm.toolShortTitle(for: key)) (⌘\(index + 1))" : vm.toolShortTitle(for: key))
     .onHover { inside in
       if inside { hoveredKey = key }
       else if hoveredKey == key { hoveredKey = nil }
@@ -101,16 +108,16 @@ private struct ProviderSwitcherBar: View {
       if switcherKeys.count > 5 {
         ScrollView(.horizontal, showsIndicators: false) {
           HStack(spacing: 4) {
-            ForEach(switcherKeys, id: \.self) { key in
-              tabButton(for: key, compactWidth: true)
+            ForEach(Array(switcherKeys.enumerated()), id: \.element) { idx, key in
+              tabButton(for: key, index: idx, compactWidth: true)
             }
           }
           .padding(.horizontal, 10)
         }
       } else {
         HStack(spacing: 4) {
-          ForEach(switcherKeys, id: \.self) { key in
-            tabButton(for: key, compactWidth: false)
+          ForEach(Array(switcherKeys.enumerated()), id: \.element) { idx, key in
+            tabButton(for: key, index: idx, compactWidth: false)
           }
         }
         .padding(.horizontal, 10)
@@ -261,25 +268,45 @@ private struct CodexBarStyleCardView: View {
     isCardHovered ? .white.opacity(0.78) : .secondary
   }
 
+  private var hasCliActivity: Bool {
+    guard !isAll && !isExternal else { return false }
+    return !(card.quotaWindows?.isEmpty ?? true)
+      || card.accountEmail != nil
+      || card.today.turnCount > 0
+      || card.days30.turnCount > 0
+      || vm.apps[selection]?.latestTurn != nil
+  }
+
+  private func isBuiltInAvailable(_ key: String) -> Bool {
+    if vm.apps[key]?.installed ?? false { return true }
+    if vm.apps[key]?.latestTurn != nil { return true }
+    let c = vm.usageData?.cards?[key]
+    return !(c?.quotaWindows?.isEmpty ?? true)
+      || c?.accountEmail != nil
+      || ((c?.today.turnCount ?? 0) > 0)
+      || ((c?.days30.turnCount ?? 0) > 0)
+  }
+
   private var statusLabel: String {
     if isAll {
-      let installed = vm.orderedKeys.filter { vm.apps[$0]?.installed ?? false }.count
-      let active = vm.orderedKeys.filter {
-        (vm.apps[$0]?.installed ?? false) && vm.isActiveOverall && vm.isToolEnabled($0)
-      }.count
+      let availableKeys = vm.orderedKeys.filter { isBuiltInAvailable($0) }
+      let active = availableKeys.filter { vm.isActiveOverall && vm.isToolEnabled($0) }.count
       if !vm.daemonOnline { return "后台未启动" }
       if !vm.masterEnabled { return "已暂停" }
-      return "\(active)/\(installed) 监控中"
+      return "\(active)/\(availableKeys.count) 监控中"
     }
     if isExternal {
       if !vm.daemonOnline { return "后台未启动" }
       if !vm.masterEnabled || !vm.isToolEnabled(selection) { return "已暂停" }
       return card.statusText ?? "外部插件"
     }
-    guard let entry = vm.apps[selection], entry.installed else { return "未安装" }
+    let entry = vm.apps[selection]
+    let appInstalled = entry?.installed ?? false
+    guard appInstalled || hasCliActivity else { return "未安装" }
     if !vm.daemonOnline { return "后台未启动" }
     if !vm.masterEnabled || !vm.isToolEnabled(selection) { return "已暂停" }
-    if let port = entry.cdpPort { return "CDP:\(port)" }
+    if let port = entry?.cdpPort { return "CDP:\(port)" }
+    if !appInstalled { return "CLI 监控中" }
     return "监控中"
   }
 
@@ -311,6 +338,88 @@ private struct CodexBarStyleCardView: View {
     return card.recentWindows.filter { $0.index == 0 || $0.turnCount > 0 }
   }
 
+  private var visibleSessions: [CardSessionSummary] {
+    guard !isBillingOnlyExternal, let sessions = card.recentSessions, !sessions.isEmpty else {
+      return []
+    }
+    return Array(sessions.prefix(3))
+  }
+
+  private var activeSessionCount: Int {
+    guard !isBillingOnlyExternal, let sessions = card.recentSessions else { return 0 }
+    return sessions.filter { $0.isActive == true }.count
+  }
+
+  private func toggleQuotaDisplayMode() {
+    vm.setQuotaDisplayMode(vm.quotaDisplayMode == .remaining ? .used : .remaining)
+  }
+
+  private func quotaFillColor(for level: QuotaHealthLevel) -> Color {
+    switch level {
+    case .normal:
+      return isCardHovered ? Color.white.opacity(0.95) : CodexBarPalette.tealBar
+    case .warning:
+      return isCardHovered
+        ? Color(red: 1.0, green: 0.86, blue: 0.32)
+        : Color(red: 0.94, green: 0.56, blue: 0.14)
+    case .critical:
+      return isCardHovered
+        ? Color(red: 1.0, green: 0.50, blue: 0.48)
+        : Color(red: 0.88, green: 0.24, blue: 0.24)
+    }
+  }
+
+  private func quotaPctLabelColor(for level: QuotaHealthLevel) -> Color {
+    if isCardHovered { return .white }
+    switch level {
+    case .critical: return Color(red: 0.85, green: 0.20, blue: 0.20)
+    case .warning: return Color(red: 0.84, green: 0.46, blue: 0.08)
+    case .normal: return .primary
+    }
+  }
+
+  private enum QuotaDisplayItem: Identifiable {
+    case paired(group: String, primary: CardQuotaWindow, secondary: CardQuotaWindow)
+    case single(CardQuotaWindow)
+
+    var id: String {
+      switch self {
+      case .paired(let group, let p, let s): return "pair:\(group):\(p.id):\(s.id)"
+      case .single(let w): return w.id
+      }
+    }
+  }
+
+  private func groupedQuotaItems(from windows: [CardQuotaWindow]) -> [QuotaDisplayItem] {
+    guard !isAll else { return windows.map { .single($0) } }
+    var consumed = Set<Int>()
+    var items: [QuotaDisplayItem] = []
+
+    for i in windows.indices {
+      if consumed.contains(i) { continue }
+      let w = windows[i]
+      if let grp = w.group?.trimmingCharacters(in: .whitespacesAndNewlines), !grp.isEmpty,
+         let kind = w.windowKind?.lowercased(), (kind == "5h" || kind == "weekly") {
+        let partnerKind = (kind == "5h") ? "weekly" : "5h"
+        if let j = windows.indices.first(where: { idx in
+          idx > i && !consumed.contains(idx) &&
+          windows[idx].group?.trimmingCharacters(in: .whitespacesAndNewlines) == grp &&
+          windows[idx].windowKind?.lowercased() == partnerKind
+        }) {
+          consumed.insert(i)
+          consumed.insert(j)
+          let fiveH = (kind == "5h") ? w : windows[j]
+          let weekly = (kind == "weekly") ? w : windows[j]
+          items.append(.paired(group: grp, primary: fiveH, secondary: weekly))
+          continue
+        }
+      }
+      consumed.insert(i)
+      items.append(.single(w))
+    }
+    return items
+  }
+
   private var dividerLine: some View {
     Rectangle()
       .fill(isCardHovered ? Color.white.opacity(0.22) : Color.primary.opacity(0.08))
@@ -318,6 +427,12 @@ private struct CodexBarStyleCardView: View {
   }
 
   var body: some View {
+    let rawWindows = card.quotaWindows ?? []
+    let windows = isAll
+      ? ProviderOrder.sortOverviewWindows(rawWindows, by: vm.orderedAllProviderKeys)
+      : rawWindows
+    let showModeToggle = !windows.isEmpty || isBillingOnlyExternal
+
     VStack(alignment: .leading, spacing: 8) {
       // Card Header (CodexBar compact density: concise title + Email / Plan)
       HStack(alignment: .top) {
@@ -325,9 +440,30 @@ private struct CodexBarStyleCardView: View {
           Text(headerTitle)
             .font(.system(size: 13.5, weight: .bold))
             .foregroundColor(primaryText)
-          Text(vm.relativeUpdateLabel())
-            .font(.system(size: 10))
-            .foregroundColor(secondaryText)
+          HStack(spacing: 5) {
+            Text(vm.relativeUpdateLabel())
+              .font(.system(size: 10))
+              .foregroundColor(secondaryText)
+            if showModeToggle {
+              Button(action: toggleQuotaDisplayMode) {
+                HStack(spacing: 2) {
+                  Text(vm.quotaDisplayMode.verbLabel)
+                  Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 7.5, weight: .semibold))
+                }
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(isCardHovered ? .white.opacity(0.92) : .secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(
+                  Capsule()
+                    .fill(isCardHovered ? Color.white.opacity(0.18) : Color.primary.opacity(0.07))
+                )
+              }
+              .buttonStyle(.plain)
+              .help("点击切换显示剩余 / 已用比例")
+            }
+          }
         }
 
         Spacer(minLength: 6)
@@ -347,14 +483,19 @@ private struct CodexBarStyleCardView: View {
       dividerLine
 
       // Primary Quota Windows (Remaining % + Reset countdown + Pace marker)
-      let rawWindows = card.quotaWindows ?? []
-      let windows = isAll
-        ? ProviderOrder.sortOverviewWindows(rawWindows, by: vm.orderedAllProviderKeys)
-        : rawWindows
       if !windows.isEmpty {
-        VStack(alignment: .leading, spacing: 8) {
-          ForEach(windows) { win in
-            quotaBlock(win: win)
+        let items = groupedQuotaItems(from: windows)
+        VStack(alignment: .leading, spacing: 7.5) {
+          ForEach(items) { item in
+            switch item {
+            case .paired(let group, let primary, let secondary):
+              pairedQuotaBlock(group: group, primary: primary, secondary: secondary)
+            case .single(let win):
+              quotaBlock(
+                win: win,
+                isPrimaryBillingWindow: windows.count == 1 || win.id == windows.first?.id
+              )
+            }
           }
         }
       } else {
@@ -364,7 +505,7 @@ private struct CodexBarStyleCardView: View {
               ? "正在同步客户端登录与额度信息…"
               : (isExternal
                   ? (card.quotaHint ?? "等待外部插件返回配额数据")
-                  : ((vm.apps[selection]?.installed ?? false)
+                  : (((vm.apps[selection]?.installed ?? false) || hasCliActivity)
                       ? (card.quotaHint ?? (
                           selection == "cursor"
                             ? (vm.hasCursorCookie
@@ -374,7 +515,9 @@ private struct CodexBarStyleCardView: View {
                                 ? (card.accountEmail != nil
                                     ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
                                     : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
-                                : "企业/团队按量模式 · 无固定个人会话限额")))
+                                : (selection == "antigravity"
+                                    ? "暂无法读取本地配额 · 请在 Antigravity 内查看剩余额度"
+                                    : "企业/团队按量模式 · 无固定个人会话限额"))))
                       : "未检测到该客户端安装"))
           )
           .font(.system(size: 10.5))
@@ -383,12 +526,29 @@ private struct CodexBarStyleCardView: View {
           Spacer(minLength: 4)
           if isExternal, card.needsAuth == true,
              let auth = vm.externalProviderMeta(for: selection)?.auth, auth.isWebCookie {
-            Button(auth.displayLabel) {
-              onLoginRequested(selection)
+            if isCardHovered {
+              Button {
+                onLoginRequested(selection)
+              } label: {
+                Text(auth.displayLabel)
+                  .font(.system(size: 10, weight: .semibold))
+                  .foregroundColor(CodexBarPalette.cardBottom)
+                  .padding(.horizontal, 8)
+                  .padding(.vertical, 3)
+                  .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                      .fill(Color.white.opacity(0.95))
+                  )
+              }
+              .buttonStyle(.plain)
+            } else {
+              Button(auth.displayLabel) {
+                onLoginRequested(selection)
+              }
+              .buttonStyle(.borderedProminent)
+              .controlSize(.mini)
+              .tint(CodexBarPalette.accentBlue)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.mini)
-            .tint(CodexBarPalette.accentBlue)
           } else {
             Text(statusLabel)
               .font(.system(size: 10, weight: .medium))
@@ -438,7 +598,40 @@ private struct CodexBarStyleCardView: View {
       if isBillingOnlyExternal {
         let b = card.billingSummary
         let periodLabel = b?.periodLabel ?? "本月"
-        if let rem = b?.periodRemaining {
+        let periodUsed: Double? = b?.periodCost ?? {
+          if let limit = b?.periodLimit, let rem = b?.periodRemaining {
+            return max(0, limit - rem)
+          }
+          return nil
+        }()
+        if vm.quotaDisplayMode == .used, let used = periodUsed {
+          VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+              Text("\(periodLabel)已消耗")
+                .font(.system(size: 10.5))
+                .foregroundColor(secondaryText)
+              Text(MeterFormat.money(used, symbol: curSym))
+                .font(.system(size: 26, weight: .bold))
+                .monospacedDigit()
+                .foregroundColor(primaryText)
+            }
+            if let rem = b?.periodRemaining {
+              metricGridRow(
+                leftLabel: "\(periodLabel)剩余",
+                leftVal: MeterFormat.money(rem, symbol: curSym),
+                rightLabel: "今日消耗",
+                rightVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym)
+              )
+            } else {
+              metricGridRow(
+                leftLabel: "\(periodLabel)限额",
+                leftVal: MeterFormat.money(b?.periodLimit, symbol: curSym),
+                rightLabel: "今日消耗",
+                rightVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym)
+              )
+            }
+          }
+        } else if let rem = b?.periodRemaining {
           VStack(alignment: .leading, spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
               Text("\(periodLabel)剩余余额")
@@ -449,20 +642,29 @@ private struct CodexBarStyleCardView: View {
                 .monospacedDigit()
                 .foregroundColor(primaryText)
             }
-            metricGridRow(
-              leftLabel: "\(periodLabel)限额",
-              leftVal: MeterFormat.money(b?.periodLimit, symbol: curSym),
-              rightLabel: "今日消耗",
-              rightVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym)
-            )
+            if let used = periodUsed {
+              metricGridRow(
+                leftLabel: "\(periodLabel)已消耗",
+                leftVal: MeterFormat.money(used, symbol: curSym),
+                rightLabel: "今日消耗",
+                rightVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym)
+              )
+            } else {
+              metricGridRow(
+                leftLabel: "\(periodLabel)限额",
+                leftVal: MeterFormat.money(b?.periodLimit, symbol: curSym),
+                rightLabel: "今日消耗",
+                rightVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym)
+              )
+            }
           }
         } else {
           VStack(alignment: .leading, spacing: 6) {
             metricGridRow(
               leftLabel: "今日消耗",
               leftVal: MeterFormat.money(b?.todayCost ?? card.today.costUsd, symbol: curSym),
-              rightLabel: "\(periodLabel)已用",
-              rightVal: MeterFormat.money(b?.periodCost ?? card.days30.costUsd, symbol: curSym)
+              rightLabel: "\(periodLabel)已消耗",
+              rightVal: MeterFormat.money(periodUsed ?? card.days30.costUsd, symbol: curSym)
             )
           }
         }
@@ -529,6 +731,12 @@ private struct CodexBarStyleCardView: View {
         }
       }
 
+      // Recent Sessions (compact, up to 3)
+      if !visibleSessions.isEmpty {
+        dividerLine
+        recentSessionsSection(sessions: visibleSessions, activeCount: activeSessionCount)
+      }
+
       // Quiet Unboxed Footer Lines
       VStack(alignment: .leading, spacing: 2) {
         if let topModel = card.topModel {
@@ -578,22 +786,127 @@ private struct CodexBarStyleCardView: View {
     .padding(.horizontal, 6)
   }
 
-  private func quotaBlock(win: CardQuotaWindow) -> some View {
+  private func pairedQuotaBlock(
+    group: String,
+    primary: CardQuotaWindow,
+    secondary: CardQuotaWindow
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 3.5) {
+      Text(group)
+        .font(.system(size: 11.5, weight: .semibold))
+        .foregroundColor(primaryText)
+        .lineLimit(1)
+
+      HStack(alignment: .top, spacing: 8) {
+        miniQuotaColumn(win: primary, kindLabel: "5h")
+        miniQuotaColumn(win: secondary, kindLabel: "每周")
+      }
+    }
+  }
+
+  private func miniQuotaColumn(win: CardQuotaWindow, kindLabel: String) -> some View {
     let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
     let clamped = min(1.0, max(0.0, pct / 100.0))
     let pctRounded = Int(pct.rounded())
+    let health = win.healthLevel
     let trackColor = isCardHovered ? Color.white.opacity(0.24) : Color.primary.opacity(0.10)
-    let fillColor = isCardHovered ? Color.white.opacity(0.95) : CodexBarPalette.tealBar
+    let fillColor = quotaFillColor(for: health)
+    let tickColor = isCardHovered ? Color.white.opacity(0.26) : Color.primary.opacity(0.14)
+
+    return VStack(alignment: .leading, spacing: 2.5) {
+      Button(action: toggleQuotaDisplayMode) {
+        HStack(spacing: 3) {
+          Text(kindLabel)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundColor(secondaryText)
+            .lineLimit(1)
+          Spacer(minLength: 2)
+          Text("\(vm.quotaDisplayMode.verbLabel) \(pctRounded)%")
+            .font(.system(size: 10.5, weight: .semibold))
+            .monospacedDigit()
+            .foregroundColor(quotaPctLabelColor(for: health))
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help("点击切换显示剩余 / 已用比例")
+
+      GeometryReader { geo in
+        ZStack(alignment: .leading) {
+          Capsule()
+            .fill(trackColor)
+          if clamped > 0 {
+            Capsule()
+              .fill(fillColor)
+              .frame(width: max(4, geo.size.width * CGFloat(clamped)))
+          }
+          HStack {
+            Spacer()
+            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
+            Spacer()
+            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
+            Spacer()
+            Rectangle().fill(tickColor).frame(width: 1, height: 5.5)
+            Spacer()
+          }
+          if let pacePct = vm.quotaDisplayMode.displayPacePct(fromRemainingPace: win.pacePct) {
+            let paceFrac = min(1.0, max(0.0, pacePct / 100.0))
+            let paceX = min(max(0, geo.size.width - 4.0), max(0, geo.size.width * CGFloat(paceFrac) - 2.0))
+            ZStack {
+              RoundedRectangle(cornerRadius: 1)
+                .fill(isCardHovered ? CodexBarPalette.cardTop : Color(nsColor: .windowBackgroundColor).opacity(0.92))
+                .frame(width: 4.5, height: 7.0)
+              RoundedRectangle(cornerRadius: 0.75)
+                .fill(isCardHovered ? Color.white : CodexBarPalette.paceGreen)
+                .frame(width: 2.0, height: 7.0)
+            }
+            .offset(x: paceX)
+          }
+        }
+      }
+      .frame(height: 5.5)
+      .help((win.subtitle?.isEmpty == false ? win.subtitle : win.resetText) ?? "")
+
+      let cleanReset = win.resetText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let cleanSub = win.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let captionText = !cleanReset.isEmpty ? cleanReset : cleanSub
+      if !captionText.isEmpty {
+        Text(captionText)
+          .font(.system(size: 9.5))
+          .monospacedDigit()
+          .foregroundColor(isCardHovered ? .white.opacity(0.82) : .secondary)
+          .lineLimit(1)
+          .minimumScaleFactor(0.8)
+          .help(!cleanSub.isEmpty ? cleanSub : captionText)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private func quotaBlock(win: CardQuotaWindow, isPrimaryBillingWindow: Bool) -> some View {
+    let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
+    let clamped = min(1.0, max(0.0, pct / 100.0))
+    let pctRounded = Int(pct.rounded())
+    let health = win.healthLevel
+    let trackColor = isCardHovered ? Color.white.opacity(0.24) : Color.primary.opacity(0.10)
+    let fillColor = quotaFillColor(for: health)
     let tickColor = isCardHovered ? Color.white.opacity(0.26) : Color.primary.opacity(0.14)
 
     return VStack(alignment: .leading, spacing: 3.5) {
       HStack(spacing: 6) {
-        Text("\(win.title) \(vm.quotaDisplayMode.verbLabel) \(pctRounded)%")
-          .font(.system(size: 12, weight: .semibold))
-          .monospacedDigit()
-          .foregroundColor(primaryText)
-          .lineLimit(1)
-          .minimumScaleFactor(0.85)
+        Button(action: toggleQuotaDisplayMode) {
+          Text("\(win.title) \(vm.quotaDisplayMode.verbLabel) \(pctRounded)%")
+            .font(.system(size: 12, weight: .semibold))
+            .monospacedDigit()
+            .foregroundColor(quotaPctLabelColor(for: health))
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("点击切换显示剩余 / 已用比例")
         Spacer(minLength: 4)
         if let resetText = win.resetText, !resetText.isEmpty {
           Text(resetText)
@@ -630,7 +943,7 @@ private struct CodexBarStyleCardView: View {
             let paceX = min(max(0, geo.size.width - 5.0), max(0, geo.size.width * CGFloat(paceFrac) - 2.5))
             ZStack {
               RoundedRectangle(cornerRadius: 1)
-                .fill(isCardHovered ? CodexBarPalette.cardTop : Color.white.opacity(0.94))
+                .fill(isCardHovered ? CodexBarPalette.cardTop : Color(nsColor: .windowBackgroundColor).opacity(0.92))
                 .frame(width: 5.0, height: 7.5)
               RoundedRectangle(cornerRadius: 0.75)
                 .fill(isCardHovered ? Color.white : CodexBarPalette.paceGreen)
@@ -642,7 +955,18 @@ private struct CodexBarStyleCardView: View {
       }
       .frame(height: 6)
 
-      if let sub = win.subtitle, !sub.isEmpty {
+      let resolvedSub: String? = {
+        if isBillingOnlyExternal,
+           isPrimaryBillingWindow,
+           vm.quotaDisplayMode == .used,
+           let b = card.billingSummary,
+           let limit = b.periodLimit, limit > 0,
+           let used = b.periodCost ?? b.periodRemaining.map({ max(0, limit - $0) }) {
+          return "已用 \(MeterFormat.money(used, symbol: curSym)) / 限额 \(MeterFormat.money(limit, symbol: curSym))"
+        }
+        return win.subtitle
+      }()
+      if let sub = resolvedSub, !sub.isEmpty {
         Text(sub)
           .font(.system(size: 10))
           .monospacedDigit()
@@ -651,6 +975,115 @@ private struct CodexBarStyleCardView: View {
           .minimumScaleFactor(0.85)
       }
     }
+  }
+
+  private func recentSessionsSection(sessions: [CardSessionSummary], activeCount: Int) -> some View {
+    let activeDotColor = isCardHovered ? Color(red: 0.45, green: 0.98, blue: 0.65) : CodexBarPalette.paceGreen
+
+    return VStack(alignment: .leading, spacing: 4.5) {
+      HStack(spacing: 6) {
+        Text("会话")
+          .font(.system(size: 10.5, weight: .semibold))
+          .foregroundColor(secondaryText)
+        Spacer(minLength: 4)
+        if activeCount > 0 {
+          HStack(spacing: 4) {
+            ZStack {
+              Circle()
+                .fill(activeDotColor.opacity(0.28))
+                .frame(width: 9, height: 9)
+              Circle()
+                .fill(activeDotColor)
+                .frame(width: 5, height: 5)
+            }
+            Text("\(activeCount) 个运行中")
+              .font(.system(size: 9.5, weight: .semibold))
+              .monospacedDigit()
+              .foregroundColor(isCardHovered ? .white : CodexBarPalette.paceGreen)
+          }
+          .padding(.horizontal, 5.5)
+          .padding(.vertical, 1.5)
+          .background(
+            Capsule()
+              .fill(isCardHovered ? Color.white.opacity(0.18) : CodexBarPalette.paceGreen.opacity(0.13))
+          )
+        }
+      }
+
+      ForEach(sessions) { session in
+        let isActive = session.isActive == true
+        let metaText = sessionMetaLine(session)
+
+        HStack(alignment: .center, spacing: 6) {
+          if isActive {
+            ZStack {
+              Circle()
+                .fill(activeDotColor.opacity(0.28))
+                .frame(width: 8, height: 8)
+              Circle()
+                .fill(activeDotColor)
+                .frame(width: 4.5, height: 4.5)
+            }
+          } else {
+            Circle()
+              .fill(isCardHovered ? Color.white.opacity(0.30) : Color.secondary.opacity(0.32))
+              .frame(width: 4.5, height: 4.5)
+              .padding(.horizontal, 1.75)
+          }
+
+          VStack(alignment: .leading, spacing: 1) {
+            Text(session.title)
+              .font(.system(size: 11, weight: .medium))
+              .foregroundColor(primaryText)
+              .lineLimit(1)
+              .truncationMode(.tail)
+            if !metaText.isEmpty {
+              Text(metaText)
+                .font(.system(size: 9.5))
+                .monospacedDigit()
+                .foregroundColor(secondaryText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            }
+          }
+
+          Spacer(minLength: 4)
+
+          Text(MeterFormat.tokens(session.totalTokens))
+            .font(.system(size: 10.5, weight: .semibold))
+            .monospacedDigit()
+            .foregroundColor(primaryText)
+            .lineLimit(1)
+        }
+      }
+    }
+  }
+
+  private func sessionMetaLine(_ session: CardSessionSummary) -> String {
+    var parts: [String] = []
+    if let count = session.modelCount, count > 1 {
+      parts.append("\(count) models")
+    } else if let model = session.model, !model.isEmpty, model.lowercased() != "unknown" {
+      parts.append(model)
+    }
+    if let subCount = session.subagentCount, subCount > 0 {
+      parts.append("\(subCount) 个子代理")
+    }
+    if let rel = relativeSessionTime(ms: session.lastActiveAtMs, isActive: session.isActive == true) {
+      parts.append(rel)
+    }
+    return parts.joined(separator: " · ")
+  }
+
+  private func relativeSessionTime(ms: Double?, isActive: Bool) -> String? {
+    guard let ms = ms, ms > 0 else {
+      return isActive ? "刚刚" : nil
+    }
+    let delta = max(0, Int(Date().timeIntervalSince1970 - (ms / 1000.0)))
+    if delta < 60 { return "刚刚" }
+    if delta < 3600 { return "\(delta / 60) 分钟前" }
+    if delta < 86400 { return "\(delta / 3600) 小时前" }
+    return "\(delta / 86400) 天前"
   }
 
   private func metricColumn(label: String, value: String) -> some View {
@@ -727,11 +1160,21 @@ private struct PopoverActionRow: View {
   }
 }
 
+private struct PopoverSectionHeights: Equatable {
+  var header: CGFloat = 0
+  var card: CGFloat = 0
+  var footer: CGFloat = 0
+
+  var total: CGFloat { header + card + footer }
+}
+
 private struct PopoverContentHeightKey: PreferenceKey {
-  static var defaultValue: CGFloat = 0
-  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+  static var defaultValue = PopoverSectionHeights()
+  static func reduce(value: inout PopoverSectionHeights, nextValue: () -> PopoverSectionHeights) {
     let next = nextValue()
-    if next > 0 { value = next }
+    if next.header > 0 { value.header = next.header }
+    if next.card > 0 { value.card = next.card }
+    if next.footer > 0 { value.footer = next.footer }
   }
 }
 
@@ -741,6 +1184,29 @@ struct MenuBarPopoverView: View {
   let onCheckUpdates: () -> Void
   let onClosePopover: () -> Void
   let onContentHeightChanged: (CGFloat) -> Void
+  @State private var measuredCardHeight: CGFloat = 0
+
+  private func isSwitcherToolAvailable(_ key: String) -> Bool {
+    if vm.isExternalProvider(key) {
+      return vm.externalProviderMeta(for: key) != nil || vm.usageData?.cards?[key] != nil
+    }
+    if vm.apps[key]?.installed ?? false { return true }
+    if vm.apps[key]?.latestTurn != nil { return true }
+    let card = vm.usageData?.cards?[key]
+    return !(card?.quotaWindows?.isEmpty ?? true)
+      || (card?.accountEmail != nil)
+      || ((card?.today.turnCount ?? 0) > 0)
+      || ((card?.days30.turnCount ?? 0) > 0)
+  }
+
+  private var switcherKeys: [String] {
+    let useFallback = vm.apps.isEmpty
+    let ordered = vm.orderedAllProviderKeys.filter { key in
+      let available = useFallback ? true : isSwitcherToolAvailable(key)
+      return available && vm.isToolEnabled(key)
+    }
+    return ["all"] + ordered
+  }
 
   private var effectiveSelection: String {
     let candidate = vm.popoverSelection
@@ -749,8 +1215,8 @@ struct MenuBarPopoverView: View {
       let exists = vm.externalProviderMeta(for: candidate) != nil || vm.usageData?.cards?[candidate] != nil
       return (exists && vm.isToolEnabled(candidate)) ? candidate : "all"
     }
-    let installed = vm.apps.isEmpty ? true : (vm.apps[candidate]?.installed ?? false)
-    return (installed && vm.isToolEnabled(candidate)) ? candidate : "all"
+    let available = vm.apps.isEmpty ? true : isSwitcherToolAvailable(candidate)
+    return (available && vm.isToolEnabled(candidate)) ? candidate : "all"
   }
 
   private var activeCard: CodexBarCardSnapshot {
@@ -797,23 +1263,26 @@ struct MenuBarPopoverView: View {
     !vm.runtime.runningFromDmg && (!vm.daemonOnline || !vm.masterEnabled)
   }
 
-  private var popoverContent: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      ProviderSwitcherBar(vm: vm, selection: $vm.popoverSelection)
+  private var popoverHeader: some View {
+    let tabs = switcherKeys
+    return VStack(alignment: .leading, spacing: 0) {
+      ProviderSwitcherBar(vm: vm, switcherKeys: tabs, selection: $vm.popoverSelection)
 
       Divider().padding(.horizontal, 12).padding(.bottom, 2)
+    }
+    .fixedSize(horizontal: false, vertical: true)
+    .background(
+      GeometryReader { geo in
+        Color.clear.preference(
+          key: PopoverContentHeightKey.self,
+          value: PopoverSectionHeights(header: geo.size.height)
+        )
+      }
+    )
+  }
 
-      CodexBarStyleCardView(
-        vm: vm,
-        selection: effectiveSelection,
-        card: activeCard,
-        onLoginRequested: { key in
-          onClosePopover()
-          vm.startPluginLogin(key)
-          onOpenMainTab(nil)
-        }
-      )
-
+  private var popoverFooter: some View {
+    VStack(alignment: .leading, spacing: 0) {
       if showsContextStrip {
         HStack {
           Text(vm.daemonOnline ? "全局监控已暂停" : "后台采集服务未运行")
@@ -867,9 +1336,9 @@ struct MenuBarPopoverView: View {
         .keyboardShortcut("r", modifiers: .command)
 
         PopoverActionRow(title: "设置...", shortcut: "⌘ ,") {
-          let targetPane: SettingsPane = vm.popoverSelection == "all"
+          let targetPane: SettingsPane = effectiveSelection == "all"
             ? .general
-            : .provider(vm.popoverSelection)
+            : .provider(effectiveSelection)
           onClosePopover()
           vm.openSettingsPane(targetPane)
           onOpenMainTab(nil)
@@ -885,23 +1354,72 @@ struct MenuBarPopoverView: View {
       .padding(.top, 3)
       .padding(.bottom, 6)
     }
-    .frame(width: 310, alignment: .top)
     .fixedSize(horizontal: false, vertical: true)
+    .background(
+      GeometryReader { geo in
+        Color.clear.preference(
+          key: PopoverContentHeightKey.self,
+          value: PopoverSectionHeights(footer: geo.size.height)
+        )
+      }
+    )
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      popoverContent
-        .background(
-          GeometryReader { geo in
-            Color.clear.preference(key: PopoverContentHeightKey.self, value: geo.size.height)
+    let tabs = switcherKeys
+    return VStack(alignment: .leading, spacing: 0) {
+      popoverHeader
+        .layoutPriority(2)
+
+      ScrollView(.vertical, showsIndicators: false) {
+        CodexBarStyleCardView(
+          vm: vm,
+          selection: effectiveSelection,
+          card: activeCard,
+          onLoginRequested: { key in
+            onClosePopover()
+            vm.startPluginLogin(key)
+            onOpenMainTab(nil)
           }
         )
-      Spacer(minLength: 0)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(
+          GeometryReader { geo in
+            Color.clear.preference(
+              key: PopoverContentHeightKey.self,
+              value: PopoverSectionHeights(card: geo.size.height)
+            )
+          }
+        )
+      }
+      .id(effectiveSelection)
+      .frame(maxHeight: measuredCardHeight > 0 ? measuredCardHeight : nil)
+      .layoutPriority(1)
+
+      popoverFooter
+        .layoutPriority(2)
     }
+    .background(
+      ZStack {
+        ForEach(Array(tabs.prefix(9).enumerated()), id: \.offset) { idx, key in
+          Button("") {
+            vm.popoverSelection = key
+          }
+          .keyboardShortcut(KeyEquivalent(Character("\(idx + 1)")), modifiers: .command)
+          .frame(width: 0, height: 0)
+          .opacity(0.001)
+          .accessibilityHidden(true)
+        }
+      }
+    )
     .frame(minWidth: 310, idealWidth: 310, maxWidth: 310, maxHeight: .infinity, alignment: .top)
-    .onPreferenceChange(PopoverContentHeightKey.self) { height in
-      onContentHeightChanged(height)
+    .onPreferenceChange(PopoverContentHeightKey.self) { heights in
+      if heights.card > 0, abs(measuredCardHeight - heights.card) > 0.5 {
+        measuredCardHeight = heights.card
+      }
+      if heights.header > 0 && heights.card > 0 && heights.footer > 0 {
+        onContentHeightChanged(heights.total)
+      }
     }
     .onChange(of: vm.popoverSelection) { _ in
       CostHistoryFlyoutController.shared.hideImmediately()

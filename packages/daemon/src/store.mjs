@@ -48,6 +48,36 @@ function formatZhRange(startMs, endMs) {
 
 const CARD_WINDOW_TITLES = ['当前窗口', '上一窗口', '2 个窗口前', '3 个窗口前'];
 const CARD_TOOL_KEYS = ['codex', 'cursor', 'antigravity', 'codebuddy'];
+const UNBOUND_WORKSPACE_LABEL = '未关联工作区';
+const ACTIVE_SESSION_WINDOW_MS = 90_000;
+const RECENT_SESSIONS_CACHE_TTL_MS = 15_000;
+
+function normalizeWorkspacePath(raw) {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  return trimmed.length > 1 ? trimmed.replace(/\/+$/, '') : trimmed;
+}
+
+function workspaceBasename(workspacePath) {
+  const normalized = normalizeWorkspacePath(workspacePath);
+  if (!normalized) return null;
+  return normalized.split('/').filter(Boolean).pop() || normalized;
+}
+
+function truncateSessionTitle(raw, maxLen = 60) {
+  if (typeof raw !== 'string') return null;
+  const clean = raw.replace(/\s+/g, ' ').trim();
+  if (!clean) return null;
+  if (clean.length <= maxLen) return clean;
+  return `${clean.slice(0, Math.max(1, maxLen - 1)).trimEnd()}…`;
+}
+
+function shortSessionId(sessionId) {
+  const s = String(sessionId || '').trim();
+  if (!s) return 'session';
+  return s.length > 12 ? s.slice(0, 8) : s;
+}
 
 function createUsageAccumulator() {
   return {
@@ -213,6 +243,7 @@ export class TurnStore {
       CREATE INDEX IF NOT EXISTS idx_turns_tool_completed ON turns(tool, completed_at_ms DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_tool_host_completed ON turns(tool, host, completed_at_ms DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(tool, session_id);
+      CREATE INDEX IF NOT EXISTS idx_turns_tool_session_completed ON turns(tool, session_id, completed_at_ms DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_workspace ON turns(workspace_path, completed_at_ms DESC);
 
       CREATE TABLE IF NOT EXISTS ingested_files (
@@ -271,6 +302,74 @@ export class TurnStore {
       this.db.exec('PRAGMA user_version = 1;');
     }
 
+    if (schemaVer < 2) {
+      const staleSessions = this.db
+        .prepare(
+          `SELECT DISTINCT session_id FROM turns
+           WHERE tool = 'antigravity'
+             AND (model = 'unknown' OR (tps IS NOT NULL AND tps_method = 'unavailable'))`
+        )
+        .all();
+      if (staleSessions.length > 0) {
+        const delIngested = this.db.prepare(`DELETE FROM ingested_files WHERE file_path LIKE ?`);
+        for (const row of staleSessions) {
+          if (typeof row.session_id === 'string' && row.session_id.trim()) {
+            delIngested.run(`%/${row.session_id}/.system_generated/logs/transcript.jsonl`);
+          }
+        }
+      }
+      this.db.exec('PRAGMA user_version = 2;');
+    }
+
+    if (schemaVer < 3) {
+      // Clear ingested_files so previously skipped open turns (Antigravity subagents, Codex, CodeBuddy CLI)
+      // and historical CodeBuddy IDE fallback timestamps are re-scanned with current parsers.
+      this.db.exec('DELETE FROM ingested_files;');
+
+      // Remove stale mid-turn cursor-cloud partial snapshots that overlap completed local cursor-ide turns.
+      const overlapCloudRows = this.db
+        .prepare(
+          `SELECT c.turn_uid, c.session_id, c.completed_at_ms, c.total_input_tokens, c.output_tokens
+           FROM turns c
+           WHERE c.tool = 'cursor' AND c.host = 'cursor-cloud'
+             AND EXISTS (
+               SELECT 1 FROM turns h
+               WHERE h.tool = 'cursor' AND h.host != 'cursor-cloud' AND h.session_id = c.session_id
+             )`
+        )
+        .all();
+      if (overlapCloudRows.length > 0) {
+        const hooksBySessionStmt = this.db.prepare(
+          `SELECT started_at_ms, completed_at_ms, total_input_tokens, output_tokens
+           FROM turns
+           WHERE tool = 'cursor' AND host != 'cursor-cloud' AND session_id = ?`
+        );
+        const delCloudStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
+        for (const cr of overlapCloudRows) {
+          const hooks = hooksBySessionStmt.all(cr.session_id);
+          const crMs = Number(cr.completed_at_ms) || 0;
+          const crIn = Number(cr.total_input_tokens) || 0;
+          const crOut = Number(cr.output_tokens) || 0;
+          const isDup = hooks.some((h) => {
+            const hStart = Number(h.started_at_ms) || 0;
+            const hEnd = Number(h.completed_at_ms) || 0;
+            const hIn = Number(h.total_input_tokens) || 0;
+            const hOut = Number(h.output_tokens) || 0;
+            const closeInTime = Math.abs(hEnd - crMs) <= 6 * 3600_000;
+            const inputMatch = closeInTime && crIn > 0 && crIn === hIn;
+            const outputMatch = Math.abs(hEnd - crMs) <= 20_000 && crOut > 0 && crOut === hOut;
+            const midTurnWindowMatch =
+              hStart > 0 && crMs >= hStart - 60_000 && crMs <= hEnd + 20_000 && crIn <= hIn;
+            return inputMatch || outputMatch || midTurnWindowMatch;
+          });
+          if (isDup) {
+            delCloudStmt.run(cr.turn_uid);
+          }
+        }
+      }
+      this.db.exec('PRAGMA user_version = 3;');
+    }
+
     // Purge any legacy third-party gateway proxy turns (e.g. workbuddy/claude-opus-5.5) recorded under Codex.
     const codexModels = this.db.prepare(`SELECT DISTINCT model FROM turns WHERE tool = 'codex'`).all();
     const staleCodexModels = codexModels.map((r) => r.model).filter((m) => !isCodexOpenAiModel(m));
@@ -284,6 +383,7 @@ export class TurnStore {
     this.writeGeneration = 0;
     this._usageBaseCache = new Map();
     this._receiptCache = new Map();
+    this._recentSessionsCache = new Map();
 
     this.upsertStmt = this.db.prepare(`
       INSERT INTO turns (
@@ -314,20 +414,37 @@ export class TurnStore {
         cache_read_tokens = excluded.cache_read_tokens,
         cache_write_tokens = excluded.cache_write_tokens,
         output_tokens = excluded.output_tokens,
-        thinking_tokens = excluded.thinking_tokens,
+        thinking_tokens = COALESCE(excluded.thinking_tokens, turns.thinking_tokens),
         cache_rate_pct = excluded.cache_rate_pct,
         duration_ms = excluded.duration_ms,
-        model_active_ms = excluded.model_active_ms,
+        model_active_ms = CASE
+          WHEN turns.tps_method = 'streaming_decode'
+            AND excluded.tps_method != 'streaming_decode'
+            AND turns.output_tokens = excluded.output_tokens
+          THEN turns.model_active_ms
+          ELSE excluded.model_active_ms
+        END,
         ttft_ms = COALESCE(excluded.ttft_ms, turns.ttft_ms),
-        tps = COALESCE(excluded.tps, turns.tps),
-        tps_method = CASE WHEN excluded.tps IS NOT NULL THEN excluded.tps_method ELSE turns.tps_method END,
+        tps = CASE
+          WHEN turns.tps_method = 'streaming_decode'
+            AND excluded.tps_method != 'streaming_decode'
+            AND turns.output_tokens = excluded.output_tokens
+          THEN turns.tps
+          ELSE COALESCE(excluded.tps, turns.tps)
+        END,
+        tps_method = CASE
+          WHEN turns.tps_method = 'streaming_decode'
+            AND excluded.tps_method != 'streaming_decode'
+            AND turns.output_tokens = excluded.output_tokens
+          THEN turns.tps_method
+          WHEN excluded.tps IS NOT NULL THEN excluded.tps_method
+          ELSE turns.tps_method
+        END,
         reply_preview = COALESCE(excluded.reply_preview, turns.reply_preview),
         explicit_cost_usd = COALESCE(excluded.explicit_cost_usd, turns.explicit_cost_usd)
     `);
 
-    this.getExistingStmt = this.db.prepare(
-      `SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, output_tokens, tps, call_count, model, workspace_path, reply_preview, explicit_cost_usd FROM turns WHERE turn_uid = ?`
-    );
+    this.getExistingStmt = this.db.prepare(`SELECT * FROM turns WHERE turn_uid = ?`);
 
     this.getIngestedStmt = this.db.prepare(`SELECT mtime_ms, size_bytes FROM ingested_files WHERE file_path = ?`);
     this.setIngestedStmt = this.db.prepare(`
@@ -364,6 +481,12 @@ export class TurnStore {
     const t = normalizeTurn(rawTurn);
     const prev = this.getExistingStmt.get(t.turnUid);
 
+    const preserveStreaming =
+      Boolean(prev) &&
+      prev.tps_method === 'streaming_decode' &&
+      t.tpsMethod !== 'streaming_decode' &&
+      prev.output_tokens === t.outputTokens;
+
     const changed =
       !prev ||
       prev.completed_at_ms !== t.completedAtMs ||
@@ -371,7 +494,8 @@ export class TurnStore {
       prev.uncached_input_tokens !== t.uncachedInputTokens ||
       prev.cache_read_tokens !== t.cacheReadTokens ||
       prev.output_tokens !== t.outputTokens ||
-      prev.tps !== t.tps ||
+      (t.thinkingTokens !== null && prev.thinking_tokens !== t.thinkingTokens) ||
+      (!preserveStreaming && (prev.tps !== t.tps || (t.tps !== null && prev.tps_method !== t.tpsMethod))) ||
       prev.call_count !== t.callCount ||
       (!prev.reply_preview && Boolean(t.replyPreview)) ||
       (prev.model === 'unknown' && t.model !== 'unknown') ||
@@ -426,7 +550,12 @@ export class TurnStore {
             const closeInTime = Math.abs(crMs - t.completedAtMs) <= 6 * 3600_000;
             const inputMatch = closeInTime && crIn > 0 && crIn === t.totalInputTokens;
             const outputMatch = Math.abs(crMs - t.completedAtMs) <= 20_000 && crOut > 0 && crOut === t.outputTokens;
-            if (inputMatch || outputMatch) {
+            const midTurnWindowMatch =
+              Boolean(t.startedAtMs) &&
+              crMs >= t.startedAtMs - 60_000 &&
+              crMs <= t.completedAtMs + 20_000 &&
+              crIn <= t.totalInputTokens;
+            if (inputMatch || outputMatch || midTurnWindowMatch) {
               delCloudStmt.run(cr.turn_uid);
             }
           }
@@ -434,11 +563,13 @@ export class TurnStore {
       }
 
       this.writeGeneration += 1;
+      this._recentSessionsCache.clear();
     }
 
+    const mergedRow = prev ? (changed ? this.getExistingStmt.get(t.turnUid) : prev) : null;
     return {
       changed,
-      record: this.enrichRecord(t),
+      record: mergedRow ? this.rowToTurn(mergedRow) : this.enrichRecord(t),
     };
   }
 
@@ -615,6 +746,17 @@ export class TurnStore {
       .all();
   }
 
+  deleteTurnByUid(turnUid) {
+    if (typeof turnUid !== 'string' || !turnUid.trim()) return false;
+    const info = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`).run(turnUid.trim());
+    if (info && info.changes > 0) {
+      this.writeGeneration += 1;
+      this._recentSessionsCache.clear();
+      return true;
+    }
+    return false;
+  }
+
   getLatestByTool() {
     const tools = ['codex', 'antigravity', 'cursor', 'codebuddy'];
     const stmt = this.db.prepare(
@@ -657,6 +799,274 @@ export class TurnStore {
       .prepare(`SELECT * FROM turns ${whereSql} ORDER BY completed_at_ms DESC LIMIT ?`)
       .all(...params, limit);
     return this.batchEnrichRows(rows);
+  }
+
+  /**
+   * Aggregate recent sessions grouped by (tool, session_id) ordered by MAX(completed_at_ms) DESC.
+   * @param {{ tool?: string | null, limit?: number, nowMs?: number, sessionTitles?: Map<string, { title?: string | null, workspacePath?: string | null, updatedAtMs?: number | null }> | null, enabledTools?: Record<string, boolean> | null }} [opts]
+   */
+  getRecentSessions({
+    tool = null,
+    limit = 5,
+    nowMs = Date.now(),
+    sessionTitles = null,
+    enabledTools = null,
+  } = {}) {
+    const effectiveTool =
+      typeof tool === 'string' && tool.trim() && tool.trim() !== 'all' ? tool.trim() : null;
+    const resolvedLimit = Math.min(100, Math.max(1, Math.round(Number(limit) || 5)));
+
+    const disabledTools =
+      !effectiveTool && enabledTools && typeof enabledTools === 'object'
+        ? Object.entries(enabledTools)
+            .filter(([, enabled]) => enabled === false)
+            .map(([k]) => k)
+            .sort()
+        : [];
+    const titleMap = sessionTitles instanceof Map ? sessionTitles : null;
+    let parentEdgeCount = 0;
+    if (titleMap) {
+      for (const entry of titleMap.values()) {
+        if (typeof entry?.parentSessionId === 'string' && entry.parentSessionId.trim()) {
+          parentEdgeCount += 1;
+        }
+      }
+    }
+
+    const resolveRootSessionId = (sTool, sid) => {
+      if (sTool !== 'antigravity' || !titleMap || parentEdgeCount === 0) return sid;
+      let cur = sid;
+      const visited = new Set([cur]);
+      while (true) {
+        const entry = titleMap.get(cur);
+        const parent =
+          typeof entry?.parentSessionId === 'string' && entry.parentSessionId.trim()
+            ? entry.parentSessionId.trim()
+            : null;
+        if (!parent || visited.has(parent)) break;
+        visited.add(parent);
+        cur = parent;
+      }
+      return cur;
+    };
+
+    const pricingVer = this.getPricingVersionTag();
+    const cacheKey = `${this.writeGeneration}|${pricingVer}|${effectiveTool || ''}|${resolvedLimit}|${disabledTools.join(',')}|${parentEdgeCount}`;
+    const nowWallMs = Date.now();
+
+    const applyOverlay = (baseItems) => {
+      return baseItems.map((item) => {
+        const titleEntry = titleMap ? titleMap.get(item.sessionId) || null : null;
+        const workspacePath =
+          item.latestWorkspacePath || normalizeWorkspacePath(titleEntry?.workspacePath) || null;
+        const title =
+          truncateSessionTitle(titleEntry?.title, 80) ||
+          truncateSessionTitle(item.firstReplyPreview, 60) ||
+          workspaceBasename(workspacePath) ||
+          shortSessionId(item.sessionId);
+
+        const titleUpdatedAtMs =
+          typeof titleEntry?.updatedAtMs === 'number' && Number.isFinite(titleEntry.updatedAtMs)
+            ? titleEntry.updatedAtMs
+            : null;
+        const effectiveActiveAtMs =
+          titleUpdatedAtMs !== null ? Math.max(item.lastActiveAtMs, titleUpdatedAtMs) : item.lastActiveAtMs;
+        const isActive = effectiveActiveAtMs > 0 && nowMs - effectiveActiveAtMs <= ACTIVE_SESSION_WINDOW_MS;
+
+        const out = {
+          sessionId: item.sessionId,
+          tool: item.tool,
+          title,
+          workspacePath,
+          model: item.model,
+          modelCount: item.modelCount,
+          totalTokens: item.totalTokens,
+          thinkingTokens: item.thinkingTokens,
+          estimatedCostUsd: item.estimatedCostUsd,
+          turnCount: item.turnCount,
+          lastActiveAtMs: item.lastActiveAtMs,
+          isActive,
+        };
+        if (item.subagentCount > 0) {
+          out.subagentCount = item.subagentCount;
+        }
+        return out;
+      });
+    };
+
+    const cached = this._recentSessionsCache.get(cacheKey);
+    if (
+      cached &&
+      nowWallMs - cached.cachedAtMs < RECENT_SESSIONS_CACHE_TTL_MS &&
+      Math.abs(nowMs - cached.nowMs) < RECENT_SESSIONS_CACHE_TTL_MS
+    ) {
+      return applyOverlay(cached.items);
+    }
+
+    const clauses = [];
+    const params = [];
+    if (effectiveTool) {
+      clauses.push('tool = ?');
+      params.push(effectiveTool);
+    } else if (disabledTools.length > 0) {
+      clauses.push(`tool NOT IN (${disabledTools.map(() => '?').join(', ')})`);
+      params.push(...disabledTools);
+    }
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    const scanLimit = parentEdgeCount > 0 ? Math.max(resolvedLimit * 40, 200) : resolvedLimit;
+    const rawGrouped = this.db
+      .prepare(
+        `SELECT tool, session_id, MAX(completed_at_ms) AS last_active_at_ms
+         FROM turns
+         ${whereSql}
+         GROUP BY tool, session_id
+         ORDER BY last_active_at_ms DESC
+         LIMIT ?`
+      )
+      .all(...params, scanLimit);
+
+    if (rawGrouped.length === 0) {
+      setBoundedCache(this._recentSessionsCache, cacheKey, { cachedAtMs: nowWallMs, nowMs, items: [] }, 32);
+      return [];
+    }
+
+    const mergedMap = new Map();
+    for (const r of rawGrouped) {
+      const rootId = resolveRootSessionId(r.tool, r.session_id);
+      const key = `${r.tool}\0${rootId}`;
+      const ts = Number(r.last_active_at_ms) || 0;
+      let group = mergedMap.get(key);
+      if (!group) {
+        group = {
+          tool: r.tool,
+          session_id: rootId,
+          last_active_at_ms: ts,
+          memberIds: new Set([rootId]),
+        };
+        mergedMap.set(key, group);
+      } else if (ts > group.last_active_at_ms) {
+        group.last_active_at_ms = ts;
+      }
+      group.memberIds.add(r.session_id);
+    }
+
+    const grouped = Array.from(mergedMap.values())
+      .sort((a, b) => b.last_active_at_ms - a.last_active_at_ms)
+      .slice(0, resolvedLimit);
+
+    if (parentEdgeCount > 0 && titleMap) {
+      const agGroupsByRoot = new Map();
+      for (const g of grouped) {
+        if (g.tool === 'antigravity') agGroupsByRoot.set(g.session_id, g);
+      }
+      if (agGroupsByRoot.size > 0) {
+        for (const candidateId of titleMap.keys()) {
+          const rootId = resolveRootSessionId('antigravity', candidateId);
+          const g = agGroupsByRoot.get(rootId);
+          if (g) {
+            g.memberIds.add(candidateId);
+          }
+        }
+      }
+    }
+
+    const queryPairs = [];
+    for (const g of grouped) {
+      for (const memberId of g.memberIds) {
+        queryPairs.push([g.tool, memberId]);
+      }
+    }
+    const turnRows = [];
+    const pairChunkSize = 100;
+    for (let i = 0; i < queryPairs.length; i += pairChunkSize) {
+      const chunk = queryPairs.slice(i, i + pairChunkSize);
+      const pairClauses = chunk.map(() => `(tool = ? AND session_id = ?)`).join(' OR ');
+      const pairParams = chunk.flat();
+      const rows = this.db
+        .prepare(
+          `SELECT
+            tool, session_id, model, workspace_path, completed_at_ms,
+            call_count, total_input_tokens, uncached_input_tokens,
+            cache_read_tokens, cache_write_tokens, output_tokens,
+            thinking_tokens, tps, reply_preview, explicit_cost_usd
+           FROM turns
+           WHERE ${pairClauses}
+           ORDER BY completed_at_ms ASC, rowid ASC`
+        )
+        .all(...pairParams);
+      turnRows.push(...rows);
+    }
+
+    const rowsByKey = new Map();
+    for (const r of turnRows) {
+      const rootId = resolveRootSessionId(r.tool, r.session_id);
+      const key = `${r.tool}\0${rootId}`;
+      let list = rowsByKey.get(key);
+      if (!list) {
+        list = [];
+        rowsByKey.set(key, list);
+      }
+      list.push(r);
+    }
+
+    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+
+    const baseItems = grouped.map((g) => {
+      const sTool = g.tool;
+      const sessionId = g.session_id;
+      const sessionRows = rowsByKey.get(`${sTool}\0${sessionId}`) || [];
+      const acc = createUsageAccumulator();
+      const nonUnknownModels = new Set();
+      const subagentSet = new Set();
+      let latestKnownModel = null;
+      let rootReplyPreview = null;
+      let fallbackReplyPreview = null;
+      let latestWorkspacePath = null;
+      let lastActiveAtMs = Number(g.last_active_at_ms) || 0;
+
+      for (const row of sessionRows) {
+        addTurnToAccumulator(acc, row, customRates);
+        if (row.session_id !== sessionId) {
+          subagentSet.add(row.session_id);
+        }
+        const ts = Number(row.completed_at_ms) || 0;
+        if (ts > lastActiveAtMs) lastActiveAtMs = ts;
+        const m = typeof row.model === 'string' ? row.model.trim() : '';
+        if (m && m !== 'unknown') {
+          nonUnknownModels.add(m);
+          latestKnownModel = m;
+        }
+        if (typeof row.reply_preview === 'string' && row.reply_preview.trim()) {
+          if (row.session_id === sessionId && !rootReplyPreview) {
+            rootReplyPreview = row.reply_preview.trim();
+          } else if (!fallbackReplyPreview) {
+            fallbackReplyPreview = row.reply_preview.trim();
+          }
+        }
+        const ws = normalizeWorkspacePath(row.workspace_path);
+        if (ws) latestWorkspacePath = ws;
+      }
+
+      const fin = finalizeAccumulator(acc);
+      return {
+        sessionId,
+        tool: sTool,
+        firstReplyPreview: rootReplyPreview || fallbackReplyPreview,
+        latestWorkspacePath,
+        model: latestKnownModel,
+        modelCount: nonUnknownModels.size,
+        subagentCount: subagentSet.size,
+        totalTokens: fin.totalTokens,
+        thinkingTokens: fin.thinkingTokens,
+        estimatedCostUsd: fin.estimatedCostUsd,
+        turnCount: fin.turnCount,
+        lastActiveAtMs,
+      };
+    });
+
+    setBoundedCache(this._recentSessionsCache, cacheKey, { cachedAtMs: nowWallMs, nowMs, items: baseItems }, 32);
+    return applyOverlay(baseItems);
   }
 
   /**
@@ -723,7 +1133,7 @@ export class TurnStore {
 
   /**
    * Aggregate usage, cost, and cache savings over `days` local calendar days (0 or 'all' = all history).
-   * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number, quotasByTool?: Record<string, any> | null, enabledTools?: Record<string, boolean> | null }} [opts]
+   * @param {{ days?: number | string | null, tool?: string | null, nowMs?: number, quotasByTool?: Record<string, any> | null, enabledTools?: Record<string, boolean> | null, externalData?: any, sessionTitles?: Map<string, any> | null }} [opts]
    */
   getUsageSummary({
     days = 7,
@@ -732,6 +1142,7 @@ export class TurnStore {
     quotasByTool = null,
     enabledTools = null,
     externalData = null,
+    sessionTitles = null,
   } = {}) {
     const todayStartMs = startOfLocalDayMs(nowMs);
     const resolvedDays =
@@ -749,6 +1160,25 @@ export class TurnStore {
       const overlaidCards = {};
       for (const [k, card] of Object.entries(base.cards)) {
         const q = quotasByTool?.[k] || null;
+        const recentSessions =
+          k === 'all'
+            ? this.getRecentSessions({
+                tool: null,
+                limit: 5,
+                nowMs,
+                sessionTitles,
+                enabledTools,
+              })
+            : CARD_TOOL_KEYS.includes(k)
+              ? this.getRecentSessions({
+                  tool: k,
+                  limit: 5,
+                  nowMs,
+                  sessionTitles,
+                })
+              : Array.isArray(card.recentSessions)
+                ? card.recentSessions
+                : [];
         overlaidCards[k] = {
           ...card,
           accountEmail: q?.accountEmail ?? null,
@@ -756,6 +1186,7 @@ export class TurnStore {
           quotaWindows: Array.isArray(q?.quotaWindows) ? q.quotaWindows : [],
           resetCreditsText: q?.resetCreditsText ?? null,
           quotaHint: q?.quotaHint ?? null,
+          recentSessions,
         };
       }
       if (externalData && typeof externalData === 'object') {
@@ -831,6 +1262,7 @@ export class TurnStore {
     const toolMap = new Map();
     const modelMap = new Map();
     const projectMap = new Map();
+    const workspaceMap = new Map();
     const dailyMap = new Map();
 
     if (resolvedDays >= 1 && resolvedDays <= 90) {
@@ -870,6 +1302,20 @@ export class TurnStore {
         });
       }
       addTurnToAccumulator(projectMap.get(projKey).acc, row, customRates);
+
+      const normWs = normalizeWorkspacePath(row.workspace_path);
+      const wsKey = normWs || UNBOUND_WORKSPACE_LABEL;
+      if (!workspaceMap.has(wsKey)) {
+        workspaceMap.set(wsKey, {
+          workspacePath: wsKey,
+          workspaceName: normWs ? workspaceBasename(normWs) : UNBOUND_WORKSPACE_LABEL,
+          acc: createUsageAccumulator(),
+          tools: new Set(),
+        });
+      }
+      const wsEntry = workspaceMap.get(wsKey);
+      addTurnToAccumulator(wsEntry.acc, row, customRates);
+      if (tKey) wsEntry.tools.add(tKey);
 
       const dayKey = toLocalDateKey(row.completed_at_ms);
       if (!dailyMap.has(dayKey)) dailyMap.set(dayKey, createUsageAccumulator());
@@ -932,6 +1378,41 @@ export class TurnStore {
           (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
       );
 
+    const totalWindowCost =
+      typeof totals.estimatedCostUsd === 'number' &&
+      Number.isFinite(totals.estimatedCostUsd) &&
+      totals.estimatedCostUsd > 0
+        ? totals.estimatedCostUsd
+        : 0;
+    const byWorkspace = Array.from(workspaceMap.values())
+      .map(({ workspacePath, workspaceName, acc, tools }) => {
+        const stats = finalizeAccumulator(acc);
+        const sharePct =
+          totalWindowCost > 0
+            ? stats.estimatedCostUsd !== null && stats.estimatedCostUsd > 0
+              ? Number(((stats.estimatedCostUsd / totalWindowCost) * 100).toFixed(1))
+              : 0
+            : totals.totalTokens > 0
+              ? Number(((stats.totalTokens / totals.totalTokens) * 100).toFixed(1))
+              : 0;
+        return {
+          workspacePath,
+          workspaceName,
+          turnCount: stats.turnCount,
+          totalTokens: stats.totalTokens,
+          thinkingTokens: stats.thinkingTokens,
+          outputTokens: stats.outputTokens,
+          estimatedCostUsd: stats.estimatedCostUsd,
+          sharePct,
+          tools: Array.from(tools).sort(),
+        };
+      })
+      .sort(
+        (a, b) =>
+          (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
+      )
+      .slice(0, 12);
+
     const daily = Array.from(dailyMap.entries())
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([date, acc]) => ({
@@ -951,6 +1432,7 @@ export class TurnStore {
       byTool,
       byModel,
       byProject,
+      byWorkspace,
       daily,
       cards,
     };
@@ -1178,6 +1660,7 @@ export class TurnStore {
       daily30,
       projects,
       recentWindows,
+      recentSessions: [],
       topModel,
     };
   }

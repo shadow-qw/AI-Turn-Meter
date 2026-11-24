@@ -111,13 +111,28 @@ struct RecentTurnsTabView: View {
     }
   }
 
+  private func openWorkspacePath(_ path: String) {
+    var isDir: ObjCBool = false
+    if FileManager.default.fileExists(atPath: path, isDirectory: &isDir) {
+      if isDir.boolValue {
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+      } else {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+      }
+    } else {
+      vm.bannerIsError = true
+      vm.statusBanner = "目录不存在或已被移动：\(path)"
+    }
+  }
+
   private func turnCard(_ t: TurnSummary) -> some View {
     let toolKey = t.tool ?? ""
     let accent = vm.toolAccentColor(for: toolKey)
     let toolName = t.toolLabel ?? vm.displayTitle(for: toolKey)
     let modelName = (t.model != nil && t.model != "unknown") ? t.model! : toolName
-    let wsName = t.workspacePath.map { ($0 as NSString).lastPathComponent }
-    let wsExists = t.workspacePath.map { FileManager.default.fileExists(atPath: $0) } ?? false
+    let workspacePath = t.workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let hasWorkspacePath = !(workspacePath ?? "").isEmpty
+    let wsName = workspacePath.map { ($0 as NSString).lastPathComponent }
     let appPath = vm.apps[toolKey]?.appPath
 
     return HStack(spacing: 0) {
@@ -203,12 +218,12 @@ struct RecentTurnsTabView: View {
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
 
-        if wsExists || appPath != nil {
+        if hasWorkspacePath || appPath != nil {
           HStack(spacing: 8) {
             Spacer()
-            if let ws = t.workspacePath, wsExists {
+            if let ws = workspacePath, !ws.isEmpty {
               Button {
-                NSWorkspace.shared.open(URL(fileURLWithPath: ws))
+                openWorkspacePath(ws)
               } label: {
                 Label("打开目录", systemImage: "folder")
                   .font(.system(size: 10.5))

@@ -97,12 +97,24 @@ const MODEL_PRICING_PER_M = {
     thresholdTokens: 272_000,
     above: { input: 10.0, cacheRead: 1.0, output: 45.0 },
   },
+  'gpt-5.5-pro': {
+    input: 30.0,
+    output: 180.0,
+    thresholdTokens: 272_000,
+    above: { input: 60.0, output: 270.0 },
+  },
   'gpt-5.4': {
     input: 2.5,
     cacheRead: 0.25,
     output: 15.0,
     thresholdTokens: 272_000,
     above: { input: 5.0, cacheRead: 0.5, output: 22.5 },
+  },
+  'gpt-5.4-pro': {
+    input: 30.0,
+    output: 180.0,
+    thresholdTokens: 272_000,
+    above: { input: 60.0, output: 270.0 },
   },
   'gpt-5.4-mini': { input: 0.75, cacheRead: 0.075, output: 4.5 },
   'gpt-5.4-nano': { input: 0.2, cacheRead: 0.02, output: 1.25 },
@@ -117,6 +129,7 @@ const MODEL_PRICING_PER_M = {
   'gpt-5.1-codex-max': { input: 1.25, cacheRead: 0.125, output: 10.0 },
   'gpt-5.1-codex-mini': { input: 0.25, cacheRead: 0.025, output: 2.0 },
   'gpt-5': { input: 1.25, cacheRead: 0.125, output: 10.0 },
+  'gpt-5-pro': { input: 15.0, output: 120.0 },
   'gpt-5-codex': { input: 1.25, cacheRead: 0.125, output: 10.0 },
   'gpt-5-mini': { input: 0.25, cacheRead: 0.025, output: 2.0 },
   'gpt-5-nano': { input: 0.05, cacheRead: 0.005, output: 0.4 },
@@ -138,6 +151,13 @@ const MODEL_PRICING_PER_M = {
 
   // Google / Antigravity
   'gemini-4-neon': {
+    input: 2.0,
+    cacheRead: 0.2,
+    output: 12.0,
+    thresholdTokens: 200_000,
+    above: { input: 4.0, cacheRead: 0.4, output: 18.0 },
+  },
+  'gemini-pro-orchestrator-neon': {
     input: 2.0,
     cacheRead: 0.2,
     output: 12.0,
@@ -201,6 +221,8 @@ const MODEL_PRICING_PER_M = {
   'claude-opus-4.7': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
   'claude-opus-4.6': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
   'claude-opus-4.5': { input: 5.0, cacheRead: 0.5, cacheWrite: 6.25, output: 25.0 },
+  'claude-opus-4.1': { input: 15.0, cacheRead: 1.5, cacheWrite: 18.75, output: 75.0 },
+  'claude-opus-4': { input: 15.0, cacheRead: 1.5, cacheWrite: 18.75, output: 75.0 },
   'claude-sonnet-5.5': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
   'claude-sonnet-5': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
   'claude-sonnet-4.6': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
@@ -220,8 +242,21 @@ const MODEL_PRICING_PER_M = {
     thresholdTokens: 200_000,
     above: { input: 6.0, cacheRead: 0.6, cacheWrite: 7.5, output: 22.5 },
   },
+  'claude-3.7-sonnet': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
+  'claude-3-7-sonnet': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
+  'claude-3.5-sonnet': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
+  'claude-3-5-sonnet': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, output: 15.0 },
   'claude-haiku-4.5': { input: 1.0, cacheRead: 0.1, cacheWrite: 1.25, output: 5.0 },
+  'claude-3.5-haiku': { input: 0.8, cacheRead: 0.08, cacheWrite: 1.0, output: 4.0 },
+  'claude-3-5-haiku': { input: 0.8, cacheRead: 0.08, cacheWrite: 1.0, output: 4.0 },
+  'claude-fable-5': { input: 10.0, cacheRead: 1.0, cacheWrite: 12.5, output: 50.0 },
   'claude-mythos-5': { input: 10.0, cacheRead: 1.0, cacheWrite: 12.5, output: 50.0 },
+  'claude-mythos-5.1': { input: 10.0, cacheRead: 0.25, cacheWrite: 12.5, output: 50.0 },
+  'claude-mythos-5.2': { input: 8.0, cacheRead: 0.2, cacheWrite: 10.0, output: 40.0 },
+
+  // Cursor Composer
+  'composer-2.5': { input: 0.5, cacheRead: 0.2, output: 2.5 },
+  'composer-2.5-fast': { input: 3.0, cacheRead: 0.5, output: 15.0 },
 
   // Other coding models
   'kimi-k3.1-pro': { input: 0.6, cacheRead: 0.1, cacheWrite: 0.6, output: 2.5 },
@@ -250,12 +285,17 @@ const MODEL_PRICING_PER_M = {
 };
 
 const MODEL_ALIASES = {
+  'gpt-5.6': 'gpt-5.6-sol',
+  'gpt-reserve': 'gpt-5.6-luna',
   'gpt-daybreak-blue-latest': 'gpt-5.6-sol',
   'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
   'gemini-pro-default': 'gemini-3.1-pro',
   'gemini-pro-agent': 'gemini-3.1-pro',
   'gemini-3.7-flash-safety-le': 'gemini-2.5-flash',
   'gemini-3.7-flash': 'gemini-2.5-flash',
+  'claude-sonnet-3.7': 'claude-3.7-sonnet',
+  'claude-sonnet-3.5': 'claude-3.5-sonnet',
+  'claude-haiku-3.5': 'claude-3.5-haiku',
 };
 
 export function defaultCustomPricingPath() {
@@ -308,6 +348,11 @@ function normalizeModelCandidates(rawModel) {
     // Strip trailing YYYYMMDD snapshots (e.g. claude-opus-4-5-20251101)
     const noDate = noPrefix.replace(/-\d{8}$/, '');
     candidates.add(noDate);
+    // Normalize dotted versions before stripping -fast/-high so distinct speed tiers (e.g. composer-2-5-fast) match first
+    const dottedNoDate = noDate
+      .replace(/(\d+)-(\d+)(?=-|$)/g, '$1.$2')
+      .replace(/(\d+)p(\d+)(?=-|$)/g, '$1.$2');
+    candidates.add(dottedNoDate);
     // Strip context / reasoning-effort / speed suffixes (e.g. -1m, -thinking-high, -xhigh-fast, -max)
     const noEffort = noDate
       .replace(/-(?:1m|200k)$/, '')
@@ -385,9 +430,17 @@ export function estimateTurnCost(turn, customRates = null) {
   }
 
   const totalInputTokens = Math.max(0, Number(turn.totalInputTokens) || 0);
-  const uncachedInputTokens = Math.max(0, Number(turn.uncachedInputTokens) || 0);
-  const cacheReadTokens = Math.max(0, Number(turn.cacheReadTokens) || 0);
-  const cacheWriteTokens = Math.max(0, Number(turn.cacheWriteTokens) || 0);
+  const rawCacheRead = Math.max(0, Number(turn.cacheReadTokens) || 0);
+  const rawCacheWrite = Math.max(0, Number(turn.cacheWriteTokens) || 0);
+  const cacheReadTokens = totalInputTokens > 0 ? Math.min(rawCacheRead, totalInputTokens) : rawCacheRead;
+  const cacheWriteTokens =
+    totalInputTokens > 0
+      ? Math.min(rawCacheWrite, Math.max(0, totalInputTokens - cacheReadTokens))
+      : rawCacheWrite;
+  const uncachedInputTokens =
+    turn.uncachedInputTokens !== undefined && turn.uncachedInputTokens !== null
+      ? Math.max(0, Number(turn.uncachedInputTokens) || 0)
+      : Math.max(0, totalInputTokens - cacheReadTokens - cacheWriteTokens);
   const outputTokens = Math.max(0, Number(turn.outputTokens) || 0);
   const callCount = Math.max(1, Number(turn.callCount) || 1);
 

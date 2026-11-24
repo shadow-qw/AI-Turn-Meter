@@ -111,9 +111,18 @@ function activate(context) {
   statusItem.show();
   context.subscriptions.push(statusItem);
 
+  const POLL_CONNECTED_MS = 30_000;
+  const POLL_DISCONNECTED_MS = 5_000;
+  const SSE_REFRESH_DEBOUNCE_MS = 300;
+  const SSE_RECONNECT_MS = 3_000;
+
   let sseReq = null;
+  let sseGeneration = 0;
+  let sseConnected = false;
   let reconnectTimer = null;
+  let refreshDebounceTimer = null;
   let pollTimer = null;
+  let currentPollIntervalMs = 0;
   let disposed = false;
 
   function getConfig() {
@@ -159,18 +168,55 @@ function activate(context) {
     }
   }
 
+  function updatePollInterval() {
+    if (disposed) return;
+    const targetMs = sseConnected ? POLL_CONNECTED_MS : POLL_DISCONNECTED_MS;
+    if (pollTimer && currentPollIntervalMs === targetMs) return;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    currentPollIntervalMs = targetMs;
+    pollTimer = setInterval(() => refreshOnce().catch(() => {}), targetMs);
+  }
+
+  function scheduleDebouncedRefresh() {
+    if (disposed) return;
+    if (refreshDebounceTimer) clearTimeout(refreshDebounceTimer);
+    refreshDebounceTimer = setTimeout(() => {
+      refreshDebounceTimer = null;
+      if (!disposed) refreshOnce().catch(() => {});
+    }, SSE_REFRESH_DEBOUNCE_MS);
+  }
+
+  function handleSseDisconnect(gen) {
+    if (disposed || gen !== sseGeneration) return;
+    sseConnected = false;
+    updatePollInterval();
+    scheduleReconnect(gen);
+  }
+
   function connectSse() {
     if (disposed) return;
+    const gen = ++sseGeneration;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    sseConnected = false;
+    updatePollInterval();
     if (sseReq) {
-      try {
-        sseReq.destroy();
-      } catch {}
+      const prevReq = sseReq;
       sseReq = null;
+      try {
+        prevReq.destroy();
+      } catch {}
     }
     const { baseUrl } = getConfig();
     try {
       const parsed = new URL(`${baseUrl}/events`);
-      sseReq = http.get(
+      let responseReceived = false;
+      const req = http.get(
         {
           hostname: parsed.hostname,
           port: parsed.port,
@@ -178,39 +224,58 @@ function activate(context) {
           headers: authHeaders(),
         },
         (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          scheduleReconnect();
-          return;
-        }
-        let buf = '';
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => {
-          buf += chunk;
-          const parts = buf.split('\n\n');
-          buf = parts.pop() || '';
-          for (const part of parts) {
-            if (part.includes('event: state') || part.includes('event: turn')) {
-              refreshOnce().catch(() => {});
-            }
+          responseReceived = true;
+          if (disposed || gen !== sseGeneration) {
+            res.resume();
+            return;
           }
-        });
-        res.on('end', scheduleReconnect);
-        res.on('error', scheduleReconnect);
+          if (res.statusCode !== 200) {
+            res.resume();
+            handleSseDisconnect(gen);
+            return;
+          }
+          sseConnected = true;
+          updatePollInterval();
+          let buf = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => {
+            if (disposed || gen !== sseGeneration) return;
+            buf += chunk;
+            const parts = buf.split('\n\n');
+            buf = parts.pop() || '';
+            let shouldRefresh = false;
+            for (const part of parts) {
+              if (part.includes('event: state') || part.includes('event: turn')) {
+                shouldRefresh = true;
+              }
+            }
+            if (shouldRefresh) {
+              scheduleDebouncedRefresh();
+            }
+          });
+          res.on('end', () => handleSseDisconnect(gen));
+          res.on('close', () => handleSseDisconnect(gen));
+          res.on('error', () => handleSseDisconnect(gen));
+        }
+      );
+      sseReq = req;
+      req.on('error', () => handleSseDisconnect(gen));
+      req.on('close', () => {
+        if (!responseReceived) handleSseDisconnect(gen);
       });
-      sseReq.on('error', scheduleReconnect);
     } catch {
-      scheduleReconnect();
+      handleSseDisconnect(gen);
     }
   }
 
-  function scheduleReconnect() {
-    if (disposed || reconnectTimer) return;
+  function scheduleReconnect(gen) {
+    if (disposed || gen !== sseGeneration || reconnectTimer) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
+      if (disposed || gen !== sseGeneration) return;
       refreshOnce().catch(() => {});
       connectSse();
-    }, 3000);
+    }, SSE_RECONNECT_MS);
   }
 
   context.subscriptions.push(
@@ -222,8 +287,11 @@ function activate(context) {
       try {
         const qs = new URLSearchParams({ limit: '15' });
         if (tool) qs.set('tool', tool);
+        qs.set('excludeCloud', '1');
         const data = await httpGetJson(`${baseUrl}/v1/turns?${qs.toString()}`);
-        const turns = data.turns || [];
+        const turns = (Array.isArray(data.turns) ? data.turns : []).filter(
+          (t) => t && t.host !== 'cursor-cloud'
+        );
         if (turns.length === 0) {
           vscode.window.showInformationMessage('AI Turn Meter: 暂无记录，等待新一轮对话完成。');
           return;
@@ -254,16 +322,28 @@ function activate(context) {
 
   refreshOnce().catch(() => {});
   connectSse();
-  pollTimer = setInterval(() => refreshOnce().catch(() => {}), 5000);
 
   context.subscriptions.push({
     dispose() {
       disposed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (pollTimer) clearInterval(pollTimer);
+      sseGeneration += 1;
+      sseConnected = false;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (refreshDebounceTimer) {
+        clearTimeout(refreshDebounceTimer);
+        refreshDebounceTimer = null;
+      }
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
       try {
         sseReq?.destroy();
       } catch {}
+      sseReq = null;
     },
   });
 }

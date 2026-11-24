@@ -133,6 +133,14 @@ struct UsageSummaryTabView: View {
                   summaryCol(title: "输出", value: MeterFormat.tokens(data.totals.outputTokens))
                   summaryCol(title: "今日", value: MeterFormat.usd(data.today.estimatedCostUsd))
                 }
+
+                if data.totals.thinkingTokens > 0 {
+                  Divider()
+                  thinkingRatioBlock(
+                    thinkingTokens: data.totals.thinkingTokens,
+                    outputTokens: data.totals.outputTokens
+                  )
+                }
               }
               .padding(14)
             }
@@ -274,11 +282,15 @@ struct UsageSummaryTabView: View {
                     }
                   }
                 case "project":
-                  let projs = data.byProject ?? []
-                  if projs.isEmpty {
-                    emptyTip("暂无项目记录")
-                  } else {
-                    ForEach(Array(projs.enumerated()), id: \.element.id) { idx, row in
+                  let workspaces = data.byWorkspace ?? []
+                  let legacyProjects = data.byProject ?? []
+                  if !workspaces.isEmpty {
+                    ForEach(Array(workspaces.enumerated()), id: \.element.id) { idx, row in
+                      if idx > 0 { Divider() }
+                      workspaceRow(row)
+                    }
+                  } else if !legacyProjects.isEmpty {
+                    ForEach(Array(legacyProjects.enumerated()), id: \.element.id) { idx, row in
                       if idx > 0 { Divider() }
                       breakdownRow(
                         title: row.name,
@@ -287,6 +299,8 @@ struct UsageSummaryTabView: View {
                         costText: MeterFormat.usd(row.estimatedCostUsd)
                       )
                     }
+                  } else {
+                    emptyTip("暂无项目记录")
                   }
                 case "daily":
                   DailyReceiptSectionView(vm: vm)
@@ -296,9 +310,15 @@ struct UsageSummaryTabView: View {
                   } else {
                     ForEach(Array(data.byModel.enumerated()), id: \.element.id) { idx, row in
                       if idx > 0 { Divider() }
+                      let thinkingPart: String = {
+                        guard let think = row.thinkingTokens, think > 0 else { return "" }
+                        let denom = max(row.outputTokens, think)
+                        let pct = denom > 0 ? (Double(think) / Double(denom)) * 100.0 : 0
+                        return " · 思考 \(MeterFormat.tokens(think)) (\(MeterFormat.pct(pct)))"
+                      }()
                       breakdownRow(
                         title: row.model,
-                        subtitle: "\(row.toolLabel) · \(row.turnCount) 轮 · \(MeterFormat.tokens(row.totalTokens))",
+                        subtitle: "\(row.toolLabel) · \(row.turnCount) 轮 · \(MeterFormat.tokens(row.totalTokens))\(thinkingPart)",
                         share: row.sharePct / 100.0,
                         costText: row.priced ? MeterFormat.usd(row.estimatedCostUsd) : "未定价"
                       )
@@ -307,6 +327,30 @@ struct UsageSummaryTabView: View {
                 }
               }
               .padding(14)
+            }
+
+            // Workspace / Project Spend Ranking Card (byWorkspace)
+            if vm.usageGroupMode != "project", let workspaces = data.byWorkspace, !workspaces.isEmpty {
+              let topWorkspaces = Array(workspaces.prefix(10))
+              SettingsGroupCard {
+                VStack(alignment: .leading, spacing: 10) {
+                  HStack {
+                    Text("项目消耗排行")
+                      .font(.system(size: 12.5, weight: .semibold))
+                      .foregroundColor(.secondary)
+                    Spacer()
+                    Text("Top \(topWorkspaces.count) 工作区")
+                      .font(.system(size: 10.5))
+                      .foregroundColor(.secondary)
+                  }
+
+                  ForEach(Array(topWorkspaces.enumerated()), id: \.element.id) { idx, row in
+                    if idx > 0 { Divider() }
+                    workspaceRow(row)
+                  }
+                }
+                .padding(14)
+              }
             }
 
             // External Provider Plugin Cards (kept separate from local USD token estimates)
@@ -490,6 +534,115 @@ struct UsageSummaryTabView: View {
         .truncationMode(.middle)
     }
     .padding(.vertical, 6)
+  }
+
+  private func thinkingRatioBlock(thinkingTokens: Int, outputTokens: Int) -> some View {
+    let denom = max(outputTokens, thinkingTokens)
+    let ratio = denom > 0 ? min(1.0, max(0.0, Double(thinkingTokens) / Double(denom))) : 0.0
+    let pct = ratio * 100.0
+    let thinkingColor = Color(red: 0.56, green: 0.36, blue: 0.96)
+
+    return VStack(alignment: .leading, spacing: 6) {
+      HStack(spacing: 6) {
+        Circle()
+          .fill(thinkingColor)
+          .frame(width: 6, height: 6)
+        Text("思考 Token 占比")
+          .font(.system(size: 11, weight: .medium))
+          .foregroundColor(.secondary)
+        Text(MeterFormat.pct(pct))
+          .font(.system(size: 11.5, weight: .semibold))
+          .monospacedDigit()
+          .foregroundColor(.primary)
+        Spacer()
+        Text("思考 \(MeterFormat.tokens(thinkingTokens)) / 输出 \(MeterFormat.tokens(outputTokens))")
+          .font(.system(size: 11))
+          .monospacedDigit()
+          .foregroundColor(.secondary)
+      }
+
+      GeometryReader { geo in
+        ZStack(alignment: .leading) {
+          Capsule()
+            .fill(CodexBarPalette.tealBar.opacity(0.28))
+          if ratio > 0 {
+            Capsule()
+              .fill(thinkingColor)
+              .frame(width: max(4, geo.size.width * CGFloat(ratio)))
+          }
+        }
+      }
+      .frame(height: 5)
+    }
+  }
+
+  private func workspaceRow(_ row: UsageWorkspaceRow) -> some View {
+    let share = min(1.0, max(0.0, row.sharePct / 100.0))
+    let tools = row.tools ?? []
+    let subtitleParts: [String] = {
+      var parts: [String] = ["\(row.turnCount) 轮", MeterFormat.tokens(row.totalTokens)]
+      if let think = row.thinkingTokens, think > 0 {
+        parts.append("思考 \(MeterFormat.tokens(think))")
+      }
+      if !row.workspacePath.isEmpty && row.workspacePath != row.workspaceName && row.workspacePath != "未关联工作区" {
+        parts.append(row.workspacePath)
+      }
+      return parts
+    }()
+
+    return VStack(alignment: .leading, spacing: 5) {
+      HStack(spacing: 6) {
+        Text(row.workspaceName)
+          .font(.system(size: 12, weight: .medium))
+          .lineLimit(1)
+          .truncationMode(.middle)
+
+        if !tools.isEmpty {
+          HStack(spacing: 4) {
+            ForEach(tools.prefix(4), id: \.self) { t in
+              Text(vm.toolShortTitle(for: t))
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundColor(vm.toolAccentColor(for: t))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(vm.toolAccentColor(for: t).opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            }
+          }
+        }
+
+        Spacer(minLength: 6)
+
+        Text(MeterFormat.pct(row.sharePct))
+          .font(.system(size: 10.5))
+          .monospacedDigit()
+          .foregroundColor(.secondary)
+
+        Text(MeterFormat.usd(row.estimatedCostUsd))
+          .font(.system(size: 12.5, weight: .semibold))
+          .monospacedDigit()
+      }
+
+      GeometryReader { geo in
+        ZStack(alignment: .leading) {
+          Capsule().fill(Color.primary.opacity(0.07))
+          if share > 0 {
+            Capsule()
+              .fill(CodexBarPalette.tealBar)
+              .frame(width: max(4, geo.size.width * CGFloat(share)))
+          }
+        }
+      }
+      .frame(height: 4)
+
+      Text(subtitleParts.joined(separator: " · "))
+        .font(.system(size: 10.5))
+        .foregroundColor(.secondary)
+        .monospacedDigit()
+        .lineLimit(1)
+        .truncationMode(.middle)
+    }
+    .padding(.vertical, 4)
   }
 
   private func emptyTip(_ msg: String) -> some View {

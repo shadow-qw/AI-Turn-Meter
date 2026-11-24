@@ -9,9 +9,11 @@ const execFileAsync = promisify(execFile);
 
 const PROXY_CACHE_TTL_MS = 15_000;
 let cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
+let inflightProxyPromise = null;
 
 export function resetNetProxyCacheForTests() {
   cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
+  inflightProxyPromise = null;
 }
 
 export function parseSystemProxyInfo(scutilOutput = '', env = process.env) {
@@ -82,23 +84,42 @@ export function resolveAppHelperBin() {
   return null;
 }
 
-export async function getProxyState(nowMs = Date.now()) {
-  if (process.env.AI_TURN_METER_DISABLE_NATIVE_NET === '1' || process.env.NODE_TEST_CONTEXT) {
+export async function getProxyState(nowMs = Date.now(), { runScutil = null } = {}) {
+  if (!runScutil && (process.env.AI_TURN_METER_DISABLE_NATIVE_NET === '1' || process.env.NODE_TEST_CONTEXT)) {
     return parseSystemProxyInfo('', process.env);
   }
   if (nowMs - cachedProxyState.checkedAt < PROXY_CACHE_TTL_MS) {
     return cachedProxyState;
   }
-  let scutilOut = '';
-  if (process.platform === 'darwin') {
-    try {
-      const { stdout } = await execFileAsync('/usr/sbin/scutil', ['--proxy'], { timeout: 1000 });
-      scutilOut = stdout || '';
-    } catch {}
+  if (inflightProxyPromise) {
+    return inflightProxyPromise;
   }
-  const parsed = parseSystemProxyInfo(scutilOut, process.env);
-  cachedProxyState = { checkedAt: nowMs, ...parsed };
-  return cachedProxyState;
+  let p;
+  p = (async () => {
+    let scutilOut = '';
+    if (typeof runScutil === 'function') {
+      try {
+        scutilOut = (await runScutil()) || '';
+      } catch {}
+    } else if (process.platform === 'darwin') {
+      try {
+        const { stdout } = await execFileAsync('/usr/sbin/scutil', ['--proxy'], { timeout: 1000 });
+        scutilOut = stdout || '';
+      } catch {}
+    }
+    const parsed = parseSystemProxyInfo(scutilOut, process.env);
+    const nextState = { checkedAt: nowMs, ...parsed };
+    if (inflightProxyPromise === p) {
+      cachedProxyState = nextState;
+    }
+    return nextState;
+  })().finally(() => {
+    if (inflightProxyPromise === p) {
+      inflightProxyPromise = null;
+    }
+  });
+  inflightProxyPromise = p;
+  return p;
 }
 
 export function runProcessWithStdin(bin, args, inputStr, timeoutMs) {
@@ -254,9 +275,9 @@ async function nativeUrlSessionFetchRaw(
   }
 }
 
-async function curlFetchRaw(
+export async function curlFetchRaw(
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, proxyUrl = null }
+  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, proxyUrl = null, redirect = 'follow' } = {}
 ) {
   const startedAt = Date.now();
   if (!existsSync('/usr/bin/curl')) {
@@ -265,6 +286,7 @@ async function curlFetchRaw(
       status: null,
       text: '',
       headers: {},
+      finalUrl: null,
       latencyMs: 0,
       errorKind: 'network',
       errorMessage: 'curl unavailable',
@@ -276,6 +298,7 @@ async function curlFetchRaw(
     const hdrFile = join(hdrTmpDir, 'headers.txt');
     const args = [
       '-sS',
+      ...(redirect !== 'manual' ? ['-L'] : []),
       '--max-time',
       String(Math.max(2, Math.ceil(timeoutMs / 1000))),
       '-X',
@@ -283,7 +306,7 @@ async function curlFetchRaw(
       '-D',
       hdrFile,
       '-w',
-      '\n__ATM_HTTP:%{http_code}',
+      '\n__ATM_HTTP:%{http_code}\n__ATM_URL:%{url_effective}',
     ];
     if (proxyUrl) {
       args.push('--proxy', proxyUrl);
@@ -312,6 +335,7 @@ async function curlFetchRaw(
         status: null,
         text: '',
         headers: respHeaders,
+        finalUrl: null,
         latencyMs,
         errorKind: 'network',
         errorMessage: res.error || 'curl error',
@@ -325,25 +349,32 @@ async function curlFetchRaw(
         status: null,
         text: res.stdout,
         headers: respHeaders,
+        finalUrl: null,
         latencyMs,
         errorKind: 'network',
         errorMessage: 'curl no status',
       };
     }
     const bodyOut = res.stdout.slice(0, idx);
-    const status = Number(res.stdout.slice(idx + marker.length).trim()) || null;
+    const trailer = res.stdout.slice(idx + marker.length);
+    const urlMarker = '\n__ATM_URL:';
+    const urlIdx = trailer.indexOf(urlMarker);
+    const statusStr = (urlIdx === -1 ? trailer : trailer.slice(0, urlIdx)).trim();
+    const finalUrl = urlIdx === -1 ? url : trailer.slice(urlIdx + urlMarker.length).trim() || url;
+    const status = Number(statusStr) || null;
     if (!status) {
       return {
         ok: false,
         status: null,
         text: bodyOut,
         headers: respHeaders,
+        finalUrl: null,
         latencyMs,
         errorKind: 'network',
         errorMessage: 'curl status 0',
       };
     }
-    return classifyHttpResult(status, bodyOut, respHeaders, latencyMs);
+    return { ...classifyHttpResult(status, bodyOut, respHeaders, latencyMs), finalUrl };
   } finally {
     if (hdrTmpDir) {
       try {
@@ -355,7 +386,17 @@ async function curlFetchRaw(
 
 export async function httpRequestRaw(
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, redirect = 'follow', fetchImpl = null } = {}
+  {
+    method = 'GET',
+    headers = {},
+    body = null,
+    timeoutMs = 8000,
+    redirect = 'follow',
+    fetchImpl = null,
+    _nativeHelperBin = undefined,
+    _proxyState = undefined,
+    _directFetch = null,
+  } = {}
 ) {
   const startedAt = Date.now();
   const bodyStr =
@@ -391,21 +432,39 @@ export async function httpRequestRaw(
     }
   }
 
-  const helperBin = resolveAppHelperBin();
-  const proxyState = await getProxyState();
+  const helperBin = _nativeHelperBin !== undefined ? _nativeHelperBin : resolveAppHelperBin();
+  const proxyState = _proxyState !== undefined ? _proxyState : await getProxyState();
+  const directFetch = typeof _directFetch === 'function' ? _directFetch : fetch;
 
   if (helperBin && proxyState.hasSystemProxy) {
-    return nativeUrlSessionFetchRaw(helperBin, url, {
+    const nativeRes = await nativeUrlSessionFetchRaw(helperBin, url, {
       method,
       headers,
       body: bodyStr ?? null,
       timeoutMs,
       redirect,
     });
+    if (nativeRes.status !== null) {
+      return nativeRes;
+    }
+    if (proxyState.fallbackProxyUrl) {
+      const curlRes = await curlFetchRaw(url, {
+        method,
+        headers,
+        body: bodyStr ?? null,
+        timeoutMs,
+        proxyUrl: proxyState.fallbackProxyUrl,
+        redirect,
+      });
+      if (curlRes.status !== null) {
+        return curlRes;
+      }
+    }
+    return nativeRes;
   }
 
   try {
-    const res = await fetch(url, {
+    const res = await directFetch(url, {
       method,
       headers,
       body: bodyStr,
@@ -420,23 +479,35 @@ export async function httpRequestRaw(
       finalUrl: typeof res.url === 'string' && res.url ? res.url : url,
     };
   } catch (err) {
+    let nativeErrRes = null;
     if (helperBin) {
-      return nativeUrlSessionFetchRaw(helperBin, url, {
+      const nativeRes = await nativeUrlSessionFetchRaw(helperBin, url, {
         method,
         headers,
         body: bodyStr ?? null,
         timeoutMs,
         redirect,
       });
+      if (nativeRes.status !== null) {
+        return nativeRes;
+      }
+      nativeErrRes = nativeRes;
     }
     if (proxyState.fallbackProxyUrl) {
-      return curlFetchRaw(url, {
+      const curlRes = await curlFetchRaw(url, {
         method,
         headers,
         body: bodyStr ?? null,
         timeoutMs,
         proxyUrl: proxyState.fallbackProxyUrl,
+        redirect,
       });
+      if (curlRes.status !== null || !nativeErrRes) {
+        return curlRes;
+      }
+    }
+    if (nativeErrRes) {
+      return nativeErrRes;
     }
     return {
       ok: false,

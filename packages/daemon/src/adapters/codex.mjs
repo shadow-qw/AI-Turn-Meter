@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { zstdDecompressSync } from 'node:zlib';
 
 const CODEX_OPENAI_MODEL_RE = /^(?:openai\/)?(?:gpt-|o1|o3|o4|codex-|chatgpt-)/i;
+const OPEN_TURN_FLUSH_MS = 120_000;
 
 /**
  * Return true when `model` is an OpenAI / Codex model rather than a third-party gateway proxy.
@@ -47,12 +48,13 @@ function mergeIntervalsMs(intervals) {
 }
 
 /**
- * Parse a Codex session rollout JSONL string into completed TurnRecord inputs.
+ * Parse a Codex session rollout JSONL string into completed TurnRecord inputs plus open-turn status.
  * @param {string} content
  * @param {string} filePath
  * @param {{ flushOpenTurns?: boolean, onlyOpenAiModels?: boolean }} [opts]
+ * @returns {{ turns: Array<object>, hasOpenTurns: boolean }}
  */
-export function parseCodexSessionContent(
+export function parseCodexSessionDetailed(
   content,
   filePath = '',
   { flushOpenTurns = false, onlyOpenAiModels = true } = {}
@@ -432,15 +434,63 @@ export function parseCodexSessionContent(
     }
   }
 
+  function canEmitTurn(t) {
+    if (!t || t.flushed) return false;
+    const effectiveModel = t.model !== 'unknown' ? t.model : currentModel;
+    if (onlyOpenAiModels && !isCodexOpenAiModel(effectiveModel)) {
+      return false;
+    }
+    if (t.calls.length > 0) {
+      const lastTurnUsage = [...t.calls].reverse().find((c) => c.turnUsage)?.turnUsage;
+      if (lastTurnUsage) {
+        return (Number(lastTurnUsage.input_tokens) || 0) > 0 || (Number(lastTurnUsage.output_tokens) || 0) > 0;
+      }
+      let inp = 0;
+      let out = 0;
+      for (const c of t.calls) {
+        if (!c.usage) continue;
+        inp += Number(c.usage.input_tokens) || 0;
+        out += Number(c.usage.output_tokens) || 0;
+      }
+      return inp > 0 || out > 0;
+    }
+    if (t.fallbackTurnUsage.calls > 0) {
+      return t.fallbackTurnUsage.input > 0 || t.fallbackTurnUsage.output > 0;
+    }
+    return false;
+  }
+
+  let hasOpenTurns = false;
   if (flushOpenTurns) {
     for (const t of turns.values()) {
       if (!t.flushed) {
         finalizeTurn(t, { completedAtMs: t.lastEventMs });
       }
     }
+  } else {
+    for (const t of turns.values()) {
+      if (canEmitTurn(t)) {
+        hasOpenTurns = true;
+        break;
+      }
+    }
   }
 
-  return completedTurns;
+  return { turns: completedTurns, hasOpenTurns };
+}
+
+/**
+ * Parse a Codex session rollout JSONL string into completed TurnRecord inputs.
+ * @param {string} content
+ * @param {string} filePath
+ * @param {{ flushOpenTurns?: boolean, onlyOpenAiModels?: boolean }} [opts]
+ */
+export function parseCodexSessionContent(
+  content,
+  filePath = '',
+  opts = {}
+) {
+  return parseCodexSessionDetailed(content, filePath, opts).turns;
 }
 
 function collectJsonlFiles(dir, out = [], maxFiles = Infinity) {
@@ -483,12 +533,13 @@ export class CodexAdapter {
           : null;
     this.isEnabled = isEnabled;
     this.fileMtimes = new Map();
+    this.pendingOpenFiles = new Map();
     this.watchers = [];
     this.timer = null;
     this.backfillTimer = null;
   }
 
-  scan({ maxRecentFiles = 30 } = {}) {
+  scan({ maxRecentFiles = 30, nowMs = Date.now() } = {}) {
     if (this.isEnabled && !this.isEnabled()) return [];
     const collectLimit = Number.isFinite(maxRecentFiles) ? Math.max(maxRecentFiles * 3, 90) : Infinity;
     const rawPaths = [];
@@ -497,7 +548,6 @@ export class CodexAdapter {
       collectJsonlFiles(this.archivedDir, rawPaths, collectLimit);
     }
 
-    const nowMs = Date.now();
     let files = rawPaths
       .map((fp) => {
         try {
@@ -510,19 +560,46 @@ export class CodexAdapter {
       .filter(Boolean)
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
     if (Number.isFinite(maxRecentFiles)) {
-      files = files.slice(0, maxRecentFiles);
+      const top = files.slice(0, maxRecentFiles);
+      if (this.pendingOpenFiles.size > 0) {
+        const topSet = new Set(top.map((f) => f.fp));
+        for (const item of files.slice(maxRecentFiles)) {
+          if (this.pendingOpenFiles.has(item.fp) && !topSet.has(item.fp)) {
+            top.push(item);
+            topSet.add(item.fp);
+          }
+        }
+        for (const fp of [...this.pendingOpenFiles.keys()]) {
+          if (topSet.has(fp)) continue;
+          try {
+            const st = statSync(fp);
+            top.push({ fp, mtimeMs: st.mtimeMs, sizeBytes: st.size });
+            topSet.add(fp);
+          } catch {
+            this.pendingOpenFiles.delete(fp);
+          }
+        }
+      }
+      files = top;
     }
     files.reverse();
 
     const changed = [];
     for (const { fp, mtimeMs, sizeBytes } of files) {
-      if (this.fileMtimes.get(fp) === mtimeMs) continue;
-      const cached = this.store.getIngestedFile?.(fp);
-      if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
-        this.fileMtimes.set(fp, mtimeMs);
-        continue;
+      const flushOpenTurns = fp.endsWith('.jsonl.zst') || nowMs - mtimeMs > OPEN_TURN_FLUSH_MS;
+      const pending = this.pendingOpenFiles.get(fp);
+      if (pending) {
+        const modified = pending.mtimeMs !== mtimeMs || pending.sizeBytes !== sizeBytes;
+        if (!modified && !flushOpenTurns) continue;
+      } else {
+        const mem = this.fileMtimes.get(fp);
+        if (mem && mem.mtimeMs === mtimeMs && mem.sizeBytes === sizeBytes) continue;
+        const cached = this.store.getIngestedFile?.(fp);
+        if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+          this.fileMtimes.set(fp, { mtimeMs, sizeBytes });
+          continue;
+        }
       }
-      this.fileMtimes.set(fp, mtimeMs);
       let content;
       try {
         if (fp.endsWith('.jsonl.zst')) {
@@ -533,13 +610,22 @@ export class CodexAdapter {
       } catch {
         continue;
       }
-      const flushOpenTurns = fp.endsWith('.jsonl.zst') || nowMs - mtimeMs > 120_000;
-      const turns = parseCodexSessionContent(content, fp, { flushOpenTurns, onlyOpenAiModels: true });
+      const { turns, hasOpenTurns } = parseCodexSessionDetailed(content, fp, {
+        flushOpenTurns,
+        onlyOpenAiModels: true,
+      });
       for (const t of turns) {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
       }
-      this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
+      if (hasOpenTurns && !flushOpenTurns) {
+        this.fileMtimes.delete(fp);
+        this.pendingOpenFiles.set(fp, { mtimeMs, sizeBytes });
+      } else {
+        this.pendingOpenFiles.delete(fp);
+        this.fileMtimes.set(fp, { mtimeMs, sizeBytes });
+        this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
+      }
     }
     if (changed.length > 0 && this.onTurns) {
       this.onTurns(changed);

@@ -1,6 +1,25 @@
 import AITurnMeterCore
 import Foundation
 
+private final class PipeDataBuffer: @unchecked Sendable {
+  private let lock = NSLock()
+  private var data = Data()
+
+  func append(_ chunk: Data) {
+    guard !chunk.isEmpty else { return }
+    lock.lock()
+    data.append(chunk)
+    lock.unlock()
+  }
+
+  func snapshot() -> Data {
+    lock.lock()
+    let copy = data
+    lock.unlock()
+    return copy
+  }
+}
+
 final class MeterRuntime: Sendable {
   let runtimeDir: String
   let nodeBin: String
@@ -43,19 +62,59 @@ final class MeterRuntime: Sendable {
       return CommandResult(exitCode: 1, stdout: "", stderr: error.localizedDescription)
     }
 
-    let group = DispatchGroup()
-    group.enter()
-    DispatchQueue.global().async {
-      proc.waitUntilExit()
-      group.leave()
+    let outHandle = outPipe.fileHandleForReading
+    let errHandle = errPipe.fileHandleForReading
+    let outBuffer = PipeDataBuffer()
+    let errBuffer = PipeDataBuffer()
+
+    let ioGroup = DispatchGroup()
+    ioGroup.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+      defer {
+        try? outHandle.close()
+        ioGroup.leave()
+      }
+      while let chunk = try? outHandle.read(upToCount: 65_536), !chunk.isEmpty {
+        outBuffer.append(chunk)
+      }
     }
-    if group.wait(timeout: .now() + timeoutSec) == .timedOut {
-      proc.terminate()
+
+    ioGroup.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+      defer {
+        try? errHandle.close()
+        ioGroup.leave()
+      }
+      while let chunk = try? errHandle.read(upToCount: 65_536), !chunk.isEmpty {
+        errBuffer.append(chunk)
+      }
+    }
+
+    let procGroup = DispatchGroup()
+    procGroup.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+      proc.waitUntilExit()
+      procGroup.leave()
+    }
+
+    if procGroup.wait(timeout: .now() + timeoutSec) == .timedOut {
+      if proc.isRunning {
+        proc.terminate()
+      }
+      if procGroup.wait(timeout: .now() + 0.5) == .timedOut && proc.isRunning {
+        kill(proc.processIdentifier, SIGKILL)
+        _ = procGroup.wait(timeout: .now() + 0.5)
+      }
+      _ = ioGroup.wait(timeout: .now() + 0.5)
       return CommandResult(exitCode: 124, stdout: "", stderr: "命令执行超时")
     }
 
-    let stdout = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    _ = ioGroup.wait(timeout: .now() + 2.0)
+
+    let stdoutData = outBuffer.snapshot()
+    let stderrData = errBuffer.snapshot()
+    let stdout = String(data: stdoutData, encoding: .utf8) ?? String(decoding: stdoutData, as: UTF8.self)
+    let stderr = String(data: stderrData, encoding: .utf8) ?? String(decoding: stderrData, as: UTF8.self)
     return CommandResult(exitCode: proc.terminationStatus, stdout: stdout, stderr: stderr)
   }
 

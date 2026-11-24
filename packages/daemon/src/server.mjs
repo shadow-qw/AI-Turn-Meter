@@ -4,7 +4,7 @@ import http from 'node:http';
 import { dirname, join } from 'node:path';
 import { URL } from 'node:url';
 import { CodexAdapter } from './adapters/codex.mjs';
-import { AntigravityAdapter } from './adapters/antigravity.mjs';
+import { AntigravityAdapter, loadAntigravitySessionTitles } from './adapters/antigravity.mjs';
 import { CodeBuddyAdapter } from './adapters/codebuddy.mjs';
 import { drainCursorSpool, processCursorHookPayload, syncCursorHistoryEvents } from './adapters/cursor.mjs';
 import { inspectAppsStatusAsync } from './apps.mjs';
@@ -120,11 +120,19 @@ function publicConfig(cfg) {
   };
 }
 
+function normalizeToolParam(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'all') return null;
+  return trimmed;
+}
+
 export function createMeterServer({
   port = Number(process.env.AI_TURN_METER_PORT || 47831),
   dbPath,
   stateDir,
   providersDir = null,
+  geminiRoot = undefined,
   authToken = null,
   requireAuthToken = true,
   enableWatchers = true,
@@ -132,6 +140,8 @@ export function createMeterServer({
   enableAntigravityRpc = true,
   enableQuotaProbe = enableWatchers,
   enableExternalProviders = true,
+  loadSessionTitles = loadAntigravitySessionTitles,
+  nowFn = () => Date.now(),
 } = {}) {
   const store = new TurnStore(dbPath);
   const effectiveDbPath = dbPath !== undefined ? dbPath : store.dbPath;
@@ -203,9 +213,9 @@ export function createMeterServer({
   let lastCursorSyncAtMs = 0;
 
   function triggerCursorHistorySync({ force = false } = {}) {
-    if (!enableQuotaProbe || config.tools.cursor === false) return null;
+    if (!enableQuotaProbe || !isToolEnabled('cursor')) return null;
     if (cursorSyncInflight) return cursorSyncInflight;
-    const now = Date.now();
+    const now = nowFn();
     const backfilled = store.getMeta?.('cursor_history_backfilled_v1') === '1';
     if (!force && backfilled && now - lastCursorSyncAtMs < 60_000) {
       return null;
@@ -222,6 +232,11 @@ export function createMeterServer({
     return cursorSyncInflight;
   }
 
+  function drainCursorSpoolIfEnabled() {
+    if (!isToolEnabled('cursor')) return [];
+    return drainCursorSpool(store, hookStateDir);
+  }
+
   const codexAdapter = new CodexAdapter({
     store,
     onTurns: onTurnsChanged,
@@ -230,9 +245,27 @@ export function createMeterServer({
   const antigravityAdapter = new AntigravityAdapter({
     store,
     onTurns: onTurnsChanged,
+    ...(geminiRoot !== undefined ? { geminiRoot } : {}),
     enableRpc: enableAntigravityRpc,
     isEnabled: () => isToolEnabled('antigravity'),
   });
+
+  let sessionTitlesCache = { atMs: 0, map: null };
+  function getSessionTitles(forceRefresh = false) {
+    const now = nowFn();
+    if (sessionTitlesCache.map) {
+      const ageMs = now - sessionTitlesCache.atMs;
+      if (!forceRefresh && ageMs < 15_000) {
+        return sessionTitlesCache.map;
+      }
+      if (forceRefresh && ageMs <= 3_000) {
+        return sessionTitlesCache.map;
+      }
+    }
+    const map = loadSessionTitles(antigravityAdapter.geminiRoot);
+    sessionTitlesCache = { atMs: now, map };
+    return map;
+  }
   const codeBuddyAdapter = new CodeBuddyAdapter({
     store,
     onTurns: onTurnsChanged,
@@ -448,9 +481,33 @@ export function createMeterServer({
 
     if (req.method === 'GET' && url.pathname === '/v1/turns') {
       const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 30));
-      const tool = url.searchParams.get('tool') || null;
+      const tool = normalizeToolParam(url.searchParams.get('tool'));
+      const rawExcludeCloud = (url.searchParams.get('excludeCloud') || '').trim().toLowerCase();
+      const excludeCloud = rawExcludeCloud === '1' || rawExcludeCloud === 'true';
+      const turns = store.getRecentTurns(
+        limit,
+        tool,
+        excludeCloud ? { excludeHosts: ['cursor-cloud'] } : undefined
+      );
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ turns: store.getRecentTurns(limit, tool) }));
+      res.end(JSON.stringify({ turns }));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/sessions') {
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 10));
+      const tool = normalizeToolParam(url.searchParams.get('tool'));
+      const forceRefresh = url.searchParams.get('refresh') === '1';
+      const sessionTitles = getSessionTitles(forceRefresh);
+      const sessions = store.getRecentSessions({
+        tool,
+        limit,
+        nowMs: nowFn(),
+        sessionTitles,
+        enabledTools: tool ? null : config.tools,
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ sessions }));
       return;
     }
 
@@ -462,13 +519,14 @@ export function createMeterServer({
           : rawDays
             ? Math.max(1, Math.round(Number(rawDays) || 7))
             : 7;
-      const tool = url.searchParams.get('tool') || null;
+      const tool = normalizeToolParam(url.searchParams.get('tool'));
       const forceRefresh = url.searchParams.get('refresh') === '1';
       if (forceRefresh) {
         triggerCursorHistorySync({ force: false });
       }
       const sendUsage = async () => {
-        const nowMs = Date.now();
+        const nowMs = nowFn();
+        const sessionTitles = getSessionTitles(forceRefresh);
         const [quotasByTool, externalData] = await Promise.all([
           enableQuotaProbe
             ? getAllQuotas(nowMs, {
@@ -487,26 +545,42 @@ export function createMeterServer({
                 .catch(() => null)
             : Promise.resolve(null),
         ]);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify(
-            store.getUsageSummary({
-              days,
-              tool,
-              nowMs,
-              quotasByTool,
-              enabledTools: config.tools,
-              externalData,
-            })
-          )
+        const usageBody = JSON.stringify(
+          store.getUsageSummary({
+            days,
+            tool,
+            nowMs,
+            quotasByTool,
+            enabledTools: config.tools,
+            externalData,
+            sessionTitles,
+          })
         );
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(usageBody);
       };
       sendUsage().catch(() => {
         if (!res.headersSent) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify(store.getUsageSummary({ days, tool, enabledTools: config.tools }))
-          );
+          try {
+            const fallbackBody = JSON.stringify(
+              store.getUsageSummary({
+                days,
+                tool,
+                nowMs: nowFn(),
+                enabledTools: config.tools,
+                sessionTitles: getSessionTitles(false),
+              })
+            );
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(fallbackBody);
+          } catch (err) {
+            if (!res.headersSent) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({ ok: false, error: err?.message || 'failed to compute usage summary' })
+              );
+            }
+          }
         }
       });
       return;
@@ -516,7 +590,7 @@ export function createMeterServer({
       try {
         const date = url.searchParams.get('date') || null;
         const scope = url.searchParams.get('scope') || 'day';
-        const tool = url.searchParams.get('tool') || null;
+        const tool = normalizeToolParam(url.searchParams.get('tool'));
         const groupBy = url.searchParams.get('groupBy') || 'model';
         const format = (url.searchParams.get('format') || 'json').toLowerCase();
         const theme = url.searchParams.get('theme') === 'dark' ? 'dark' : 'paper';
@@ -590,17 +664,24 @@ export function createMeterServer({
         res.end(JSON.stringify({ ok: false, error: 'missing id' }));
         return;
       }
-      const prevLen = (config.fingerprintEndpoints || []).length;
-      config.fingerprintEndpoints = (config.fingerprintEndpoints || []).filter((ep) => ep.id !== id);
-      persistConfig();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          ok: true,
-          deleted: config.fingerprintEndpoints.length < prevLen,
-          endpoints: config.fingerprintEndpoints.map(sanitizeEndpoint),
-        })
-      );
+      try {
+        const prevLen = (config.fingerprintEndpoints || []).length;
+        config.fingerprintEndpoints = (config.fingerprintEndpoints || []).filter((ep) => ep.id !== id);
+        persistConfig();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            deleted: config.fingerprintEndpoints.length < prevLen,
+            endpoints: config.fingerprintEndpoints.map(sanitizeEndpoint),
+          })
+        );
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err?.message || 'failed to delete endpoint' }));
+        }
+      }
       return;
     }
 
@@ -611,9 +692,16 @@ export function createMeterServer({
         res.end(JSON.stringify({ ok: false, error: 'missing id' }));
         return;
       }
-      const deleted = store.deleteFingerprintBaseline(id);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, deleted, baselines: store.listFingerprintBaselines() }));
+      try {
+        const deleted = store.deleteFingerprintBaseline(id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, deleted, baselines: store.listFingerprintBaselines() }));
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err?.message || 'failed to delete baseline' }));
+        }
+      }
       return;
     }
 
@@ -686,8 +774,17 @@ export function createMeterServer({
       });
       req.on('end', () => {
         if (aborted) return;
+        let payload;
         try {
-          const payload = body.trim() ? JSON.parse(body) : {};
+          payload = body.trim() ? JSON.parse(body) : {};
+        } catch {
+          if (!res.headersSent) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid json' }));
+          }
+          return;
+        }
+        try {
           if (url.pathname === '/v1/fingerprint/endpoints') {
             const baseUrl = typeof payload?.baseUrl === 'string' ? payload.baseUrl.trim() : '';
             const model = typeof payload?.model === 'string' ? payload.model.trim() : '';
@@ -1116,26 +1213,35 @@ export function createMeterServer({
                 else if (!was && now) cdpInjector.pushAll({ force: true, tools: [k] }).catch(() => {});
               }
             }
-            if (enableWatchers && config.enabled) {
+            if (config.enabled) {
               const becameEnabled = (k) => (!prevEnabled && config.tools[k] !== false) || (prevTools[k] === false && config.tools[k] !== false);
-              if (becameEnabled('codex')) {
-                try { codexAdapter.scan({ maxRecentFiles: 12 }); } catch {}
+              if (enableWatchers) {
+                if (becameEnabled('codex')) {
+                  try { codexAdapter.scan({ maxRecentFiles: 12 }); } catch {}
+                }
+                if (becameEnabled('antigravity')) {
+                  antigravityAdapter.scan({ maxRecentFiles: 8 }).catch(() => {});
+                }
+                if (becameEnabled('codebuddy')) {
+                  try { codeBuddyAdapter.scan({ maxRecent: 10 }); } catch {}
+                }
               }
-              if (becameEnabled('antigravity')) {
-                antigravityAdapter.scan({ maxRecentFiles: 8 }).catch(() => {});
-              }
-              if (becameEnabled('codebuddy')) {
-                try { codeBuddyAdapter.scan({ maxRecent: 10 }); } catch {}
+              if (becameEnabled('cursor')) {
+                const drained = drainCursorSpoolIfEnabled();
+                if (drained.length > 0) onTurnsChanged(drained);
               }
             }
             if (refreshQuota && enableQuotaProbe) {
-              getAllQuotas(Date.now(), {
+              getAllQuotas(nowFn(), {
                 forceRefresh: true,
                 cursorCookie: config.cursorCookie,
                 enabledTools: config.tools,
               }).catch(() => {});
               triggerCursorHistorySync({ force: true });
-            } else if (payload?.tools?.cursor === true) {
+            } else if (
+              isToolEnabled('cursor') &&
+              (payload?.tools?.cursor === true || (!prevEnabled && config.enabled))
+            ) {
               triggerCursorHistorySync({ force: false });
             }
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1151,6 +1257,11 @@ export function createMeterServer({
               res.end(JSON.stringify({ ok: false, error: 'invalid cursor hook event' }));
               return;
             }
+            if (!isToolEnabled('cursor')) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, ignored: true, reason: 'disabled' }));
+              return;
+            }
             turn = processCursorHookPayload(payload, hookStateDir ? { stateDir: hookStateDir } : undefined);
             if (!turn) {
               res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1163,13 +1274,20 @@ export function createMeterServer({
             res.end(JSON.stringify({ ok: false, error: 'invalid turn payload' }));
             return;
           }
+          if (!isToolEnabled(turn.tool)) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, ignored: true, reason: 'disabled' }));
+            return;
+          }
           const result = store.upsertTurn(turn);
           if (result.changed) onTurnsChanged([result.record]);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, record: result.record }));
-        } catch {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'invalid json' }));
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err?.message || 'internal server error' }));
+          }
         }
       });
       return;
@@ -1188,7 +1306,7 @@ export function createMeterServer({
       server.listen(port, '127.0.0.1', resolve);
     });
 
-    const spooled = drainCursorSpool(store, hookStateDir);
+    const spooled = drainCursorSpoolIfEnabled();
     if (spooled.length > 0) onTurnsChanged(spooled);
 
     if (enableWatchers) {
@@ -1196,7 +1314,7 @@ export function createMeterServer({
       await antigravityAdapter.start();
       codeBuddyAdapter.start();
       spoolTimer = setInterval(() => {
-        const drained = drainCursorSpool(store, hookStateDir);
+        const drained = drainCursorSpoolIfEnabled();
         if (drained.length > 0) onTurnsChanged(drained);
       }, 2500);
       spoolTimer.unref?.();
@@ -1256,5 +1374,6 @@ export function createMeterServer({
     codexAdapter,
     antigravityAdapter,
     codeBuddyAdapter,
+    triggerCursorHistorySync,
   };
 }

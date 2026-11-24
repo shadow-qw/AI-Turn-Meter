@@ -1030,6 +1030,10 @@ export class ExternalProviderRegistry {
       };
     }
 
+    if (!forceRefresh && this.inflight.has(meta.key)) {
+      return this.inflight.get(meta.key);
+    }
+
     const cached = this.resultCache.get(meta.key);
     if (!forceRefresh && cached && nowMs - cached.fetchedAtMs < meta.cacheTtlMs) {
       return {
@@ -1040,11 +1044,8 @@ export class ExternalProviderRegistry {
       };
     }
 
-    if (!forceRefresh && this.inflight.has(meta.key)) {
-      return this.inflight.get(meta.key);
-    }
-
-    const job = (async () => {
+    let p;
+    p = (async () => {
       try {
         const ctx = {
           nowMs,
@@ -1081,14 +1082,16 @@ export class ExternalProviderRegistry {
           card.billingSummary.periodCost !== null ||
           card.billingSummary.todayCost !== null;
 
-        this.resultCache.set(meta.key, {
-          fetchedAtMs: Date.now(),
-          card,
-          ok: ok && !errMsg,
-          error: errMsg,
-          lastGoodCard: hasUsefulData ? card : prev?.lastGoodCard || null,
-          lastGoodAtMs: hasUsefulData ? Date.now() : prev?.lastGoodAtMs || 0,
-        });
+        if (this.inflight.get(meta.key) === p) {
+          this.resultCache.set(meta.key, {
+            fetchedAtMs: Date.now(),
+            card,
+            ok: ok && !errMsg,
+            error: errMsg,
+            lastGoodCard: hasUsefulData ? card : prev?.lastGoodCard || null,
+            lastGoodAtMs: hasUsefulData ? Date.now() : prev?.lastGoodAtMs || 0,
+          });
+        }
 
         return { meta, ok: ok && !errMsg, error: errMsg, card };
       } catch (err) {
@@ -1101,32 +1104,38 @@ export class ExternalProviderRegistry {
             statusText: '缓存数据',
             quotaHint: prev.lastGoodCard.quotaHint || errMsg,
           };
-          this.resultCache.set(meta.key, {
-            ...prev,
-            fetchedAtMs: Date.now(),
-            card: staleCard,
-            ok: false,
-            error: errMsg,
-          });
+          if (this.inflight.get(meta.key) === p) {
+            this.resultCache.set(meta.key, {
+              ...prev,
+              fetchedAtMs: Date.now(),
+              card: staleCard,
+              ok: false,
+              error: errMsg,
+            });
+          }
           return { meta, ok: false, error: errMsg, card: staleCard };
         }
         const errCard = buildNormalizedCard(meta, {}, { nowMs, errorMessage: errMsg });
-        this.resultCache.set(meta.key, {
-          fetchedAtMs: Date.now(),
-          card: errCard,
-          ok: false,
-          error: errMsg,
-          lastGoodCard: prev?.lastGoodCard || null,
-          lastGoodAtMs: prev?.lastGoodAtMs || 0,
-        });
+        if (this.inflight.get(meta.key) === p) {
+          this.resultCache.set(meta.key, {
+            fetchedAtMs: Date.now(),
+            card: errCard,
+            ok: false,
+            error: errMsg,
+            lastGoodCard: prev?.lastGoodCard || null,
+            lastGoodAtMs: prev?.lastGoodAtMs || 0,
+          });
+        }
         return { meta, ok: false, error: errMsg, card: errCard };
       }
     })().finally(() => {
-      this.inflight.delete(meta.key);
+      if (this.inflight.get(meta.key) === p) {
+        this.inflight.delete(meta.key);
+      }
     });
 
-    this.inflight.set(meta.key, job);
-    return job;
+    this.inflight.set(meta.key, p);
+    return p;
   }
 
   async fetchAll({ nowMs = Date.now(), forceRefresh = false, enabledTools = null } = {}) {

@@ -817,15 +817,20 @@ export class CdpInlineInjector {
     this.runtimeSource = buildInjectedRuntimeSource();
   }
 
-  resolvePort(spec) {
+  resolvePort(spec, { listeningPorts = null, isListening = null } = {}) {
+    const checkPort = (p) => {
+      if (typeof isListening === 'function') return Boolean(isListening(p));
+      if (listeningPorts instanceof Set) return listeningPorts.has(p);
+      return true;
+    };
     if (spec.portFile && existsSync(spec.portFile)) {
       try {
         const lines = readFileSync(spec.portFile, 'utf8').trim().split(/\r?\n/);
         const port = Number(lines[0]);
-        if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
+        if (Number.isInteger(port) && port > 0 && port <= 65535 && checkPort(port)) return port;
       } catch {}
     }
-    if (typeof spec.port === 'number' && spec.port > 0 && spec.port <= 65535) {
+    if (typeof spec.port === 'number' && spec.port > 0 && spec.port <= 65535 && checkPort(spec.port)) {
       return spec.port;
     }
     return null;
@@ -847,12 +852,27 @@ export class CdpInlineInjector {
     }
   }
 
+  async findTargetsForSpec(spec) {
+    const primaryPort = this.resolvePort(spec);
+    if (!primaryPort) return [];
+    const primaryTargets = await this.findTargets(primaryPort);
+    if (primaryTargets.length > 0) return primaryTargets;
+    const fallbackPort =
+      typeof spec.port === 'number' && spec.port > 0 && spec.port <= 65535 ? spec.port : null;
+    if (fallbackPort && fallbackPort !== primaryPort) {
+      return this.findTargets(fallbackPort);
+    }
+    return [];
+  }
+
   evaluateOnTarget(wsUrl, expression) {
     return new Promise((resolve) => {
       let settled = false;
+      let timeout = null;
       const done = (val) => {
         if (settled) return;
         settled = true;
+        if (timeout) clearTimeout(timeout);
         resolve(val);
       };
       let ws;
@@ -861,7 +881,7 @@ export class CdpInlineInjector {
       } catch {
         return done(false);
       }
-      const timeout = setTimeout(() => {
+      timeout = setTimeout(() => {
         try {
           ws.close();
         } catch {}
@@ -869,28 +889,35 @@ export class CdpInlineInjector {
       }, 1400);
 
       ws.addEventListener('open', () => {
-        ws.send(
-          JSON.stringify({
-            id: 1,
-            method: 'Runtime.evaluate',
-            params: { expression, returnByValue: true },
-          })
-        );
+        try {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression, returnByValue: true },
+            })
+          );
+        } catch {
+          done(false);
+        }
       });
       ws.addEventListener('message', (ev) => {
         try {
           const msg = JSON.parse(String(ev.data));
           if (msg.id === 1) {
-            clearTimeout(timeout);
-            ws.close();
             done(!msg.error);
+            try {
+              ws.close();
+            } catch {}
           }
         } catch {
           // ignore
         }
       });
       ws.addEventListener('error', () => {
-        clearTimeout(timeout);
+        done(false);
+      });
+      ws.addEventListener('close', () => {
         done(false);
       });
     });
@@ -900,6 +927,20 @@ export class CdpInlineInjector {
     if (typeof this.shouldPushTool === 'function' && !this.shouldPushTool(spec.tool)) {
       return false;
     }
+
+    const targets = await this.findTargetsForSpec(spec);
+    const prefix = `${spec.tool}:`;
+    const activeKeys = new Set();
+    for (const target of targets) {
+      activeKeys.add(`${prefix}${target.id || target.webSocketDebuggerUrl}`);
+    }
+    for (const k of Array.from(this.lastPushedByTarget.keys())) {
+      if (k.startsWith(prefix) && !activeKeys.has(k)) {
+        this.lastPushedByTarget.delete(k);
+      }
+    }
+    if (targets.length === 0) return false;
+
     let turns = [];
     if (typeof this.getTurnsForTool === 'function') {
       turns = (this.getTurnsForTool(spec.tool) || []).filter(
@@ -915,21 +956,6 @@ export class CdpInlineInjector {
       .slice(0, 16)
       .map((t) => `${t.turnUid}:${t.completedAtMs}:${t.tps}:${t.totalInputTokens}:${t.replyPreview || ''}`)
       .join('|');
-
-    const port = this.resolvePort(spec);
-    if (!port) return false;
-    const targets = await this.findTargets(port);
-    const prefix = `${spec.tool}:`;
-    const activeKeys = new Set();
-    for (const target of targets) {
-      activeKeys.add(`${prefix}${target.id || target.webSocketDebuggerUrl}`);
-    }
-    for (const k of Array.from(this.lastPushedByTarget.keys())) {
-      if (k.startsWith(prefix) && !activeKeys.has(k)) {
-        this.lastPushedByTarget.delete(k);
-      }
-    }
-    if (targets.length === 0) return false;
 
     let payloadExpr = null;
     let anyOk = false;
@@ -961,9 +987,7 @@ export class CdpInlineInjector {
         this.lastPushedByTarget.delete(k);
       }
     }
-    const port = this.resolvePort(spec);
-    if (!port) return false;
-    const targets = await this.findTargets(port);
+    const targets = await this.findTargetsForSpec(spec);
     if (targets.length === 0) return false;
     const expr = 'if (typeof window.__aiTurnMeterCleanup === "function") { window.__aiTurnMeterCleanup(); } window.__aiTurnMeterVersion = 0;';
     await Promise.all(targets.map((t) => this.evaluateOnTarget(t.webSocketDebuggerUrl, expr)));

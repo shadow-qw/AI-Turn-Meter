@@ -205,12 +205,15 @@ ai-turn-meter status                 # 查看守护进程与四家 CDP / 最新�
 ai-turn-meter providers [import|remove] # 管理外部数据源插件（列表、导入 .mjs 或移除）
 ai-turn-meter cost [--days=7]        # 查看今日/本周/历史 Token 用量与 API 等效费用估算
 ai-turn-meter receipt [--date=...]   # 打印每日 AI 账单小票（支持 --scope=day|week|month --currency=both|usd|cny --rate=7 --theme=paper|dark --svg=out.svg）
-ai-turn-meter fingerprint [--mode=.] # 手动运行降智检测（passive|codex_protocol|quick|deep，支持 --target=codex|<id> --record-baseline）
-ai-turn-meter doctor                 # 诊断 Node、LaunchAgent、Cursor Hooks、VSIX 与 CDP 状态
+ai-turn-meter fingerprint [--mode=.] # 手动运行降智检测（one_click|passive|codex_protocol|manual_score|quick|deep，支持 --target=codex|<id> --record-baseline）
+ai-turn-meter doctor                 # 诊断 Node、LaunchAgent、Cursor Hooks、VSIX 与 CDP 状态（含版本一致性告警）
 ai-turn-meter install                # 注册 LaunchAgent、合并 Cursor Hooks、装入 VSIX 与 CLI 软链
 ai-turn-meter uninstall              # 清理 LaunchAgent、VSIX、Cursor Hooks 与 CLI 软链
 ai-turn-meter open <app|all>         # 带调试口拉起 codex | cursor | codebuddy | antigravity | all
 ai-turn-meter ssh-info [host]        # 输出 Remote-SSH 所需 RemoteForward 与远端 hooks.json 配置
+ai-turn-meter ssh-apply <host> [--remote] # 一键将 RemoteForward 写入本机 ~/.ssh/config（加 --remote 同步写远端 hooks.json）
+ai-turn-meter app-autostart <enable|disable|status> # 管理菜单栏应用开机自启（兼容 on|true / off|false）
+ai-turn-meter daemon [--port=47831]  # 在前台直接启动守护进程（另有 start-daemon / stop-daemon 管理 LaunchAgent）
 
 npm test                             # 运行 Node 单元测试（node --test tests/*.test.mjs）
 npm run test:swift                   # 运行 macOS Swift Core 单元测试（swift test）
@@ -226,17 +229,19 @@ npm run uninstall:all                # 等价于本地仓库运行 ai-turn-meter
 
 ### Daemon HTTP / SSE 接口（默认 `http://127.0.0.1:47831`）
 
-> 安全模型：守护进程仅监听回环地址，所有接口均校验 `Host` 并拒绝浏览器 `Origin` / 跨站 `Sec-Fetch-Site`；写入与敏感接口（`POST /v1/config`、`POST /v1/cursor/sync-local`、`/v1/fingerprint/*`、`POST /v1/ingest`）额外要求请求头携带 `~/.local/share/ai-turn-meter/daemon.token`（`X-ATM-Token`）；`POST /v1/ingest/cursor-hook` 豁免 Token 以便 Remote-SSH 转发上报，仍执行回环与事件白名单校验。
+> 安全模型：守护进程仅监听回环地址，所有接口均校验 `Host` 并拒绝浏览器 `Origin` / 跨站 `Sec-Fetch-Site`；写入与敏感接口（`POST /v1/config`、`POST /v1/cursor/sync-local`、`/v1/providers/*` 变更/认证接口：`POST /v1/providers/import`、`POST /v1/providers/reload`、`DELETE /v1/providers`、`POST / DELETE /v1/providers/auth`，以及 `/v1/fingerprint/*`、`POST /v1/ingest`）额外要求请求头携带 `~/.local/share/ai-turn-meter/daemon.token`（`X-ATM-Token`）；`POST /v1/ingest/cursor-hook` 豁免 Token 以便 Remote-SSH 转发上报，仍执行回环与事件白名单校验。
 
 - `GET /health`：健康检查（返回 `ok`、`pid`、`port`、`version`）
 - `GET /v1/apps`：各客户端安装状态、调试端口（5s 异步缓存）、外部数据源插件列表与最新轮次状态
-- `GET /v1/providers`、`POST /v1/providers/import`、`POST /v1/providers/reload` & `DELETE /v1/providers`：查看、校验导入、重载与移除本地外部数据源插件
+- `GET /v1/config` & `POST /v1/config`：读取与更新全局/单软件开关、内嵌胶囊开关及 Cursor 会话配置（写操作需 `X-ATM-Token`）
+- `GET /v1/providers`、`POST /v1/providers/import`、`POST /v1/providers/reload`、`DELETE /v1/providers` & `POST / DELETE /v1/providers/auth`：查看、校验导入、重载、移除外部数据源插件与管理插件认证凭证（变更与认证接口均受 `X-ATM-Token` 保护）
 - `GET /v1/state?limit=20`：最新全局状态与 `byTool` 摘要
-- `GET /v1/turns?limit=30&tool=`：按时间倒序的最近轮次列表
-- `GET /v1/usage?days=7&tool=`：多维度用量统计、费用估算与各软件剩余配额卡片
+- `GET /v1/turns?limit=30&tool=&excludeCloud=1`：按时间倒序的最近轮次列表（传 `excludeCloud=1` 可过滤 `cursor-cloud` 账单行）
+- `GET /v1/sessions?tool=&limit=10`：按 `(tool, session_id)` 聚合的最近会话列表（含标题、活跃状态、模型与 Token/费用汇总）
+- `GET /v1/usage?days=7&tool=`：多维度用量统计、费用估算、工作区排行（`byWorkspace`）、最近会话（`recentSessions`）与各软件剩余配额卡片
 - `GET /v1/receipt?date=&scope=day&groupBy=model&format=json|ascii|svg`：每日/周期 AI 账单数据、文本小票与矢量 SVG
 - `GET /v1/fingerprint/overview`：被动降智诊断、Codex 配置、自定义端点、基线与历史体检记录
-- `POST /v1/fingerprint/run`：手动触发一键体检（`one_click`）、被动诊断、Codex 路由核验、能力探针或单 Token 分布指纹
+- `POST /v1/fingerprint/run`：手动触发一键体检（`one_click`）、被动诊断（`passive`）、Codex 路由核验（`codex_protocol`）、私有客户端手动出题评分（`manual_score`）、能力探针（`quick`）或单 Token 分布指纹（`deep`）
 - `POST / DELETE /v1/fingerprint/endpoints` & `DELETE /v1/fingerprint/baselines`：自定义检测端点与参考基线管理
 - `GET /v1/match?tool=&workspace=&workspaceHash=`：IDE 窗口匹配查询（传 `tool` 时严格隔离）
 - `GET /events`：SSE 实时推送（`state` / `turn` 事件）

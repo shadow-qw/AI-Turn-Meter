@@ -22,7 +22,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
   private var cachedIconKey: IconCacheKey?
   private var cachedIconImage: NSImage?
   private var lastPopoverHeight: CGFloat = 0
+  private var didCreatePopover: Bool = false
   private lazy var popover: NSPopover = {
+    didCreatePopover = true
     let pop = NSPopover()
     pop.behavior = .transient
     pop.animates = true
@@ -105,6 +107,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
   }
 
+  var isPopoverShown: Bool {
+    didCreatePopover && popover.isShown
+  }
+
   @objc private func togglePopover(_ sender: AnyObject?) {
     if popover.isShown {
       closePopover()
@@ -124,12 +130,13 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       }
     }
     popover.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
+    NSApp.activate(ignoringOtherApps: true)
     popover.contentViewController?.view.window?.makeKey()
   }
 
   func closePopover() {
     CostHistoryFlyoutController.shared.hideImmediately()
-    if popover.isShown {
+    if didCreatePopover && popover.isShown {
       popover.performClose(nil)
     }
   }
@@ -257,6 +264,18 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     return (today.totalTokens, today.estimatedCostUsd, "$", false)
   }
 
+  private func resolvedBillingAmount(for card: CodexBarCardSnapshot) -> Double? {
+    guard let b = card.billingSummary else { return nil }
+    if vm.quotaDisplayMode == .used {
+      if let cost = b.periodCost { return cost }
+      if let limit = b.periodLimit, let rem = b.periodRemaining {
+        return max(0, limit - rem)
+      }
+      return nil
+    }
+    return b.periodRemaining
+  }
+
   private func compactMenuBarTitle() -> String {
     guard vm.isActiveOverall else { return "" }
     switch vm.menuBarDisplayMode {
@@ -284,7 +303,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       var parts: [String] = []
       for key in keys {
         guard vm.isToolEnabled(key), let card = vm.usageData?.cards?[key] else { continue }
-        let amount = card.billingSummary?.periodRemaining.map {
+        let amount = resolvedBillingAmount(for: card).map {
           MeterFormat.compactMoney($0, symbol: card.resolvedCurrencySymbol)
         }
         let pct = card.quotaWindows?.first.map {
@@ -330,7 +349,22 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
           let sym = card.resolvedCurrencySymbol
           if let firstWin = card.quotaWindows?.first {
             let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: firstWin.remainingPct).rounded())
-            let costPart = (card.billingSummary?.periodCost ?? card.days30.costUsd).map { " · \(MeterFormat.money($0, symbol: sym))" } ?? ""
+            let costPart: String = {
+              if vm.quotaDisplayMode == .used {
+                if let used = resolvedBillingAmount(for: card) ?? card.days30.costUsd {
+                  return " · \(MeterFormat.money(used, symbol: sym))"
+                }
+                return ""
+              } else {
+                if let rem = card.billingSummary?.periodRemaining {
+                  return " · \(MeterFormat.money(rem, symbol: sym))"
+                }
+                if let used = card.billingSummary?.periodCost ?? card.days30.costUsd {
+                  return " · 已用 \(MeterFormat.money(used, symbol: sym))"
+                }
+                return ""
+              }
+            }()
             lines.append("\(meta.name): \(firstWin.title) \(vm.quotaDisplayMode.verbLabel)\(pct)%\(costPart)")
           } else if let hint = card.quotaHint {
             lines.append("\(meta.name): \(hint)")

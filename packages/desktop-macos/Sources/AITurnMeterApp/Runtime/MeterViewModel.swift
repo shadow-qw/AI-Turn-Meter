@@ -23,9 +23,10 @@ final class MeterViewModel: ObservableObject {
     static let receiptUsdToCny = "atm.receiptUsdToCny.v1"
     static let receiptTheme = "atm.receiptTheme.v1"
     static let receiptHideProjects = "atm.receiptHideProjects.v1"
+    static let alertsEnabled = "atm.alertsEnabled.v1"
   }
 
-  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.29"
+  @Published var version: String = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.30"
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
@@ -91,6 +92,7 @@ final class MeterViewModel: ObservableObject {
   }()
   @Published var hideDockIcon: Bool = UserDefaults.standard.bool(forKey: PrefKey.hideDockIcon)
   @Published var showRecentWindowsInMenu: Bool = UserDefaults.standard.bool(forKey: PrefKey.showRecentWindowsInMenu)
+  @Published var alertsEnabled: Bool = UserDefaults.standard.object(forKey: PrefKey.alertsEnabled) as? Bool ?? true
   @Published var launchAtLogin: Bool = FileManager.default.fileExists(
     atPath: (NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents/com.local.ai-turn-meter.app.plist")
   )
@@ -116,7 +118,12 @@ final class MeterViewModel: ObservableObject {
   @Published var receiptData: ReceiptDataResponse? = nil
   @Published var receiptLoading: Bool = false
   @Published var receiptError: String? = nil
-  @Published var receiptDate: String = MeterFormat.makeIsoDayFormatter().string(from: Date())
+  @Published var receiptDate: String = MeterFormat.makeIsoDayFormatter().string(from: Date()) {
+    didSet {
+      guard !isUpdatingReceiptDateAutomatically else { return }
+      isReceiptDateAutoToday = (receiptDate == Self.currentIsoDayString())
+    }
+  }
   @Published var receiptScope: String = "day"
   @Published var receiptGroupBy: String = "model"
   @Published var receiptCurrencyMode: String = UserDefaults.standard.string(forKey: PrefKey.receiptCurrencyMode) ?? "both"
@@ -172,12 +179,19 @@ final class MeterViewModel: ObservableObject {
 
   private var pollTimer: Timer?
   private let sseClient = DaemonSSEClient()
+  private let alertManager = QuotaAlertManager()
   private var sseConnected: Bool = false
   private var sseTurnRefreshWorkItem: DispatchWorkItem?
   private var didBootstrap = false
   private var didTryRestoreWebCookie = false
   private var hasStarted = false
   private var lastUsageRefreshAt: Date = .distantPast
+  private var isReceiptDateAutoToday: Bool = true
+  private var isUpdatingReceiptDateAutomatically: Bool = false
+  private var usageFetchSeq: UInt64 = 0
+  private var turnsFetchSeq: UInt64 = 0
+  private var receiptFetchSeq: UInt64 = 0
+  private var sshSnippetSeq: UInt64 = 0
 
   func isExternalProvider(_ key: String) -> Bool {
     key.hasPrefix("ext:")
@@ -734,6 +748,35 @@ export default {
     UserDefaults.standard.set(value, forKey: PrefKey.showRecentWindowsInMenu)
   }
 
+  func setAlertsEnabled(_ value: Bool) {
+    alertsEnabled = value
+    alertManager.enabled = value
+    onPreferencesChanged?()
+  }
+
+  private func evaluateAlerts() {
+    var names: [String: String] = [:]
+    for key in orderedAllProviderKeys {
+      names[key] = displayTitle(for: key)
+    }
+    for key in apps.keys where names[key] == nil {
+      names[key] = displayTitle(for: key)
+    }
+    if let cards = usageData?.cards {
+      for key in cards.keys where key != "all" && names[key] == nil {
+        names[key] = displayTitle(for: key)
+      }
+    }
+    let enabledTools = Set(orderedAllProviderKeys.filter { isToolEnabled($0) })
+    alertManager.evaluate(
+      usage: usageData,
+      apps: apps,
+      displayNames: names,
+      masterEnabled: masterEnabled,
+      enabledTools: enabledTools
+    )
+  }
+
   func openSettingsPane(_ pane: SettingsPane) {
     settingsPane = pane
     switch pane {
@@ -757,6 +800,10 @@ export default {
   func start() {
     guard !hasStarted else { return }
     hasStarted = true
+    alertManager.enabled = alertsEnabled
+    if alertsEnabled {
+      alertManager.requestPermissionIfNeeded()
+    }
     knownSshHosts = MeterRuntime.readSshConfigHosts()
     configureSSE()
     sseClient.start(port: daemonPort)
@@ -802,15 +849,33 @@ export default {
     }
   }
 
+  private var hasVisibleAppWindow: Bool {
+    NSApp.windows.contains { win in
+      guard win.isVisible, !win.isMiniaturized, win.alphaValue > 0.01 else { return false }
+      let className = NSStringFromClass(type(of: win))
+      if className.contains("Popover") {
+        return true
+      }
+      if className.contains("StatusBar") || win.level == .statusBar {
+        return false
+      }
+      if className.contains("ToolTip") {
+        return false
+      }
+      return true
+    }
+  }
+
   private func scheduleSseTurnRefresh() {
     sseTurnRefreshWorkItem?.cancel()
     let item = DispatchWorkItem { [weak self] in
       MainActor.assumeIsolated {
         guard let self = self else { return }
-        if NSApp.windows.contains(where: { $0.isVisible }) || self.showMenuBarExtra {
+        let hasVisibleWindow = self.hasVisibleAppWindow
+        if hasVisibleWindow || self.showMenuBarExtra {
           self.fetchUsageSummary(silent: true)
         }
-        if self.activeTab == .turns && NSApp.windows.contains(where: { $0.isVisible }) {
+        if self.activeTab == .turns && hasVisibleWindow {
           self.fetchRecentTurns(silent: true)
         }
       }
@@ -821,10 +886,14 @@ export default {
 
   func pollTick() {
     guard !busy else { return }
-    if NSApp.windows.contains(where: { $0.isVisible }) {
+    let receiptRolledOver = syncReceiptDateForCurrentDayIfNeeded()
+    if hasVisibleAppWindow {
       fetchAppsStatusHttp()
-      if Date().timeIntervalSince(lastUsageRefreshAt) >= 30 {
+      if Date().timeIntervalSince(lastUsageRefreshAt) >= 30 || receiptRolledOver {
         fetchUsageSummary(silent: true)
+      }
+      if receiptRolledOver && receiptData != nil {
+        fetchReceipt(silent: true)
       }
       if activeTab == .turns && !sseConnected {
         fetchRecentTurns(silent: true)
@@ -833,7 +902,7 @@ export default {
       if !sseConnected {
         fetchDaemonStateLight()
       }
-      if Date().timeIntervalSince(lastUsageRefreshAt) >= 45 {
+      if Date().timeIntervalSince(lastUsageRefreshAt) >= 45 || receiptRolledOver {
         fetchUsageSummary(silent: true)
       }
     }
@@ -1030,20 +1099,24 @@ export default {
       }
       self.apps = nextApps
     }
+    self.evaluateAlerts()
   }
 
   func fetchUsageSummary(silent: Bool = false, forceRefresh: Bool = false) {
-    let toolQs = usageToolFilter == "all" ? "" : "&tool=\(usageToolFilter)"
+    let toolFilter = usageToolFilter
+    let toolQs = toolFilter == "all" ? "" : "&tool=\(toolFilter)"
     let refreshQs = forceRefresh ? "&refresh=1" : ""
     guard let url = URL(
       string: "http://127.0.0.1:\(daemonPort)/v1/usage?days=\(usageDays)\(toolQs)\(refreshQs)"
     ) else { return }
+    usageFetchSeq &+= 1
+    let seq = usageFetchSeq
     if !silent { usageLoading = true }
     let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 20)
 
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
       DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
+        guard let self = self, self.usageFetchSeq == seq else { return }
         self.usageLoading = false
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let data = data,
@@ -1059,9 +1132,10 @@ export default {
         }
         self.lastSyncedAt = Date()
         self.lastUsageRefreshAt = Date()
-        if self.usageToolFilter == "all" {
+        if toolFilter == "all" && self.usageToolFilter == "all" {
           self.todaySummary = parsed.today
         }
+        self.evaluateAlerts()
         self.onStateUpdated?()
       }
     }.resume()
@@ -1070,12 +1144,14 @@ export default {
   func fetchRecentTurns(silent: Bool = false) {
     let qs = recentTurnsFilterTool == "all" ? "limit=80" : "limit=80&tool=\(recentTurnsFilterTool)"
     guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/turns?\(qs)") else { return }
+    turnsFetchSeq &+= 1
+    let seq = turnsFetchSeq
     if !silent { recentTurnsLoading = true }
     let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 4)
 
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
       DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
+        guard let self = self, self.turnsFetchSeq == seq else { return }
         self.recentTurnsLoading = false
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let data = data,
@@ -1117,6 +1193,7 @@ export default {
       }
       updateRecentTurnsCache(state.recent)
     }
+    self.evaluateAlerts()
     self.onStateUpdated?()
   }
 
@@ -1430,6 +1507,22 @@ export default {
     }
   }
 
+  private static func currentIsoDayString(now: Date = Date()) -> String {
+    MeterFormat.makeIsoDayFormatter().string(from: now)
+  }
+
+  @discardableResult
+  private func syncReceiptDateForCurrentDayIfNeeded(now: Date = Date()) -> Bool {
+    guard isReceiptDateAutoToday else { return false }
+    let todayStr = Self.currentIsoDayString(now: now)
+    guard receiptDate != todayStr else { return false }
+    isUpdatingReceiptDateAutomatically = true
+    receiptDate = todayStr
+    isUpdatingReceiptDateAutomatically = false
+    receiptPunchlineIndex = 0
+    return true
+  }
+
   func shiftReceiptDate(byDays delta: Int) {
     let f = MeterFormat.makeIsoDayFormatter()
     let cal = Calendar(identifier: .gregorian)
@@ -1444,13 +1537,17 @@ export default {
   }
 
   func selectReceiptToday() {
-    let f = MeterFormat.makeIsoDayFormatter()
-    receiptDate = f.string(from: Date())
+    let todayStr = Self.currentIsoDayString()
+    isReceiptDateAutoToday = true
+    isUpdatingReceiptDateAutomatically = true
+    receiptDate = todayStr
+    isUpdatingReceiptDateAutomatically = false
     receiptPunchlineIndex = 0
     fetchReceipt()
   }
 
   func fetchReceipt(silent: Bool = false) {
+    syncReceiptDateForCurrentDayIfNeeded()
     var comps = URLComponents(string: "http://127.0.0.1:\(daemonPort)/v1/receipt")
     var q: [URLQueryItem] = [
       URLQueryItem(name: "date", value: receiptDate),
@@ -1462,6 +1559,8 @@ export default {
     }
     comps?.queryItems = q
     guard let url = comps?.url else { return }
+    receiptFetchSeq &+= 1
+    let seq = receiptFetchSeq
     if !silent {
       receiptLoading = true
       receiptError = nil
@@ -1470,7 +1569,7 @@ export default {
 
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
+        guard let self = self, self.receiptFetchSeq == seq else { return }
         self.receiptLoading = false
         if let err = err {
           self.receiptError = "无法连接本地统计服务（\(err.localizedDescription)）"
@@ -1758,11 +1857,23 @@ export default {
   func generateSshSnippet() {
     let targetHost = sshHost.trimmingCharacters(in: .whitespacesAndNewlines)
     let args = targetHost.isEmpty ? ["ssh-info"] : ["ssh-info", targetHost]
-    let res = runtime.runCli(args, timeoutSec: 5)
-    let out = res.exitCode == 0 ? res.stdout : res.stderr
-    sshPreview = out
-    let lines = out.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
-    sshOneLiner = lines.last(where: { $0.hasPrefix("ssh ") }) ?? ""
+    sshSnippetSeq &+= 1
+    let seq = sshSnippetSeq
+    let rt = runtime
+    sshPreview = "正在生成配置预览…"
+    sshOneLiner = ""
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let res = rt.runCli(args, timeoutSec: 5)
+      let out = res.exitCode == 0 ? res.stdout : res.stderr
+      let lines = out.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+      let oneLiner = lines.last(where: { $0.hasPrefix("ssh ") }) ?? ""
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.sshSnippetSeq == seq else { return }
+        self.sshPreview = out
+        self.sshOneLiner = oneLiner
+      }
+    }
   }
 
   func applySshConfig(includeRemote: Bool) {
@@ -1893,7 +2004,13 @@ export default {
           }
           if UpdateChecker.compareSemver(remoteVer, curVersion) > 0 {
             let dlUrl = "\(repoPrefix)/releases/download/\(rawTag)/AI-Turn-Meter-\(remoteVer)-arm64.dmg"
-            self.availableUpdate = UpdateReleaseInfo(version: remoteVer, downloadUrl: dlUrl, notes: "")
+            let sha256Url = "\(dlUrl).sha256"
+            self.availableUpdate = UpdateReleaseInfo(
+              version: remoteVer,
+              downloadUrl: dlUrl,
+              notes: "",
+              sha256Url: sha256Url
+            )
             self.updateStatusText = "发现新版本 v\(remoteVer)（当前 v\(curVersion)）"
           } else {
             self.updateStatusText = "当前已是最新版本（v\(curVersion)）。"
@@ -1969,49 +2086,55 @@ export default {
         return
       }
 
-      let fileSize = (try? fm.attributesOfItem(atPath: dest.path)[.size] as? NSNumber)?.int64Value ?? 0
-      guard fileSize >= 1_000_000 else {
-        try? fm.removeItem(at: dest)
-        DispatchQueue.main.async {
-          self.updateDownloading = false
-          self.updateStatusText = "下载文件异常（大小不足 1 MB），已中止更新。"
-        }
-        return
-      }
-
       let urlName = URL(string: info.downloadUrl)?.lastPathComponent ?? ""
       let assetFilename = urlName.isEmpty ? dmgFilename : urlName
-      if let shaErr = Self.verifyDownloadedDmgSha256IfAvailable(dest: dest, filename: assetFilename, info: info) {
-        try? fm.removeItem(at: dest)
-        DispatchQueue.main.async {
-          self.updateDownloading = false
-          self.updateStatusText = shaErr
-        }
-        return
-      }
 
-      if canSelfReplace {
-        DispatchQueue.main.async {
-          self.updateStatusText = "正在安装 v\(info.version) 并准备重启…"
-        }
-        if let errMsg = Self.installAppUpdateAndRelaunch(dmgUrl: dest, targetAppUrl: bundleUrl) {
+      // Move post-download verification & installation off URLSession.shared's serial delegate queue
+      // so checksum HTTP requests and hdiutil/ditto never deadlock or stall shared network callbacks.
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        guard let self = self else { return }
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? NSNumber)?.int64Value ?? 0
+        guard fileSize >= 1_000_000 else {
+          try? FileManager.default.removeItem(at: dest)
           DispatchQueue.main.async {
             self.updateDownloading = false
-            self.updateStatusText = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
-            NSWorkspace.shared.open(dest)
+            self.updateStatusText = "下载文件异常（大小不足 1 MB），已中止更新。"
           }
-        } else {
-          DispatchQueue.main.async {
-            self.terminateForUpdateRelaunch()
-          }
+          return
         }
-        return
-      }
 
-      DispatchQueue.main.async {
-        self.updateDownloading = false
-        self.updateStatusText = "已下载到「下载」文件夹并打开安装包，拖入「应用程序」覆盖即可。"
-        NSWorkspace.shared.open(dest)
+        if let shaErr = Self.verifyDownloadedDmgSha256IfAvailable(dest: dest, filename: assetFilename, info: info) {
+          try? FileManager.default.removeItem(at: dest)
+          DispatchQueue.main.async {
+            self.updateDownloading = false
+            self.updateStatusText = shaErr
+          }
+          return
+        }
+
+        if canSelfReplace {
+          DispatchQueue.main.async {
+            self.updateStatusText = "正在安装 v\(info.version) 并准备重启…"
+          }
+          if let errMsg = Self.installAppUpdateAndRelaunch(dmgUrl: dest, targetAppUrl: bundleUrl) {
+            DispatchQueue.main.async {
+              self.updateDownloading = false
+              self.updateStatusText = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
+              NSWorkspace.shared.open(dest)
+            }
+          } else {
+            DispatchQueue.main.async {
+              self.terminateForUpdateRelaunch()
+            }
+          }
+          return
+        }
+
+        DispatchQueue.main.async {
+          self.updateDownloading = false
+          self.updateStatusText = "已下载到「下载」文件夹并打开安装包，拖入「应用程序」覆盖即可。"
+          NSWorkspace.shared.open(dest)
+        }
       }
     }.resume()
   }
@@ -2030,18 +2153,28 @@ export default {
       guard let shaUrl = URL(string: shaUrlStr) else {
         return "无法获取或解析安装包 SHA-256 校验文件，已中止更新。"
       }
+      let config = URLSessionConfiguration.ephemeral
+      config.timeoutIntervalForRequest = 10
+      config.timeoutIntervalForResource = 12
+      let session = URLSession(configuration: config)
+      defer { session.finishTasksAndInvalidate() }
+
       let sem = DispatchSemaphore(value: 0)
       var fetchedText: String? = nil
       var req = URLRequest(url: shaUrl, timeoutInterval: 10)
       req.setValue("AI-Turn-Meter/\(info.version)", forHTTPHeaderField: "User-Agent")
-      URLSession.shared.dataTask(with: req) { data, resp, _ in
+      let task = session.dataTask(with: req) { data, resp, _ in
         if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
            let data = data {
           fetchedText = String(data: data, encoding: .utf8)
         }
         sem.signal()
-      }.resume()
-      _ = sem.wait(timeout: .now() + 12)
+      }
+      task.resume()
+      if sem.wait(timeout: .now() + 12) == .timedOut {
+        task.cancel()
+        return "获取安装包 SHA-256 校验文件超时，已中止更新。"
+      }
       if let text = fetchedText {
         expected = UpdateChecker.parseSha256Checksum(from: text, filename: filename)
       }
@@ -2109,19 +2242,67 @@ export default {
     try? fm.removeItem(at: dmgUrl)
 
     let pid = ProcessInfo.processInfo.processIdentifier
-    let script = """
+    let daemonPlistPath = (NSHomeDirectory() as NSString)
+      .appendingPathComponent("Library/LaunchAgents/com.local.ai-turn-meter.daemon.plist")
+    let script = #"""
+    target="${3%/}"
+    updating="${target}.updating"
+    backup="${target}.backup"
+    uid="$(/usr/bin/id -u)"
+    plist="$5"
+
     i=0
     while kill -0 "$1" 2>/dev/null && [ "$i" -lt 150 ]; do
       sleep 0.1
       i=$((i + 1))
     done
     sleep 0.2
-    rm -rf "$3" && /usr/bin/ditto "$2" "$3" && (/usr/bin/xattr -dr com.apple.quarantine "$3" >/dev/null 2>&1 || true) && /usr/bin/open -n "$3"
-    rm -rf "$4"
-    """
+
+    rm -rf "$updating"
+    if ! /usr/bin/ditto "$2" "$updating"; then
+      rm -rf "$updating" "$4"
+      exit 1
+    fi
+    /usr/bin/xattr -dr com.apple.quarantine "$updating" >/dev/null 2>&1 || true
+
+    /bin/launchctl bootout "gui/${uid}/com.local.ai-turn-meter.daemon" >/dev/null 2>&1 || \
+      ([ -n "$plist" ] && [ -f "$plist" ] && /bin/launchctl bootout "gui/${uid}" "$plist" >/dev/null 2>&1) || true
+    sleep 0.2
+
+    rm -rf "$backup"
+    if [ -e "$target" ]; then
+      if ! /bin/mv "$target" "$backup"; then
+        rm -rf "$updating" "$4"
+        if [ -n "$plist" ] && [ -f "$plist" ]; then
+          /bin/launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+        fi
+        exit 1
+      fi
+    fi
+
+    if ! /bin/mv "$updating" "$target"; then
+      if [ -e "$backup" ] && [ ! -e "$target" ]; then
+        /bin/mv "$backup" "$target" >/dev/null 2>&1 || true
+      fi
+      rm -rf "$updating" "$4"
+      if [ -n "$plist" ] && [ -f "$plist" ]; then
+        /bin/launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+      fi
+      exit 1
+    fi
+
+    rm -rf "$backup" "$4"
+    if [ -n "$plist" ] && [ -f "$plist" ]; then
+      /bin/launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+    fi
+    /usr/bin/open -n "$target"
+    """#
     let launcher = Process()
     launcher.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
-    launcher.arguments = ["/bin/zsh", "-c", script, "atm-updater", "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path]
+    launcher.arguments = [
+      "/bin/zsh", "-c", script, "atm-updater",
+      "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path, daemonPlistPath,
+    ]
     launcher.standardInput = FileHandle.nullDevice
     launcher.standardOutput = FileHandle.nullDevice
     launcher.standardError = FileHandle.nullDevice

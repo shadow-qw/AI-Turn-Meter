@@ -20,6 +20,9 @@ import { CodexAdapter, isCodexOpenAiModel, parseCodexSessionContent } from '../p
 import {
   AntigravityAdapter,
   buildAntigravitySpeedIndex,
+  buildLanguageServerEndpoints,
+  discoverAntigravityDaemonFiles,
+  parseAntigravityLanguageServerPsOutput,
   parseAntigravityTranscriptContent,
 } from '../packages/daemon/src/adapters/antigravity.mjs';
 import {
@@ -53,6 +56,7 @@ import { estimateTurnCost, resolveModelPricing } from '../packages/daemon/src/pr
 import {
   computeQuotaWindow,
   decryptCursorSafeStorageToken,
+  fetchAntigravityQuota,
   fetchCodexQuota,
   normalizeCodexRateWindows,
   parseCursorQuotaSummary,
@@ -2597,5 +2601,204 @@ test('normalizeCodexRateWindows & fetchCodexQuota align with CodexBar for weekly
     if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = prevCodexHome;
     rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('Antigravity offline transcript extracts model + e2e_minus_tools TPS, detects 2.34+ token hardening, and protects streaming_decode on rescan', async () => {
+  // 1. Offline transcript parsing (no RPC speedIndex)
+  const offlineTranscript = [
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-23T02:15:03Z' }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-23T02:15:03Z',
+      model: 'gemini-4-neon-high',
+      input_tokens: 24503,
+      cache_read_tokens: 0,
+      output_tokens: 356,
+      tool_calls: [{ name: 'run_command' }],
+    }),
+    JSON.stringify({ step_index: 2, type: 'GENERIC', status: 'DONE', created_at: '2026-11-23T02:15:10Z' }),
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-23T02:15:14Z',
+      model: 'gemini-4-neon-high',
+      input_tokens: 4894,
+      cache_read_tokens: 24504,
+      output_tokens: 303,
+      tool_calls: [{ name: 'read_file' }],
+    }),
+    JSON.stringify({ step_index: 4, type: 'GENERIC', status: 'DONE', created_at: '2026-11-23T02:15:22Z' }),
+    JSON.stringify({
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-23T02:15:25Z',
+      model: 'gemini-4-neon-high',
+      input_tokens: 2000,
+      cache_read_tokens: 28000,
+      output_tokens: 500,
+      tool_calls: [],
+    }),
+    // Simple single-step turn with cross-second duration (no tools -> e2e_turn)
+    JSON.stringify({ step_index: 6, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-23T02:20:00Z' }),
+    JSON.stringify({
+      step_index: 7,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-23T02:20:04Z',
+      model: 'gemini-4-argon-medium',
+      input_tokens: 1000,
+      cache_read_tokens: 0,
+      output_tokens: 200,
+      tool_calls: [],
+    }),
+  ].join('\n');
+
+  const turns = parseAntigravityTranscriptContent(offlineTranscript, { sessionId: 'sess-offline' });
+  assert.equal(turns.length, 2);
+
+  // Turn 0: tool wait = (14-10) + (25-22) = 7s; active = (10-3) + (22-14) = 15s; activeOut = 356 + 303 = 659
+  assert.equal(turns[0].model, 'gemini-4-neon-high');
+  assert.equal(turns[0].tpsMethod, 'e2e_minus_tools');
+  assert.equal(turns[0].modelActiveMs, 15000);
+  assert.equal(turns[0].tps, 43.9);
+  const priced0 = estimateTurnCost(turns[0]);
+  assert.equal(priced0.priced, true);
+  assert.ok(priced0.costUsd > 0);
+
+  // Turn 6: no tools, 4s e2e duration -> 200 / 4 = 50 tok/s (e2e_turn)
+  assert.equal(turns[1].model, 'gemini-4-argon-medium');
+  assert.equal(turns[1].tpsMethod, 'e2e_turn');
+  assert.equal(turns[1].tps, 50);
+
+  // 2. Process inspection for Antigravity 2.34+ (stdin token, no --csrf_token)
+  const ps234 = [
+    '71817 501 /Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --override_ide_name antigravity --override_ide_version 2.34.0 --host_bridge_url=http://127.0.0.1:51223 --read_host_bridge_token_from_stdin',
+  ].join('\n');
+  const inspected234 = await parseAntigravityLanguageServerPsOutput(ps234, { uid: 501 });
+  assert.equal(inspected234.servers.length, 0);
+  assert.equal(inspected234.runningWithoutCsrfToken, true);
+  assert.equal(inspected234.detectedVersion, '2.34.0');
+
+  const q234 = await fetchAntigravityQuota(Date.now(), {
+    inspectServers: async () => inspected234,
+  });
+  assert.equal(q234.quotaWindows.length, 0);
+  assert.match(q234.quotaHint || '', /2\.34\.0/);
+  assert.match(q234.quotaHint || '', /本地令牌探测/);
+
+  const qStopped = await fetchAntigravityQuota(Date.now(), {
+    inspectServers: async () => ({ servers: [], runningWithoutCsrfToken: false, detectedVersion: null }),
+  });
+  assert.match(qStopped.quotaHint || '', /未检测到运行中的 Antigravity/);
+
+  // 2b. Daemon discovery JSON files (`~/.gemini/antigravity/daemon/hub_*.json`) filter stale PIDs and map https/http endpoints
+  const daemonRoot = mkdtempSync(join(tmpdir(), 'atm-ag-daemon-'));
+  try {
+    const daemonDir = join(daemonRoot, 'antigravity', 'daemon');
+    mkdirSync(daemonDir, { recursive: true });
+    writeFileSync(
+      join(daemonDir, 'hub_dead.json'),
+      JSON.stringify({ pid: 99991, httpsPort: 51000, httpPort: 51001, lsVersion: '2.33.0', csrfToken: 'dead-token' })
+    );
+    writeFileSync(
+      join(daemonDir, 'hub_live.json'),
+      JSON.stringify({ pid: 73511, httpsPort: 56392, httpPort: 56393, lsVersion: '2.34.0', csrfToken: 'live-token' })
+    );
+    const discovered = discoverAntigravityDaemonFiles(daemonRoot, {
+      isPidAlive: (pid) => pid === 73511,
+    });
+    assert.equal(discovered.length, 1);
+    assert.equal(discovered[0].pid, 73511);
+    assert.equal(discovered[0].csrf, 'live-token');
+    assert.equal(discovered[0].version, '2.34.0');
+    assert.deepEqual(buildLanguageServerEndpoints(discovered[0]), [
+      { port: 56392, useHttps: true },
+      { port: 56393, useHttps: false },
+    ]);
+  } finally {
+    rmSync(daemonRoot, { recursive: true, force: true });
+  }
+
+  // 3. TurnStore protects historical streaming_decode from offline downgrade and repairs legacy unknown rows
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-ag-store-'));
+  try {
+    const dbPath = join(tmpDir, 'meter.db');
+    const store = new TurnStore(dbPath);
+    store.upsertTurn({
+      turnUid: 'antigravity:sess-hist:turn-0',
+      tool: 'antigravity',
+      host: 'antigravity-desktop',
+      sessionId: 'sess-hist',
+      turnId: 'turn-0',
+      model: 'gemini-4-neon',
+      totalInputTokens: 10000,
+      uncachedInputTokens: 1000,
+      cacheReadTokens: 9000,
+      outputTokens: 600,
+      thinkingTokens: 120,
+      durationMs: 12000,
+      modelActiveMs: 4000,
+      tps: 150,
+      tpsMethod: 'streaming_decode',
+      completedAtMs: 1700000000000,
+    });
+    // Simulate later offline rescan of same turn without RPC
+    const rescan = store.upsertTurn({
+      turnUid: 'antigravity:sess-hist:turn-0',
+      tool: 'antigravity',
+      host: 'antigravity-desktop',
+      sessionId: 'sess-hist',
+      turnId: 'turn-0',
+      model: 'gemini-4-neon-high',
+      totalInputTokens: 10000,
+      uncachedInputTokens: 1000,
+      cacheReadTokens: 9000,
+      outputTokens: 600,
+      thinkingTokens: null,
+      durationMs: 12000,
+      modelActiveMs: 8000,
+      tps: 75,
+      tpsMethod: 'e2e_minus_tools',
+      completedAtMs: 1700000000000,
+    });
+    assert.equal(rescan.changed, false);
+    const saved = store.getRecentTurns(5, 'antigravity')[0];
+    assert.equal(saved.tps, 150);
+    assert.equal(saved.tpsMethod, 'streaming_decode');
+    assert.equal(saved.modelActiveMs, 4000);
+    assert.equal(saved.thinkingTokens, 120);
+
+    // Simulate legacy schema v1 database with unknown Antigravity model + cached ingested file
+    store.upsertTurn({
+      turnUid: 'antigravity:sess-legacy:turn-0',
+      tool: 'antigravity',
+      host: 'antigravity-desktop',
+      sessionId: 'sess-legacy',
+      turnId: 'turn-0',
+      model: 'unknown',
+      totalInputTokens: 5000,
+      uncachedInputTokens: 5000,
+      cacheReadTokens: 0,
+      outputTokens: 300,
+      durationMs: 6000,
+      tps: 50,
+      tpsMethod: 'unavailable',
+      completedAtMs: 1700000001000,
+    });
+    const fakeTranscriptPath = '/tmp/brain/sess-legacy/.system_generated/logs/transcript.jsonl';
+    store.setIngestedFile(fakeTranscriptPath, 12345, 678);
+    store.db.exec('PRAGMA user_version = 1;');
+    store.close();
+
+    const migratedStore = new TurnStore(dbPath);
+    assert.equal(migratedStore.getIngestedFile(fakeTranscriptPath), null);
+    migratedStore.close();
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
   }
 });
