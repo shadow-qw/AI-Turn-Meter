@@ -658,3 +658,155 @@ test('getRecentTurns(excludeHosts) & CdpInlineInjector prevent cursor-cloud bill
     rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Fingerprint: passive lightweight vs flagship model_drift, excluded subagents, o3-mini capability payload, and manual_score error shape', async () => {
+  const store = new TurnStore(':memory:');
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-fp-new-'));
+  let meter = null;
+  try {
+    const baseMs = Date.now() - 2 * 3600_000;
+    // 1a. Lightweight -> lightweight (gpt-5-mini -> gpt-5-nano) must NOT trigger model_drift
+    for (let i = 0; i < 4; i += 1) {
+      store.upsertTurn({
+        turnUid: `codex:light:${i}`,
+        tool: 'codex',
+        sessionId: 'sess-light',
+        turnId: `l-${i}`,
+        model: i < 2 ? 'gpt-5-mini' : 'gpt-5-nano',
+        completedAtMs: baseMs + i * 60_000,
+        totalInputTokens: 5000,
+        cacheReadTokens: 3000,
+        outputTokens: 200,
+        thinkingTokens: 100,
+        tps: 80,
+        tpsMethod: 'streaming_decode',
+      });
+    }
+    // 1b. Flagship -> lightweight (gemini-4-neon -> gemini-3.8-flash) MUST trigger model_drift
+    for (let i = 0; i < 4; i += 1) {
+      store.upsertTurn({
+        turnUid: `ag:drift:${i}`,
+        tool: 'antigravity',
+        sessionId: 'sess-drift',
+        turnId: `d-${i}`,
+        model: i < 3 ? 'gemini-4-neon' : 'gemini-3.8-flash',
+        completedAtMs: baseMs + i * 60_000,
+        totalInputTokens: 15_000,
+        cacheReadTokens: 10_000,
+        outputTokens: 300,
+        thinkingTokens: i < 3 ? 1200 : 1200,
+        tps: i < 3 ? 45 : 48,
+        tpsMethod: 'streaming_decode',
+      });
+    }
+    // 1c. Excluded hosts (cursor-cloud & antigravity-subagent) must be ignored
+    for (let i = 0; i < 3; i += 1) {
+      store.upsertTurn({
+        turnUid: `cursor:cloud:${i}`,
+        tool: 'cursor',
+        host: 'cursor-cloud',
+        sessionId: 'sess-cloud',
+        turnId: `c-${i}`,
+        model: 'gpt-6-astra',
+        completedAtMs: baseMs + i * 60_000,
+        totalInputTokens: 10_000,
+        outputTokens: 200,
+        tps: 300,
+        tpsMethod: 'streaming_decode',
+      });
+      store.upsertTurn({
+        turnUid: `ag:sub:${i}`,
+        tool: 'antigravity',
+        host: 'antigravity-subagent',
+        sessionId: 'sess-sub',
+        turnId: `s-${i}`,
+        model: 'gemini-4-neon',
+        completedAtMs: baseMs + i * 60_000,
+        totalInputTokens: 10_000,
+        outputTokens: 200,
+        tps: 300,
+        tpsMethod: 'streaming_decode',
+      });
+    }
+
+    const passive = analyzePassiveTelemetry(store, { days: 7 });
+    assert.equal(passive.totalTurnsScanned, 8);
+    assert.equal(passive.byTool.cursor.turnCount, 0);
+    assert.equal(
+      passive.anomalies.some((a) => a.tool === 'codex' && a.kind === 'model_drift'),
+      false
+    );
+    assert.equal(
+      passive.anomalies.some((a) => a.tool === 'antigravity' && a.kind === 'model_drift'),
+      true
+    );
+
+    // 2. OpenAI reasoning models (o3-mini) send max_completion_tokens without max_tokens or temperature
+    const capturedBodies = [];
+    const probeRes = await runQuickCapabilityProbes({
+      targetType: 'endpoint',
+      targetName: 'o3-test',
+      endpointConfig: {
+        protocol: 'openai',
+        baseUrl: 'https://api.example.test/v1',
+        apiKey: 'test-key',
+        model: 'o3-mini',
+      },
+      fetchImpl: async (_url, init) => {
+        capturedBodies.push(JSON.parse(init.body));
+        return new Response(
+          JSON.stringify({
+            model: 'o3-mini',
+            choices: [{ message: { content: 'OK' } }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      },
+    });
+    assert.equal(probeRes.targetName, 'o3-test');
+    assert.ok(capturedBodies.length >= 1);
+    for (const body of capturedBodies) {
+      assert.equal(typeof body.max_completion_tokens, 'number');
+      assert.ok(body.max_completion_tokens > 0);
+      assert.equal('max_tokens' in body, false);
+      assert.equal('temperature' in body, false);
+    }
+
+    // 3. POST /v1/fingerprint/run with failing manual_score returns ok: false + error + run metadata
+    meter = createMeterServer({
+      port: 0,
+      dbPath: ':memory:',
+      stateDir: tmpDir,
+      authToken: 'tok-fp',
+      enableWatchers: false,
+      enableCdp: false,
+      enableAntigravityRpc: false,
+      enableQuotaProbe: false,
+    });
+    const addr = await meter.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/v1/fingerprint/run`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-atm-token': meter.authToken,
+      },
+      body: JSON.stringify({
+        mode: 'manual_score',
+        replyText: 'not valid format',
+      }),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.ok, false);
+    assert.equal(typeof json.error, 'string');
+    assert.ok(json.error.length > 0);
+    assert.equal(typeof json.run?.id, 'string');
+    assert.ok(json.run.id.length > 0);
+    assert.equal(typeof json.run?.createdAtMs, 'number');
+    assert.ok(json.run.createdAtMs > 0);
+  } finally {
+    await meter?.stop?.();
+    store.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

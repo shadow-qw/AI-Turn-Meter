@@ -5,11 +5,15 @@ import SwiftUI
 struct RecentTurnsTabView: View {
   @ObservedObject var vm: MeterViewModel
   @State private var hoveredTurnChip: String? = nil
+  @State private var hideCursorCloud: Bool = false
 
   private var filteredTurns: [TurnSummary] {
+    let base = hideCursorCloud
+      ? vm.recentTurns.filter { $0.host != "cursor-cloud" }
+      : vm.recentTurns
     let q = vm.recentTurnsSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard !q.isEmpty else { return vm.recentTurns }
-    return vm.recentTurns.filter { t in
+    guard !q.isEmpty else { return base }
+    return base.filter { t in
       (t.model?.lowercased().contains(q) ?? false) ||
       (t.workspacePath?.lowercased().contains(q) ?? false) ||
       (t.replyPreview?.lowercased().contains(q) ?? false) ||
@@ -27,6 +31,22 @@ struct RecentTurnsTabView: View {
               turnToolChip(key: k, label: vm.toolShortTitle(for: k))
             }
           }
+        }
+
+        if vm.recentTurnsFilterTool == "all" || vm.recentTurnsFilterTool == "cursor" {
+          Button {
+            hideCursorCloud.toggle()
+          } label: {
+            Text(hideCursorCloud ? "已隐云端" : "隐藏云端")
+              .font(.system(size: 11, weight: hideCursorCloud ? .semibold : .regular))
+              .foregroundColor(hideCursorCloud ? .white : .secondary)
+              .padding(.horizontal, 8)
+              .padding(.vertical, 4.5)
+              .background(hideCursorCloud ? CodexBarPalette.accentBlue : Color.primary.opacity(0.05))
+              .clipShape(Capsule())
+          }
+          .buttonStyle(.plain)
+          .help("隐藏 Cursor Cloud API 同步的云端摘要记录")
         }
 
         HStack(spacing: 5) {
@@ -49,13 +69,32 @@ struct RecentTurnsTabView: View {
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
-        .frame(width: 210)
+        .frame(width: 195)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(Capsule())
         .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1))
 
         if vm.recentTurnsLoading {
           ProgressView().controlSize(.small)
+        } else {
+          Button {
+            vm.fetchRecentTurns()
+          } label: {
+            Image(systemName: "arrow.clockwise")
+              .font(.system(size: 12))
+              .foregroundColor(.secondary)
+          }
+          .buttonStyle(.borderless)
+          .help("刷新最近轮次")
+        }
+      }
+
+      if !vm.recentTurnsSearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.recentTurns.count >= 80 {
+        HStack {
+          Text("当前在最近 80 条记录内搜索")
+            .font(.system(size: 10.5))
+            .foregroundColor(.secondary)
+          Spacer()
         }
       }
 

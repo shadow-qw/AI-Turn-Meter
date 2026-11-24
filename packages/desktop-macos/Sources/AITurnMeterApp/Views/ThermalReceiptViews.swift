@@ -106,6 +106,34 @@ private struct ReceiptMistyBackdropView: View {
 }
 
 private struct ThermalReceiptCardView: View {
+  private static let fmtLock = NSLock()
+  private static let intFormatter: NumberFormatter = {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    return f
+  }()
+  private static let dec2Formatter: NumberFormatter = {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    f.minimumFractionDigits = 2
+    f.maximumFractionDigits = 2
+    return f
+  }()
+  private static let dec4Formatter: NumberFormatter = {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    f.minimumFractionDigits = 4
+    f.maximumFractionDigits = 4
+    return f
+  }()
+  private static let issuedFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.calendar = Calendar(identifier: .gregorian)
+    f.locale = Locale(identifier: "zh_CN")
+    f.dateFormat = "yyyy年M月d日 HH:mm"
+    return f
+  }()
+
   let receipt: ReceiptDataResponse
   let theme: String
   let currencyMode: String
@@ -130,17 +158,16 @@ private struct ThermalReceiptCardView: View {
   }
 
   private func fmtNumber(_ value: Double, digits: Int = 2) -> String {
-    let f = NumberFormatter()
-    f.numberStyle = .decimal
-    f.minimumFractionDigits = digits
-    f.maximumFractionDigits = digits
+    Self.fmtLock.lock()
+    defer { Self.fmtLock.unlock() }
+    let f = digits == 4 ? Self.dec4Formatter : Self.dec2Formatter
     return f.string(from: NSNumber(value: abs(value))) ?? String(format: "%.\(digits)f", abs(value))
   }
 
   private func fmtInt(_ value: Int) -> String {
-    let f = NumberFormatter()
-    f.numberStyle = .decimal
-    return f.string(from: NSNumber(value: value)) ?? "\(value)"
+    Self.fmtLock.lock()
+    defer { Self.fmtLock.unlock() }
+    return Self.intFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
   }
 
   private func fmtSingleMoney(_ usd: Double?) -> String {
@@ -190,12 +217,10 @@ private struct ThermalReceiptCardView: View {
 
   private var issuedDisplayText: String {
     let d = Date(timeIntervalSince1970: receipt.generatedAtMs / 1000.0)
-    let f = DateFormatter()
-    f.calendar = Calendar(identifier: .gregorian)
-    f.locale = Locale(identifier: "zh_CN")
-    f.timeZone = TimeZone.current
-    f.dateFormat = "yyyy年M月d日 HH:mm"
-    return f.string(from: d)
+    Self.fmtLock.lock()
+    defer { Self.fmtLock.unlock() }
+    Self.issuedFormatter.timeZone = TimeZone.current
+    return Self.issuedFormatter.string(from: d)
   }
 
   private func modelGlyphSymbol(_ model: String) -> String {
@@ -474,10 +499,19 @@ struct DailyReceiptSectionView: View {
     panel.allowedContentTypes = [.png]
     panel.nameFieldStringValue = "ai-turn-meter-receipt-\(receipt.date).png"
     if panel.runModal() == .OK, let url = panel.url {
-      try? rendered.png.write(to: url, options: .atomic)
-      vm.bannerIsError = false
-      vm.statusBanner = "已保存高清小票：\(url.lastPathComponent)"
+      do {
+        try rendered.png.write(to: url, options: .atomic)
+        vm.bannerIsError = false
+        vm.statusBanner = "已保存高清小票：\(url.lastPathComponent)"
+      } catch {
+        vm.bannerIsError = true
+        vm.statusBanner = "保存 PNG 失败：\(error.localizedDescription)"
+      }
     }
+  }
+
+  private var isReceiptOnToday: Bool {
+    vm.receiptDate >= MeterFormat.makeIsoDayFormatter().string(from: Date())
   }
 
   var body: some View {
@@ -508,6 +542,7 @@ struct DailyReceiptSectionView: View {
           }
           .buttonStyle(.bordered)
           .controlSize(.mini)
+          .disabled(isReceiptOnToday)
           .help("后一天")
 
           Button("今日") {
@@ -515,6 +550,7 @@ struct DailyReceiptSectionView: View {
           }
           .buttonStyle(.bordered)
           .controlSize(.mini)
+          .disabled(isReceiptOnToday)
         }
 
         Picker("", selection: Binding(
@@ -617,8 +653,27 @@ struct DailyReceiptSectionView: View {
           Spacer()
         }
         .padding(.vertical, 28)
-      } else if let receipt = vm.receiptData {
+      } else if let receipt = vm.receiptData,
+                (vm.receiptError == nil || receipt.date == vm.receiptDate) {
         VStack(spacing: 12) {
+          if let err = vm.receiptError, !err.isEmpty {
+            HStack(spacing: 8) {
+              Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+                .font(.system(size: 11.5))
+              Text(err)
+                .font(.system(size: 11.5))
+                .foregroundColor(.orange)
+              Spacer()
+              Button("重试") { vm.fetchReceipt() }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.orange.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+          }
           ThermalReceiptCardView(
             receipt: receipt,
             theme: vm.receiptTheme,
@@ -752,7 +807,9 @@ struct DailyReceiptSectionView: View {
     }
     .onAppear {
       rateText = String(format: "%.4g", vm.receiptUsdToCny)
-      vm.fetchReceipt(silent: vm.receiptData != nil)
+      if vm.receiptData == nil || vm.receiptData?.date != vm.receiptDate || vm.receiptError != nil {
+        vm.fetchReceipt(silent: vm.receiptData != nil)
+      }
     }
   }
 }

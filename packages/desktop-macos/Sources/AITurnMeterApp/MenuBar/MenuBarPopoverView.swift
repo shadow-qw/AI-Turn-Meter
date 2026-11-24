@@ -549,6 +549,30 @@ private struct CodexBarStyleCardView: View {
               .controlSize(.mini)
               .tint(CodexBarPalette.accentBlue)
             }
+          } else if selection == "cursor", !vm.hasCursorCookie, windows.isEmpty {
+            if isCardHovered {
+              Button {
+                onLoginRequested("cursor")
+              } label: {
+                Text("网页登录…")
+                  .font(.system(size: 10, weight: .semibold))
+                  .foregroundColor(CodexBarPalette.cardBottom)
+                  .padding(.horizontal, 8)
+                  .padding(.vertical, 3)
+                  .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                      .fill(Color.white.opacity(0.95))
+                  )
+              }
+              .buttonStyle(.plain)
+            } else {
+              Button("网页登录…") {
+                onLoginRequested("cursor")
+              }
+              .buttonStyle(.borderedProminent)
+              .controlSize(.mini)
+              .tint(CodexBarPalette.accentBlue)
+            }
           } else {
             Text(statusLabel)
               .font(.system(size: 10, weight: .medium))
@@ -716,7 +740,7 @@ private struct CodexBarStyleCardView: View {
                   .foregroundColor(primaryText)
                   .lineLimit(1)
                 Spacer()
-                Text("\(MeterFormat.usd(win.costUsd)) · \(MeterFormat.tokens(win.totalTokens))")
+                Text("\(MeterFormat.money(win.costUsd, symbol: curSym)) · \(MeterFormat.tokens(win.totalTokens))")
                   .font(.system(size: 11, weight: .semibold))
                   .monospacedDigit()
                   .foregroundColor(primaryText)
@@ -1119,6 +1143,7 @@ private struct PopoverActionRow: View {
   var shortcut: String? = nil
   var trailingSymbol: String? = nil
   var badgeText: String? = nil
+  var isLoading: Bool = false
   var action: () -> Void
 
   @State private var hovering = false
@@ -1129,6 +1154,9 @@ private struct PopoverActionRow: View {
         Text(title)
           .font(.system(size: 12))
           .foregroundColor(hovering ? .white : .primary)
+        if isLoading {
+          ProgressView().controlSize(.mini)
+        }
         Spacer()
         if let badge = badgeText, !badge.isEmpty {
           Text(badge)
@@ -1223,7 +1251,7 @@ struct MenuBarPopoverView: View {
     if let snapshot = vm.usageData?.cards?[effectiveSelection] {
       return snapshot
     }
-    let todayTotals = vm.todaySummary
+    let todayTotals = effectiveSelection == "all" ? vm.todaySummary : nil
     let emptyToday = CardTodayMetrics(
       costUsd: todayTotals?.estimatedCostUsd,
       totalTokens: todayTotals?.totalTokens ?? 0,
@@ -1329,9 +1357,9 @@ struct MenuBarPopoverView: View {
       Divider().padding(.horizontal, 10)
 
       VStack(spacing: 1) {
-        PopoverActionRow(title: "刷新", shortcut: "⌘ R") {
+        PopoverActionRow(title: "刷新", shortcut: "⌘ R", isLoading: vm.usageLoading) {
           vm.refreshDoctorAndBootstrap()
-          vm.fetchUsageSummary(silent: true, forceRefresh: true)
+          vm.fetchUsageSummary(silent: false, forceRefresh: true)
         }
         .keyboardShortcut("r", modifiers: .command)
 
@@ -1378,8 +1406,14 @@ struct MenuBarPopoverView: View {
           card: activeCard,
           onLoginRequested: { key in
             onClosePopover()
-            vm.startPluginLogin(key)
             onOpenMainTab(nil)
+            DispatchQueue.main.async {
+              if key == "cursor" {
+                vm.showCursorLoginSheet = true
+              } else {
+                vm.startPluginLogin(key)
+              }
+            }
           }
         )
         .fixedSize(horizontal: false, vertical: true)

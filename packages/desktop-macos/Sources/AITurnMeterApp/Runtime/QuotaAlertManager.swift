@@ -16,7 +16,15 @@ private final class ForegroundNotificationDelegate: NSObject, UNUserNotification
 final class QuotaAlertManager {
   static let enabledPrefKey = "atm.alertsEnabled.v1"
 
-  private(set) var lastDeliveryError: String? = nil
+  var onDeliveryErrorChanged: ((String?) -> Void)?
+
+  private(set) var lastDeliveryError: String? = nil {
+    didSet {
+      if oldValue != lastDeliveryError {
+        onDeliveryErrorChanged?(lastDeliveryError)
+      }
+    }
+  }
 
   var enabled: Bool {
     didSet {
@@ -27,12 +35,14 @@ final class QuotaAlertManager {
         requestPermissionIfNeeded()
       } else if enabled {
         requestPermissionIfNeeded()
+      } else {
+        lastDeliveryError = nil
       }
     }
   }
 
   private var evaluator: QuotaAlertEvaluator
-  private var permissionRequested = false
+  private var didRequestAuthPrompt = false
   private let notificationDelegate = ForegroundNotificationDelegate()
 
   init(
@@ -62,32 +72,43 @@ final class QuotaAlertManager {
     return Bundle.main.bundleURL.pathExtension == "app"
   }
 
+  func refreshPermissionStatus() {
+    checkAndRequestPermission(allowPrompt: false)
+  }
+
   func requestPermissionIfNeeded() {
-    guard enabled, supportsUserNotifications, !permissionRequested else { return }
-    permissionRequested = true
+    checkAndRequestPermission(allowPrompt: true)
+  }
+
+  private func checkAndRequestPermission(allowPrompt: Bool) {
+    guard enabled, supportsUserNotifications else {
+      if !enabled { lastDeliveryError = nil }
+      return
+    }
     let center = UNUserNotificationCenter.current()
     if center.delegate == nil {
       center.delegate = notificationDelegate
     }
     center.getNotificationSettings { [weak self] settings in
-      if settings.authorizationStatus == .denied {
-        Task { @MainActor [weak self] in
-          self?.lastDeliveryError = "系统通知权限已关闭"
-        }
-        return
-      }
-      guard settings.authorizationStatus == .notDetermined else { return }
-      DispatchQueue.main.async {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
-          Task { @MainActor [weak self] in
-            if let error = error {
-              self?.lastDeliveryError = error.localizedDescription
-            } else if !granted {
-              self?.lastDeliveryError = "用户拒绝了通知权限"
-            } else {
-              self?.lastDeliveryError = nil
-            }
+      let status = settings.authorizationStatus
+      Task { @MainActor [weak self] in
+        guard let self = self, self.enabled else { return }
+        switch status {
+        case .denied:
+          self.lastDeliveryError = "系统通知权限已关闭"
+        case .authorized, .provisional:
+          self.lastDeliveryError = nil
+        case .notDetermined:
+          guard allowPrompt, !self.didRequestAuthPrompt else { return }
+          self.didRequestAuthPrompt = true
+          do {
+            let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+            self.lastDeliveryError = granted ? nil : "用户拒绝了通知权限"
+          } catch {
+            self.lastDeliveryError = error.localizedDescription
           }
+        @unknown default:
+          break
         }
       }
     }

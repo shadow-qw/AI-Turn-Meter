@@ -37,7 +37,7 @@ export function toNonNegFloat(v) {
   return v;
 }
 
-export function normalizePreviewText(v, maxLen = 120) {
+export function normalizePreviewText(v, maxLen = 280) {
   if (typeof v !== 'string') return null;
   const clean = v
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
@@ -49,7 +49,7 @@ export function normalizePreviewText(v, maxLen = 120) {
 }
 
 /**
- * Format token counts compactly: 341, 1.4k, 97.2k, 1.24M.
+ * Format token counts compactly: 341, 1.4k, 97.2k, 1.24M, 1.85B.
  * @param {number | null | undefined} count
  * @returns {string}
  */
@@ -58,9 +58,9 @@ export function formatTokens(count) {
     return 'N/A';
   }
   if (count < 1000) return String(Math.round(count));
-  if (count < 10000) return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}k`;
-  if (count < 1_000_000) return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}k`;
-  return `${(count / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`;
+  if (count < 999_950) return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  if (count < 999_995_000) return `${(count / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`;
+  return `${(count / 1_000_000_000).toFixed(2).replace(/\.?0+$/, '')}B`;
 }
 
 /**

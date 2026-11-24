@@ -3,9 +3,11 @@ import AppKit
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+  private static let openPanelNotification = Notification.Name("com.local.ai-turn-meter.openControlPanel")
   private var window: NSWindow?
   private var vm: MeterViewModel?
   private var statusBarController: StatusBarController?
+  private var openPanelObserver: NSObjectProtocol?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     MainActor.assumeIsolated {
@@ -48,14 +50,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self?.statusBarController?.syncVisibilityAndAppearance()
       }
 
+      openPanelObserver = DistributedNotificationCenter.default().addObserver(
+        forName: Self.openPanelNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.showControlPanel()
+        }
+      }
+
       applyActivationPolicy(keepWindowVisible: false)
       sb.syncVisibilityAndAppearance()
       model.ensureStarted()
 
       let launchInBackground = CommandLine.arguments.contains("--background")
       if !launchInBackground {
-        win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if model.hideDockIcon {
+          DispatchQueue.main.async { [weak win] in
+            win?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+          }
+        } else {
+          win.makeKeyAndOrderFront(nil)
+          NSApp.activate(ignoringOtherApps: true)
+        }
       }
     }
   }
@@ -150,10 +169,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
     MainActor.assumeIsolated {
-      if !flag {
+      if !(window?.isVisible ?? false) {
         showControlPanel()
       }
       return true
+    }
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    MainActor.assumeIsolated {
+      if let obs = openPanelObserver {
+        DistributedNotificationCenter.default().removeObserver(obs)
+        openPanelObserver = nil
+      }
+      vm?.stopPolling()
     }
   }
 

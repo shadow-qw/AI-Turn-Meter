@@ -285,9 +285,6 @@ struct ContentView: View {
       case .usage:
         vm.activeTab = .usage
         vm.fetchUsageSummary()
-        if vm.usageGroupMode == "daily" {
-          vm.fetchReceipt(silent: true)
-        }
       case .turns:
         vm.activeTab = .turns
         vm.fetchRecentTurns()
@@ -306,104 +303,111 @@ struct ContentView: View {
     } message: {
       Text("将停止后台服务并移除 Hooks 与 IDE 扩展，历史统计库会保留。")
     }
-    .sheet(isPresented: $vm.showSshSheet) {
-      RemoteSshSheetView(vm: vm)
-    }
-    .sheet(isPresented: $vm.showCursorLoginSheet) {
-      CursorWebLoginSheetView(vm: vm)
-    }
-    .sheet(isPresented: Binding(
-      get: { vm.pluginLoginKey != nil },
-      set: { if !$0 { vm.pluginLoginKey = nil } }
-    )) {
-      if let key = vm.pluginLoginKey {
+    .sheet(item: $vm.activeSheet) { sheet in
+      switch sheet {
+      case .ssh:
+        RemoteSshSheetView(vm: vm)
+      case .cursorLogin:
+        CursorWebLoginSheetView(vm: vm)
+      case .pluginLogin(let key):
         ExternalProviderLoginSheetView(vm: vm, key: key)
-      }
-    }
-    .sheet(isPresented: $vm.showPluginCodeSheet) {
-      PluginCodeImportSheetView(vm: vm)
-    }
-    .sheet(isPresented: $vm.showCursorCookieSheet) {
-      VStack(alignment: .leading, spacing: 12) {
-        Text("配置 Cursor 会话 Cookie")
-          .font(.headline)
-        Text("1. 点击下方「网页登录同步…」或浏览器打开 cursor.com/dashboard?tab=usage 完成登录；\n2. 若手动粘贴，请打开开发者工具（⌥⌘I）→ Network，复制任意请求头中的 Cookie（含 WorkosCursorSessionToken）；\n3. 粘贴保存后即可同步 Cursor 套餐剩余额度。")
-          .font(.system(size: 12))
-          .foregroundColor(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
-        TextField("WorkosCursorSessionToken=user_...%3A%3AeyJ...", text: $vm.cursorCookieDraft)
-          .textFieldStyle(.roundedBorder)
-          .font(.system(size: 11.5, design: .monospaced))
-        HStack {
-          Button("网页登录同步…") {
-            vm.showCursorCookieSheet = false
-            vm.showCursorLoginSheet = true
-          }
-          .controlSize(.small)
-          if let url = URL(string: "https://cursor.com/dashboard?tab=usage") {
-            Button("浏览器打开") { NSWorkspace.shared.open(url) }
-              .controlSize(.small)
-          }
-          if vm.hasCursorCookie {
-            Button("清除", role: .destructive) {
-              vm.showCursorCookieSheet = false
-              vm.saveCursorCookie(nil)
+      case .pluginCode:
+        PluginCodeImportSheetView(vm: vm)
+      case .cursorCookie:
+        VStack(alignment: .leading, spacing: 12) {
+          Text("配置 Cursor 会话 Cookie")
+            .font(.headline)
+          Text("1. 点击下方「网页登录同步…」或浏览器打开 cursor.com/dashboard?tab=usage 完成登录；\n2. 若手动粘贴，请打开开发者工具（⌥⌘I）→ Network，复制任意请求头中的 Cookie（含 WorkosCursorSessionToken）；\n3. 粘贴保存后即可同步 Cursor 套餐剩余额度。")
+            .font(.system(size: 12))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+          TextField("WorkosCursorSessionToken=user_...%3A%3AeyJ...", text: $vm.cursorCookieDraft)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 11.5, design: .monospaced))
+          HStack {
+            Button("网页登录同步…") {
+              vm.presentSheet(.cursorLogin)
             }
             .controlSize(.small)
+            if let url = URL(string: "https://cursor.com/dashboard?tab=usage") {
+              Button("浏览器打开") { NSWorkspace.shared.open(url) }
+                .controlSize(.small)
+            }
+            if vm.hasCursorCookie {
+              Button("清除", role: .destructive) {
+                vm.activeSheet = nil
+                vm.saveCursorCookie(nil)
+              }
+              .controlSize(.small)
+            }
+            Spacer()
+            Button("取消") { vm.activeSheet = nil }
+            Button("保存") {
+              let val = vm.cursorCookieDraft
+              vm.activeSheet = nil
+              vm.saveCursorCookie(val)
+            }
+            .buttonStyle(.borderedProminent)
           }
-          Spacer()
-          Button("取消") { vm.showCursorCookieSheet = false }
-          Button("保存") {
-            let val = vm.cursorCookieDraft
-            vm.showCursorCookieSheet = false
-            vm.saveCursorCookie(val)
-          }
-          .buttonStyle(.borderedProminent)
         }
-      }
-      .padding(18)
-      .frame(width: 490)
-    }
-    .sheet(isPresented: $vm.showUpdateSheet) {
-      VStack(alignment: .leading, spacing: 14) {
-        Text("检查软件更新")
-          .font(.headline)
-        Text(vm.updateStatusText)
-          .font(.system(size: 12.5))
-          .foregroundColor(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
-        if let info = vm.availableUpdate, !info.notes.isEmpty {
-          ScrollView {
-            Text(info.notes)
-              .font(.system(size: 11.5))
-              .foregroundColor(.primary)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .textSelection(.enabled)
-              .padding(10)
+        .padding(18)
+        .frame(width: 490)
+      case .update:
+        VStack(alignment: .leading, spacing: 14) {
+          Text("检查软件更新")
+            .font(.headline)
+          Text(vm.updateStatusText)
+            .font(.system(size: 12.5))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+          if vm.updateDownloading, let progress = vm.updateDownloadProgress {
+            HStack(spacing: 10) {
+              ProgressView(value: progress)
+              Text("\(Int((progress * 100).rounded()))%")
+                .font(.system(size: 11, design: .monospaced))
+                .monospacedDigit()
+                .foregroundColor(.secondary)
+                .frame(width: 36, alignment: .trailing)
+            }
           }
-          .frame(maxHeight: 150)
-          .background(Color(nsColor: .textBackgroundColor))
-          .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-          .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-              .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-          )
-        }
-        HStack {
-          if vm.updateChecking || vm.updateDownloading {
-            ProgressView().controlSize(.small)
+          if let info = vm.availableUpdate, !info.notes.isEmpty {
+            ScrollView {
+              Text(info.notes)
+                .font(.system(size: 11.5))
+                .foregroundColor(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .padding(10)
+            }
+            .frame(maxHeight: 150)
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+              RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            )
           }
-          Spacer()
-          if let info = vm.availableUpdate {
-            Button("立即更新并重启") { vm.downloadAndOpenUpdate(info) }
-              .buttonStyle(.borderedProminent)
+          HStack {
+            if vm.updateChecking || (vm.updateDownloading && vm.updateDownloadProgress == nil) {
+              ProgressView().controlSize(.small)
+            }
+            Spacer()
+            if vm.updateDownloading {
+              Button("取消下载") {
+                vm.cancelUpdateDownload()
+              }
+            } else if let info = vm.availableUpdate {
+              Button("立即更新并重启") { vm.downloadAndOpenUpdate(info) }
+                .buttonStyle(.borderedProminent)
+            }
+            Button("关闭") { vm.activeSheet = nil }
               .disabled(vm.updateDownloading)
           }
-          Button("关闭") { vm.showUpdateSheet = false }
         }
+        .padding(18)
+        .frame(width: 460)
+        .interactiveDismissDisabled(vm.updateDownloading)
       }
-      .padding(18)
-      .frame(width: 460)
     }
   }
 

@@ -31,7 +31,8 @@ final class MeterRuntime: Sendable {
     self.runtimeDir = (resDir as NSString).appendingPathComponent("runtime")
     self.nodeBin = (self.runtimeDir as NSString).appendingPathComponent("node")
     self.cliScript = (self.runtimeDir as NSString).appendingPathComponent("packages/daemon/bin/cli.mjs")
-    self.runningFromDmg = Bundle.main.bundlePath.hasPrefix("/Volumes/")
+    let values = try? Bundle.main.bundleURL.resourceValues(forKeys: [.volumeIsReadOnlyKey])
+    self.runningFromDmg = Bundle.main.bundlePath.hasPrefix("/Volumes/") && (values?.volumeIsReadOnly == true)
   }
 
   func runCli(_ args: [String], timeoutSec: TimeInterval = 25) -> CommandResult {
@@ -98,11 +99,14 @@ final class MeterRuntime: Sendable {
     }
 
     if procGroup.wait(timeout: .now() + timeoutSec) == .timedOut {
+      let pid = proc.processIdentifier
       if proc.isRunning {
+        Self.signalChildProcesses(parentPid: pid, signalFlag: "-TERM")
         proc.terminate()
       }
       if procGroup.wait(timeout: .now() + 0.5) == .timedOut && proc.isRunning {
-        kill(proc.processIdentifier, SIGKILL)
+        Self.signalChildProcesses(parentPid: pid, signalFlag: "-KILL")
+        kill(pid, SIGKILL)
         _ = procGroup.wait(timeout: .now() + 0.5)
       }
       _ = ioGroup.wait(timeout: .now() + 0.5)
@@ -122,17 +126,40 @@ final class MeterRuntime: Sendable {
     UpdateChecker.compareSemver(a, b)
   }
 
+  private static func signalChildProcesses(parentPid: pid_t, signalFlag: String) {
+    guard parentPid > 0 else { return }
+    let pkill = Process()
+    pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+    pkill.arguments = [signalFlag, "-P", "\(parentPid)"]
+    pkill.standardOutput = FileHandle.nullDevice
+    pkill.standardError = FileHandle.nullDevice
+    try? pkill.run()
+    pkill.waitUntilExit()
+  }
+
   static func readSshConfigHosts() -> [String] {
     let path = (NSHomeDirectory() as NSString).appendingPathComponent(".ssh/config")
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
     var hosts: [String] = []
     for rawLine in text.components(separatedBy: .newlines) {
-      let line = rawLine.trimmingCharacters(in: .whitespaces)
-      guard line.lowercased().hasPrefix("host ") else { continue }
-      let parts = line.dropFirst(5).split(whereSeparator: { $0 == " " || $0 == "\t" })
+      let withoutComment = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? rawLine
+      let line = withoutComment.trimmingCharacters(in: .whitespaces)
+      guard !line.isEmpty else { continue }
+      let lower = line.lowercased()
+      let remainder: Substring
+      if lower.hasPrefix("host ") || lower.hasPrefix("host\t") {
+        remainder = line.dropFirst(4)
+      } else if lower.hasPrefix("host=") {
+        remainder = line.dropFirst(5)
+      } else {
+        continue
+      }
+      let parts = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" })
       for p in parts {
-        let s = String(p)
-        if s == "*" || s.contains("*") || s.contains("?") || hosts.contains(s) { continue }
+        let s = String(p).trimmingCharacters(in: .whitespaces)
+        if s.isEmpty || s == "=" || s == "*" || s.contains("*") || s.contains("?") || s.hasPrefix("!") || hosts.contains(s) {
+          continue
+        }
         hosts.append(s)
       }
     }

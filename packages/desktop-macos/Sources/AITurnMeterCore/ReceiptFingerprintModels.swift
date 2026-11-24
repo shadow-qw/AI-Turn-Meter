@@ -239,6 +239,30 @@ public struct FingerprintRunItem: Decodable, Identifiable {
   public let jsDistance: Double?
   public let summary: String
   public let details: FingerprintRunDetails?
+
+  private enum CodingKeys: String, CodingKey {
+    case id, createdAtMs, targetType, targetName, tool, requestedModel, responseModel
+    case mode, verdict, score, jsDistance, summary, details
+  }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    let rawId = try c.decodeIfPresent(String.self, forKey: .id)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    self.id = (rawId?.isEmpty == false) ? rawId! : UUID().uuidString
+    self.createdAtMs = try c.decodeIfPresent(Double.self, forKey: .createdAtMs) ?? 0
+    self.targetType = try c.decode(String.self, forKey: .targetType)
+    self.targetName = try c.decode(String.self, forKey: .targetName)
+    self.tool = try c.decodeIfPresent(String.self, forKey: .tool)
+    self.requestedModel = try c.decodeIfPresent(String.self, forKey: .requestedModel)
+    self.responseModel = try c.decodeIfPresent(String.self, forKey: .responseModel)
+    self.mode = try c.decode(String.self, forKey: .mode)
+    self.verdict = try c.decode(String.self, forKey: .verdict)
+    self.score = try c.decodeIfPresent(Int.self, forKey: .score)
+    self.jsDistance = try c.decodeIfPresent(Double.self, forKey: .jsDistance)
+    self.summary = try c.decode(String.self, forKey: .summary)
+    self.details = try c.decodeIfPresent(FingerprintRunDetails.self, forKey: .details)
+  }
 }
 
 public struct ManualProbePack: Decodable {

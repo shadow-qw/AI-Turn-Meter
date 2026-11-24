@@ -4,6 +4,7 @@ public struct TurnSummary: Decodable, Identifiable {
   public var id: String { turnUid ?? "\(tool ?? "turn")-\(completedAtMs ?? 0)-\(inlineText ?? "")" }
   public let turnUid: String?
   public let tool: String?
+  public let host: String?
   public let toolLabel: String?
   public let model: String?
   public let workspacePath: String?
@@ -23,6 +24,7 @@ public struct TurnSummary: Decodable, Identifiable {
   public init(
     turnUid: String? = nil,
     tool: String? = nil,
+    host: String? = nil,
     toolLabel: String? = nil,
     model: String? = nil,
     workspacePath: String? = nil,
@@ -41,6 +43,7 @@ public struct TurnSummary: Decodable, Identifiable {
   ) {
     self.turnUid = turnUid
     self.tool = tool
+    self.host = host
     self.toolLabel = toolLabel
     self.model = model
     self.workspacePath = workspacePath
@@ -867,6 +870,7 @@ public struct DoctorResponse: Decodable {
   public let daemon: DoctorDaemon
   public let launchAgent: DoctorLaunchAgent
   public let cursorHooks: DoctorCursorHooks
+  public let vsixVersionMismatch: Bool?
   public let apps: [String: DoctorAppEntry]
 }
 
@@ -1030,6 +1034,17 @@ public struct QuotaAlertEvaluator: Sendable {
         return false
       }
     }
+    if cooldownSeconds > 0 {
+      lastSentAtByDedupeKey = lastSentAtByDedupeKey.filter { _, sentAt in
+        now.timeIntervalSince(sentAt) < cooldownSeconds
+      }
+    }
+    if lastSentAtByDedupeKey.count >= 500 {
+      let overflow = lastSentAtByDedupeKey.count - 450
+      for (k, _) in lastSentAtByDedupeKey.sorted(by: { $0.value < $1.value }).prefix(overflow) {
+        lastSentAtByDedupeKey.removeValue(forKey: k)
+      }
+    }
     lastSentAtByDedupeKey[dedupeKey] = now
     return true
   }
@@ -1063,7 +1078,20 @@ public struct QuotaAlertEvaluator: Sendable {
     }
 
     guard masterEnabled else {
+      lastRemainingByWindow.removeAll(keepingCapacity: true)
       return []
+    }
+
+    if let enabledTools = enabledTools {
+      lastRemainingByWindow = lastRemainingByWindow.filter { key, _ in
+        if key.hasPrefix("ext:") {
+          let afterPrefix = key.index(key.startIndex, offsetBy: 4)
+          guard let sep = key[afterPrefix...].firstIndex(of: ":") else { return false }
+          return enabledTools.contains(String(key[..<sep]))
+        }
+        guard let sep = key.firstIndex(of: ":") else { return false }
+        return enabledTools.contains(String(key[..<sep]))
+      }
     }
 
     var events: [QuotaAlertEvent] = []

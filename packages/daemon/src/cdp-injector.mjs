@@ -905,7 +905,7 @@ export class CdpInlineInjector {
         try {
           const msg = JSON.parse(String(ev.data));
           if (msg.id === 1) {
-            done(!msg.error);
+            done(!msg.error && !msg.result?.exceptionDetails);
             try {
               ws.close();
             } catch {}

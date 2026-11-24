@@ -6,8 +6,20 @@ import { TOOL_LABELS } from './format.mjs';
 import { httpRequestRaw } from './net.mjs';
 import { resolveCodexUsageUrl } from './quota.mjs';
 
-const LIGHTWEIGHT_MODEL_RE = /(mini|nano|haiku|flash|lite|luna|small|instant|8b|7b|3b)/i;
-const FLAGSHIP_MODEL_RE = /(opus|sonnet|pro|ultra|astra|sol|gpt-5|gpt-6|o1|o3|o4|claude-4|gemini-3|gemini-2\.5-pro|deepseek-r1)/i;
+const LIGHTWEIGHT_MODEL_RE =
+  /(?:^|[-_./:\s])(?:mini|nano|haiku|flash|lite|luna|small|instant|8b|7b|3b)(?:$|[-_./:\s])/i;
+const FLAGSHIP_MODEL_RE =
+  /(?:^|[-_./:\s])(?:opus|sonnet|pro|ultra|astra|sol|neon|carbon|hydrogen|gpt-5|gpt-6|o1|o3|o4|claude-4|gemini-3|gemini-4|gemini-2\.5-pro|deepseek-r1)(?:$|[-_./:\s])/i;
+const OPENAI_REASONING_MODEL_RE = /(?:^|\/)(?:o1|o3|o4|gpt-5|gpt-6)(?:[-.]|$)/i;
+
+function isLightweightModel(model) {
+  return LIGHTWEIGHT_MODEL_RE.test(String(model || ''));
+}
+
+function isFlagshipModel(model) {
+  const m = String(model || '');
+  return !isLightweightModel(m) && FLAGSHIP_MODEL_RE.test(m);
+}
 
 function median(values) {
   if (!Array.isArray(values) || values.length === 0) return null;
@@ -76,10 +88,14 @@ export function analyzePassiveTelemetry(store, { days = 7, tool = null, nowMs = 
   const sinceMs = nowMs - Math.max(1, Number(days) || 7) * 86_400_000;
   const rawRows = tool
     ? store.db
-        .prepare(`SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
+        .prepare(
+          `SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ? AND COALESCE(host, '') NOT IN ('cursor-cloud', 'antigravity-subagent') ORDER BY completed_at_ms ASC`
+        )
         .all(tool, sinceMs)
     : store.db
-        .prepare(`SELECT * FROM turns WHERE completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
+        .prepare(
+          `SELECT * FROM turns WHERE completed_at_ms >= ? AND COALESCE(host, '') NOT IN ('cursor-cloud', 'antigravity-subagent') ORDER BY completed_at_ms ASC`
+        )
         .all(sinceMs);
 
   const groupMap = new Map();
@@ -207,8 +223,8 @@ export function analyzePassiveTelemetry(store, { days = 7, tool = null, nowMs = 
     if (
       prevModel &&
       prevModel !== model &&
-      FLAGSHIP_MODEL_RE.test(prevModel) &&
-      LIGHTWEIGHT_MODEL_RE.test(model)
+      isFlagshipModel(prevModel) &&
+      isLightweightModel(model)
     ) {
       anomalies.push({
         id: `drift:${r.turn_uid}`,
@@ -486,12 +502,19 @@ async function callModelOnce(
       Authorization: `Bearer ${token}`,
       ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}),
     };
-    body = {
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: maxTokens,
-      temperature,
-    };
+    const isReasoning = OPENAI_REASONING_MODEL_RE.test(String(model || ''));
+    body = isReasoning
+      ? {
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_completion_tokens: maxTokens,
+        }
+      : {
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: maxTokens,
+          temperature,
+        };
   }
 
   const raw = await httpRequestRaw(url, {
@@ -1012,54 +1035,62 @@ export async function runQuickCapabilityProbes({
     name = name || `Codex (${cfg.modelProvider})`;
   }
 
-  const results = [];
+  const results = new Array(QUICK_CAPABILITY_PROBES.length);
   let responseModel = null;
   let totalScore = 0;
   let maxScore = 0;
   let latencySum = 0;
   let successCalls = 0;
 
-  for (const probe of QUICK_CAPABILITY_PROBES) {
-    maxScore += probe.weight;
-    try {
-      const res = await callModelOnce(
-        {
-          ...conn,
-          prompt: probe.prompt,
-          maxTokens: 160,
-          temperature: 0,
-          timeoutMs: 22000,
-        },
-        fetchImpl
-      );
-      if (!responseModel && res.responseModel) responseModel = res.responseModel;
-      latencySum += res.latencyMs;
-      successCalls += 1;
-      const ev = probe.evaluate(res.text);
-      if (ev.passed) totalScore += probe.weight;
-      results.push({
-        id: probe.id,
-        name: probe.name,
-        weight: probe.weight,
-        passed: ev.passed,
-        score: ev.passed ? probe.weight : 0,
-        latencyMs: res.latencyMs,
-        reason: ev.reason,
-        snippet: res.text.slice(0, 120),
-      });
-    } catch (err) {
-      results.push({
-        id: probe.id,
-        name: probe.name,
-        weight: probe.weight,
-        passed: false,
-        score: 0,
-        latencyMs: err.latencyMs || 0,
-        reason: `请求失败: ${err.message}`,
-        snippet: '',
-      });
+  let nextIdx = 0;
+  const concurrency = Math.min(3, QUICK_CAPABILITY_PROBES.length);
+  async function runWorker() {
+    while (nextIdx < QUICK_CAPABILITY_PROBES.length) {
+      const i = nextIdx;
+      nextIdx += 1;
+      const probe = QUICK_CAPABILITY_PROBES[i];
+      maxScore += probe.weight;
+      try {
+        const res = await callModelOnce(
+          {
+            ...conn,
+            prompt: probe.prompt,
+            maxTokens: 160,
+            temperature: 0,
+            timeoutMs: 22000,
+          },
+          fetchImpl
+        );
+        if (!responseModel && res.responseModel) responseModel = res.responseModel;
+        latencySum += res.latencyMs;
+        successCalls += 1;
+        const ev = probe.evaluate(res.text);
+        if (ev.passed) totalScore += probe.weight;
+        results[i] = {
+          id: probe.id,
+          name: probe.name,
+          weight: probe.weight,
+          passed: ev.passed,
+          score: ev.passed ? probe.weight : 0,
+          latencyMs: res.latencyMs,
+          reason: ev.reason,
+          snippet: res.text.slice(0, 120),
+        };
+      } catch (err) {
+        results[i] = {
+          id: probe.id,
+          name: probe.name,
+          weight: probe.weight,
+          passed: false,
+          score: 0,
+          latencyMs: err.latencyMs || 0,
+          reason: `请求失败: ${err.message}`,
+          snippet: '',
+        };
+      }
     }
   }
+  await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
 
   if (successCalls === 0) {
     return {

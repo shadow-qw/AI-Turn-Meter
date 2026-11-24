@@ -3,6 +3,15 @@ import AppKit
 import SwiftUI
 
 struct FingerprintTabView: View {
+  private static let tsFmtLock = NSLock()
+  private static let tsFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.calendar = Calendar(identifier: .gregorian)
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "MM-dd HH:mm"
+    return f
+  }()
+
   @ObservedObject var vm: MeterViewModel
 
   @State private var showAddEndpointSheet: Bool = false
@@ -18,6 +27,8 @@ struct FingerprintTabView: View {
   @State private var showAnomaliesExpanded: Bool = false
   @State private var showAllRuns: Bool = false
   @State private var expandedRunId: String? = nil
+  @State private var pendingDeleteEndpoint: FingerprintEndpointItem? = nil
+  @State private var pendingDeleteBaseline: FingerprintBaselineItem? = nil
 
   private func verdictColor(_ verdict: String) -> Color {
     switch verdict {
@@ -60,10 +71,12 @@ struct FingerprintTabView: View {
   }
 
   private func formatTimestamp(_ ms: Double) -> String {
+    guard ms.isFinite, ms > 0 else { return "" }
     let d = Date(timeIntervalSince1970: ms / 1000.0)
-    let f = DateFormatter()
-    f.dateFormat = "MM-dd HH:mm"
-    return f.string(from: d)
+    Self.tsFmtLock.lock()
+    defer { Self.tsFmtLock.unlock() }
+    Self.tsFormatter.timeZone = TimeZone.current
+    return Self.tsFormatter.string(from: d)
   }
 
   private var heroStatus: (icon: String, color: Color, title: String, subtitle: String) {
@@ -74,8 +87,20 @@ struct FingerprintTabView: View {
     let codexTip = ov.codex.configured ? "Codex 当前 \(ov.codex.model)" : "Codex 未登录"
     let baseSub = "近 \(ov.passive.days) 天共分析 \(ov.passive.totalTurnsScanned) 轮对话 · \(codexTip)"
 
-    if let latestRun = ov.runs.first, latestRun.verdict == "suspected_swap" {
-      return ("xmark.shield.fill", .red, "检测到疑似换模", latestRun.summary)
+    let nowMs = Date().timeIntervalSince1970 * 1000.0
+    if let activeRun = ov.runs.first(where: { run in
+      (run.targetType == "codex" || run.targetType == "client") || (nowMs - run.createdAtMs <= 86_400_000)
+    }) {
+      switch activeRun.verdict {
+      case "suspected_swap":
+        return ("xmark.shield.fill", .red, "检测到疑似换模（\(activeRun.targetName)）", activeRun.summary)
+      case "degraded":
+        return ("exclamationmark.shield.fill", .red, "检测到疑似降智（\(activeRun.targetName)）", activeRun.summary)
+      case "error":
+        return ("exclamationmark.triangle.fill", .orange, "最近体检失败（\(activeRun.targetName)）", activeRun.summary)
+      default:
+        break
+      }
     }
     if anomCount == 0 {
       return ("checkmark.shield.fill", CodexBarPalette.paceGreen, "状态正常 · 未发现降智", baseSub)
@@ -358,7 +383,7 @@ struct FingerprintTabView: View {
                     }
                     Divider()
                     Button("删除此端点", role: .destructive) {
-                      vm.deleteFingerprintEndpoint(id: ep.id)
+                      pendingDeleteEndpoint = ep
                     }
                   } label: {
                     Image(systemName: "ellipsis.circle")
@@ -394,7 +419,7 @@ struct FingerprintTabView: View {
                     .foregroundColor(.secondary)
                   Spacer()
                   Button(role: .destructive) {
-                    vm.deleteFingerprintBaseline(id: bl.id)
+                    pendingDeleteBaseline = bl
                   } label: {
                     Image(systemName: "xmark.circle")
                       .font(.system(size: 11))
@@ -571,9 +596,26 @@ struct FingerprintTabView: View {
             Spacer()
           }
 
-          TextField("可选：直接粘贴模型回复的 JSON（留空则自动读取最新一轮）", text: $manualReplyDraft)
-            .textFieldStyle(.roundedBorder)
-            .font(.system(size: 11.5, design: .monospaced))
+          ZStack(alignment: .topLeading) {
+            TextEditor(text: $manualReplyDraft)
+              .font(.system(size: 11.5, design: .monospaced))
+              .padding(4)
+            if manualReplyDraft.isEmpty {
+              Text("可选：直接粘贴模型回复的 JSON（留空则自动读取最新一轮）")
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundColor(Color(nsColor: .placeholderTextColor))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 8)
+                .allowsHitTesting(false)
+            }
+          }
+          .frame(height: 84)
+          .background(Color(nsColor: .textBackgroundColor))
+          .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+          .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+              .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+          )
         }
 
         HStack {
@@ -656,6 +698,34 @@ struct FingerprintTabView: View {
       }
       .padding(18)
       .frame(width: 460)
+    }
+    .alert("确认删除检测端点？", isPresented: Binding(
+      get: { pendingDeleteEndpoint != nil },
+      set: { if !$0 { pendingDeleteEndpoint = nil } }
+    )) {
+      Button("取消", role: .cancel) { pendingDeleteEndpoint = nil }
+      Button("删除", role: .destructive) {
+        if let ep = pendingDeleteEndpoint {
+          pendingDeleteEndpoint = nil
+          vm.deleteFingerprintEndpoint(id: ep.id)
+        }
+      }
+    } message: {
+      Text("将移除自定义端点「\(pendingDeleteEndpoint?.name ?? "")」及其 API 配置。")
+    }
+    .alert("确认删除参考基线？", isPresented: Binding(
+      get: { pendingDeleteBaseline != nil },
+      set: { if !$0 { pendingDeleteBaseline = nil } }
+    )) {
+      Button("取消", role: .cancel) { pendingDeleteBaseline = nil }
+      Button("删除", role: .destructive) {
+        if let bl = pendingDeleteBaseline {
+          pendingDeleteBaseline = nil
+          vm.deleteFingerprintBaseline(id: bl.id)
+        }
+      }
+    } message: {
+      Text("将永久删除参考基线「\(pendingDeleteBaseline?.name ?? "")」（\(pendingDeleteBaseline?.sampleCount ?? 0) 样本）。")
     }
   }
 }

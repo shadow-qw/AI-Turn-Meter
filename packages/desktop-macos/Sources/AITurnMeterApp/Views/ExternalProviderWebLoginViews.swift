@@ -8,6 +8,7 @@ import WebKit
 struct ExternalProviderAuthWebView: NSViewRepresentable {
   let auth: ExternalProviderAuth
   let manualCheckToken: Int
+  let reloadToken: Int
   let onStatusChanged: (String) -> Void
   let onCaptured: ([String: Any]) -> Void
 
@@ -19,14 +20,26 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
     weak var webView: WKWebView?
     var didCapture = false
     var lastManualToken = 0
+    var lastReloadToken = 0
     var pollTimer: Timer?
+    var popupWindows: [WKWebView: NSWindow] = [:]
 
     init(_ parent: ExternalProviderAuthWebView) {
       self.parent = parent
       self.lastManualToken = parent.manualCheckToken
+      self.lastReloadToken = parent.reloadToken
     }
 
     deinit { pollTimer?.invalidate() }
+
+    func closeAllPopups() {
+      for (popup, win) in popupWindows {
+        popup.navigationDelegate = nil
+        popup.uiDelegate = nil
+        win.close()
+      }
+      popupWindows.removeAll()
+    }
 
     func startPolling() {
       pollTimer?.invalidate()
@@ -44,10 +57,17 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
       (parent.auth.cookieDomains ?? []).map { $0.lowercased() }
     }
 
-    func cookieApplies(_ cookie: HTTPCookie) -> Bool {
+    func cookieAppliesForRead(_ cookie: HTTPCookie) -> Bool {
       let cd = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
       return domains.contains { t in
         cd == t || t.hasSuffix("." + cd) || cd.hasSuffix("." + t)
+      }
+    }
+
+    func cookieAppliesForClear(_ cookie: HTTPCookie) -> Bool {
+      let cd = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+      return domains.contains { t in
+        cd == t || cd.hasSuffix("." + t)
       }
     }
 
@@ -68,9 +88,18 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
       guard !didCapture, let wv = webView else { return }
       guard force || onTargetPage(wv.url) else { return }
       let store = wv.configuration.websiteDataStore.httpCookieStore
+      let now = Date()
       store.getAllCookies { [weak self] all in
         guard let self = self, !self.didCapture else { return }
-        let cookies = all.filter { self.cookieApplies($0) && !$0.value.isEmpty }
+        let rawCookies = all.filter { c in
+          let notExpired = c.expiresDate.map { $0 > now } ?? true
+          return self.cookieAppliesForRead(c) && notExpired && !c.value.isEmpty
+        }
+        var deduped: [String: HTTPCookie] = [:]
+        for c in rawCookies.sorted(by: { $0.domain.count < $1.domain.count || $0.path.count < $1.path.count }) {
+          deduped[c.name] = c
+        }
+        let cookies = Array(deduped.values).sorted { $0.name < $1.name }
         let required = self.parent.auth.requiredCookies ?? []
         let names = Set(cookies.map(\.name))
         let missing = required.filter { !names.contains($0) }
@@ -98,6 +127,7 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
           }
           if !storage.isEmpty { creds["storage"] = storage }
           self.stopPolling()
+          self.closeAllPopups()
           self.parent.onCaptured(creds)
         }
       }
@@ -131,14 +161,35 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+      guard webView === self.webView else { return }
       if let host = webView.url?.host {
         parent.onStatusChanged("正在打开 \(host)…")
       }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+      guard webView === self.webView else {
+        check(force: false)
+        return
+      }
       parent.onStatusChanged("请在下方完成登录；登录成功后将自动同步。")
       check(force: false)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+      let nsErr = error as NSError
+      if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled { return }
+      DispatchQueue.main.async { [weak self] in
+        self?.parent.onStatusChanged("页面加载失败：\(error.localizedDescription)")
+      }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+      let nsErr = error as NSError
+      if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled { return }
+      DispatchQueue.main.async { [weak self] in
+        self?.parent.onStatusChanged("页面加载失败：\(error.localizedDescription)")
+      }
     }
 
     func webView(
@@ -148,9 +199,35 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
       windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
       if navigationAction.targetFrame == nil {
-        webView.load(navigationAction.request)
+        let w = max(420, windowFeatures.width?.doubleValue ?? 540)
+        let h = max(480, windowFeatures.height?.doubleValue ?? 640)
+        let popup = WKWebView(frame: NSRect(x: 0, y: 0, width: w, height: h), configuration: configuration)
+        popup.customUserAgent = webView.customUserAgent ?? ExternalProviderAuthWebView.userAgent
+        popup.navigationDelegate = self
+        popup.uiDelegate = self
+        let win = NSWindow(
+          contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+          styleMask: [.titled, .closable, .resizable],
+          backing: .buffered,
+          defer: false
+        )
+        win.isReleasedWhenClosed = false
+        win.title = "登录授权"
+        win.center()
+        win.contentView = popup
+        win.makeKeyAndOrderFront(nil)
+        popupWindows[popup] = win
+        return popup
       }
       return nil
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+      if let win = popupWindows.removeValue(forKey: webView) {
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        win.close()
+      }
     }
   }
 
@@ -167,11 +244,10 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
     context.coordinator.startPolling()
 
     guard let raw = auth.loginUrl, let target = URL(string: raw) else { return wv }
-    // Drop stale target-domain cookies so re-login really re-authenticates;
-    // identity-provider cookies on other domains are kept, so SSO stays seamless.
+    // Drop stale exact/subdomain target cookies so re-login re-authenticates without wiping shared parent SSO cookies.
     let store = cfg.websiteDataStore.httpCookieStore
     store.getAllCookies { cookies in
-      let stale = cookies.filter { context.coordinator.cookieApplies($0) }
+      let stale = cookies.filter { context.coordinator.cookieAppliesForClear($0) }
       let group = DispatchGroup()
       for c in stale {
         group.enter()
@@ -190,10 +266,19 @@ struct ExternalProviderAuthWebView: NSViewRepresentable {
       context.coordinator.lastManualToken = manualCheckToken
       context.coordinator.check(force: true)
     }
+    if reloadToken != context.coordinator.lastReloadToken {
+      context.coordinator.lastReloadToken = reloadToken
+      if nsView.url != nil {
+        nsView.reload()
+      } else if let raw = auth.loginUrl, let target = URL(string: raw) {
+        nsView.load(URLRequest(url: target))
+      }
+    }
   }
 
   static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
     coordinator.stopPolling()
+    coordinator.closeAllPopups()
     nsView.navigationDelegate = nil
     nsView.uiDelegate = nil
   }
@@ -204,11 +289,12 @@ struct ExternalProviderLoginSheetView: View {
   let key: String
   @State private var statusText: String = "正在加载登录页…"
   @State private var manualCheckToken: Int = 0
+  @State private var reloadToken: Int = 0
 
   var body: some View {
     let meta = vm.externalProviderMeta(for: key)
     VStack(spacing: 0) {
-      HStack(spacing: 10) {
+      HStack(spacing: 8) {
         Image(systemName: "person.badge.key")
           .foregroundColor(CodexBarPalette.accentBlue)
         VStack(alignment: .leading, spacing: 2) {
@@ -230,6 +316,12 @@ struct ExternalProviderLoginSheetView: View {
           }
         }
         Spacer()
+        Button("重新加载") {
+          statusText = "正在重新加载…"
+          reloadToken += 1
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         Button("同步当前登录态") { manualCheckToken += 1 }
           .buttonStyle(.bordered)
           .controlSize(.small)
@@ -246,6 +338,7 @@ struct ExternalProviderLoginSheetView: View {
         ExternalProviderAuthWebView(
           auth: auth,
           manualCheckToken: manualCheckToken,
+          reloadToken: reloadToken,
           onStatusChanged: { msg in statusText = msg },
           onCaptured: { creds in
             vm.pluginLoginKey = nil

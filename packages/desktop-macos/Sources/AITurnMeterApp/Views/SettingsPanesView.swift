@@ -120,7 +120,7 @@ struct ProviderSettingsDetailView: View {
               .labelsHidden()
               .controlSize(.small)
               .disabled(!appInstalled || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
-              .help(appInstalled ? "在桌面客户端消息旁显示 TPS" : "仅桌面客户端支持内置 TPS 显示")
+              .help(appInstalled ? "在桌面客户端消息旁与 IDE 状态栏显示 TPS" : "仅桌面客户端支持内置 TPS 显示")
             }
 
             if card?.accountEmail != nil || card?.planTitle != nil {
@@ -130,59 +130,64 @@ struct ProviderSettingsDetailView: View {
                 value: [card?.accountEmail, card?.planTitle].compactMap { $0 }.joined(separator: " · ")
               )
             }
-
-            if key == "cursor" {
-              Divider().padding(.leading, 14)
-              HStack(spacing: 8) {
-                Text("会话授权")
-                  .font(.system(size: 12.5))
-                Spacer()
-                Button(vm.hasCursorCookie ? "已连接 · 重新登录…" : "网页登录同步…") {
-                  vm.showCursorLoginSheet = true
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-                Button("Cookie…") {
-                  vm.cursorCookieDraft = ""
-                  vm.showCursorCookieSheet = true
-                }
-                .buttonStyle(.borderless)
-                .font(.system(size: 12))
-                .foregroundColor(CodexBarPalette.accentBlue)
-              }
-              .padding(.horizontal, 14)
-              .padding(.vertical, 10)
-            }
-
-            if let turn = latestTurn {
-              let summaryText = turn.inlineText ?? turn.tps.map { MeterFormat.tps($0) }
-              if let summary = summaryText, !summary.isEmpty {
-                Divider().padding(.leading, 14)
-                HStack(spacing: 8) {
-                  Text("最近轮次")
-                    .font(.system(size: 12.5))
-                  Spacer()
-                  Text(summary)
-                    .font(.system(size: 12))
-                    .monospacedDigit()
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                  Button("查看") {
-                    vm.recentTurnsFilterTool = key
-                    vm.openSettingsPane(.turns)
-                  }
-                  .buttonStyle(.borderless)
-                  .font(.system(size: 12))
-                  .foregroundColor(CodexBarPalette.accentBlue)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-              }
-            }
           }
           .opacity(isDimmed ? 0.42 : 1.0)
           .disabled(isDimmed)
+
+          if key == "cursor" || latestTurn != nil {
+            SettingsGroupCard {
+              VStack(spacing: 0) {
+                if key == "cursor" {
+                  HStack(spacing: 8) {
+                    Text("会话授权")
+                      .font(.system(size: 12.5))
+                    Spacer()
+                    Button(vm.hasCursorCookie ? "已连接 · 重新登录…" : "网页登录同步…") {
+                      vm.showCursorLoginSheet = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    Button("Cookie…") {
+                      vm.cursorCookieDraft = ""
+                      vm.showCursorCookieSheet = true
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+                    .foregroundColor(CodexBarPalette.accentBlue)
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.vertical, 10)
+                }
+
+                if let turn = latestTurn {
+                  let summaryText = turn.inlineText ?? turn.tps.map { MeterFormat.tps($0) }
+                  if let summary = summaryText, !summary.isEmpty {
+                    if key == "cursor" { Divider().padding(.leading, 14) }
+                    HStack(spacing: 8) {
+                      Text("最近轮次")
+                        .font(.system(size: 12.5))
+                      Spacer()
+                      Text(summary)
+                        .font(.system(size: 12))
+                        .monospacedDigit()
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                      Button("查看") {
+                        vm.recentTurnsFilterTool = key
+                        vm.openSettingsPane(.turns)
+                      }
+                      .buttonStyle(.borderless)
+                      .font(.system(size: 12))
+                      .foregroundColor(CodexBarPalette.accentBlue)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                  }
+                }
+              }
+            }
+          }
         }
 
         // Card 2: Quota & Spend (Core Focus)
@@ -440,6 +445,7 @@ struct ExternalProviderDetailView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
+            .opacity(isDimmed ? 0.55 : 1.0)
 
             Divider().padding(.leading, 14)
             HStack(spacing: 8) {
@@ -470,6 +476,8 @@ struct ExternalProviderDetailView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
+            .opacity(isDimmed ? 0.55 : 1.0)
+            .disabled(isDimmed)
 
             if let auth = meta?.auth, auth.isWebCookie {
               Divider().padding(.leading, 14)
@@ -540,10 +548,9 @@ struct ExternalProviderDetailView: View {
                 title: "账户",
                 value: [card?.accountEmail, card?.planTitle].compactMap { $0 }.joined(separator: " · ")
               )
+              .opacity(isDimmed ? 0.55 : 1.0)
             }
           }
-          .opacity(isDimmed ? 0.42 : 1.0)
-          .disabled(isDimmed)
         }
 
         // Card 2: Quota Windows & Billing Totals
@@ -1347,6 +1354,25 @@ struct GeneralSettingsPaneView: View {
             ))
             .toggleStyle(.switch)
             .labelsHidden()
+          }
+          if vm.alertsEnabled, let alertErr = vm.alertDeliveryError, !alertErr.isEmpty {
+            Divider().padding(.leading, 14)
+            HStack(spacing: 8) {
+              Image(systemName: "bell.slash.fill")
+                .font(.system(size: 11.5))
+                .foregroundColor(.orange)
+              Text(alertErr)
+                .font(.system(size: 11.5))
+                .foregroundColor(.orange)
+              Spacer()
+              Button("打开通知设置") {
+                vm.openNotificationSettings()
+              }
+              .buttonStyle(.bordered)
+              .controlSize(.mini)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
           }
         }
 

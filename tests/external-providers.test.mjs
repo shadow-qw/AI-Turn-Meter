@@ -465,3 +465,62 @@ test('Plugin auth: declared auth config, credential storage (0600), ctx.credenti
     rmSync(tmp2, { recursive: true, force: true });
   }
 });
+
+test('ExternalProviderRegistry normalizes remaining/limit windows, rejects duplicate plugin IDs, and removes spaced/dotted filenames with credentials', async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-ext-reg-new-'));
+  const providersDir = join(tmpDir, 'providers');
+  mkdirSync(providersDir, { recursive: true });
+  const reg = new ExternalProviderRegistry({ providersDir });
+  try {
+    // 1. remaining/limit + group + windowKind normalization
+    const importRes = await reg.importPluginSource({
+      fileName: 'rem-limit.mjs',
+      content: `
+        export default {
+          id: 'rem-gw',
+          name: 'Rem Gateway',
+          fetch: async () => ({
+            ok: true,
+            quotaWindows: [
+              { id: 'w1', title: '额度', remaining: 40, limit: 100, group: 'monthly', windowKind: 'billing' }
+            ]
+          })
+        };
+      `,
+    });
+    assert.equal(importRes.meta.key, 'ext:rem-gw');
+    const fetched = await reg.fetchAll({ onlyKey: 'ext:rem-gw', forceRefresh: true });
+    const win = fetched.cards['ext:rem-gw'].quotaWindows[0];
+    assert.equal(win.remainingPct, 40);
+    assert.equal(win.group, 'monthly');
+    assert.equal(win.windowKind, 'billing');
+    assert.equal(win.subtitle.includes('已用'), true);
+    assert.equal(win.subtitle.includes('剩余'), true);
+
+    // 2. Duplicate ID across a different fileName must be rejected
+    await assert.rejects(
+      () =>
+        reg.importPluginSource({
+          fileName: 'dup.mjs',
+          content: `export default { id: 'rem-gw', name: 'Dup', fetch: async () => ({ ok: true, quotaWindows: [] }) };`,
+        }),
+      /已存在相同 ID/
+    );
+    assert.equal(existsSync(join(providersDir, 'dup.mjs')), false);
+
+    // 3. Existing filename containing dots/spaces can be removed and cleans up credentials
+    const specialFile = 'my.custom gateway.mjs';
+    const specialPath = join(providersDir, specialFile);
+    writeFileSync(
+      specialPath,
+      `export default { id: 'special-gw', name: 'Special', fetch: async () => ({ ok: true, quotaWindows: [] }) };`
+    );
+    reg.setCredentials('ext:special-gw', { cookie: 'sid=special-123', cookies: { sid: 'special-123' } });
+    assert.equal(reg.hasCredentials('ext:special-gw'), true);
+    await reg.removePlugin({ fileName: specialFile });
+    assert.equal(existsSync(specialPath), false);
+    assert.equal(reg.hasCredentials('ext:special-gw'), false);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

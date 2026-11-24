@@ -395,13 +395,16 @@ export function createMeterServer({
       }
       const cleared = externalProviders.clearCredentials(key);
       (enableExternalProviders
-        ? externalProviders.fetchAll({ nowMs: Date.now(), forceRefresh: true, enabledTools: config.tools })
+        ? externalProviders.fetchAll({ nowMs: Date.now(), enabledTools: config.tools, onlyKey: key })
         : Promise.resolve({ providers: [] })
       )
         .catch(() => ({ providers: [] }))
         .then((out) => {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, cleared, providers: out.providers || [] }));
+          broadcast('state', { ...store.getState(20, config.tools), config: publicConfig(config) });
+          if (!res.headersSent) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, cleared, providers: out.providers || [] }));
+          }
         });
       return;
     }
@@ -947,8 +950,20 @@ export function createMeterServer({
                   }
                 }
                 const result = scoreManualProbeResponse(replyText, { tool, model });
-                const saved = result.ok ? store.saveFingerprintRun(result) : result;
-                return { ok: result.ok, mode, run: saved };
+                if (result.ok) {
+                  const saved = store.saveFingerprintRun(result);
+                  return { ok: true, mode, run: saved };
+                }
+                return {
+                  ok: false,
+                  mode,
+                  error: result.summary,
+                  run: {
+                    ...result,
+                    id: `unsaved-${Date.now()}`,
+                    createdAtMs: Date.now(),
+                  },
+                };
               }
 
               // L1 quick or L2 deep
@@ -1085,20 +1100,25 @@ export function createMeterServer({
               res.end(JSON.stringify({ ok: false, error: err?.message || '保存凭证失败' }));
               return;
             }
-            externalProviders
-              .fetchAll({ nowMs: Date.now(), forceRefresh: true, enabledTools: config.tools })
+            (enableExternalProviders
+              ? externalProviders.fetchAll({ nowMs: Date.now(), enabledTools: config.tools, onlyKey: key })
+              : Promise.resolve({ providers: [], cards: {} })
+            )
               .catch(() => ({ providers: [], cards: {} }))
               .then((out) => {
+                broadcast('state', { ...store.getState(20, config.tools), config: publicConfig(config) });
                 const prov = (out.providers || []).find((p) => p.key === key) || null;
-                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(
-                  JSON.stringify({
-                    ok: true,
-                    provider: prov,
-                    providers: out.providers || [],
-                    card: out.cards?.[key] || null,
-                  })
-                );
+                if (!res.headersSent) {
+                  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                  res.end(
+                    JSON.stringify({
+                      ok: true,
+                      provider: prov,
+                      providers: out.providers || [],
+                      card: out.cards?.[key] || null,
+                    })
+                  );
+                }
               });
             return;
           }
@@ -1114,8 +1134,8 @@ export function createMeterServer({
                 const out = enableExternalProviders
                   ? await externalProviders.fetchAll({
                       nowMs: Date.now(),
-                      forceRefresh: true,
                       enabledTools: config.tools,
+                      onlyKey: imp.meta.key,
                     })
                   : { providersDir: externalProviders.providersDir, providers: [imp.meta], cards: {} };
                 if (!res.headersSent) {

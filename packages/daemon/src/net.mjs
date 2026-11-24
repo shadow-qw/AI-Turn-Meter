@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -311,8 +311,19 @@ export async function curlFetchRaw(
     if (proxyUrl) {
       args.push('--proxy', proxyUrl);
     }
+    const escapeCurlCfgVal = (s) =>
+      String(s).replace(/[\r\n\0]+/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const cfgLines = [];
     for (const [k, v] of Object.entries(headers || {})) {
-      if (v !== undefined && v !== null) args.push('-H', `${k}: ${v}`);
+      if (v === undefined || v === null) continue;
+      const cleanKey = String(k).replace(/[\r\n:\0]+/g, '').trim();
+      if (!cleanKey) continue;
+      cfgLines.push(`header = "${escapeCurlCfgVal(`${cleanKey}: ${v}`)}"`);
+    }
+    if (cfgLines.length > 0) {
+      const cfgFile = join(hdrTmpDir, 'curl-config.txt');
+      writeFileSync(cfgFile, `${cfgLines.join('\n')}\n`, { mode: 0o600 });
+      args.push('-K', cfgFile);
     }
     const bodyStr = body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
     if (bodyStr !== null) {
@@ -461,6 +472,20 @@ export async function httpRequestRaw(
       }
     }
     return nativeRes;
+  }
+
+  if (!helperBin && proxyState.hasSystemProxy && proxyState.fallbackProxyUrl) {
+    const curlRes = await curlFetchRaw(url, {
+      method,
+      headers,
+      body: bodyStr ?? null,
+      timeoutMs,
+      proxyUrl: proxyState.fallbackProxyUrl,
+      redirect,
+    });
+    if (curlRes.status !== null) {
+      return curlRes;
+    }
   }
 
   try {

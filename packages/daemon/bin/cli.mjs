@@ -13,8 +13,8 @@
  *   ai-turn-meter daemon [--port=47831]
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   APP_SPECS,
@@ -30,7 +30,7 @@ import {
   resolveAppPaths,
 } from '../src/apps.mjs';
 import { formatTokens, formatTps } from '../src/format.mjs';
-import { AUTH_TOKEN_HEADER, readDaemonToken } from '../src/auth.mjs';
+import { AUTH_TOKEN_HEADER, defaultTokenPath, readDaemonToken } from '../src/auth.mjs';
 import {
   applyLocalSshConfig,
   applyRemoteCursorHooks,
@@ -55,6 +55,45 @@ function getPkgVersion() {
     return pkg.version || '0.0.0';
   } catch {
     return '0.0.0';
+  }
+}
+
+function readLocalPublicConfig() {
+  const toolKeys = ['antigravity', 'codex', 'cursor', 'codebuddy'];
+  const defaults = {
+    enabled: true,
+    tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    inlineEnabled: true,
+    inlineTools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    hasCursorCookie: false,
+  };
+  try {
+    const cfgPath = join(dirname(defaultTokenPath()), 'config.json');
+    if (!existsSync(cfgPath)) return defaults;
+    const raw = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    const tools = { ...defaults.tools };
+    const inlineTools = { ...defaults.inlineTools };
+    for (const k of toolKeys) {
+      if (typeof raw?.tools?.[k] === 'boolean') tools[k] = raw.tools[k];
+      if (typeof raw?.inlineTools?.[k] === 'boolean') inlineTools[k] = raw.inlineTools[k];
+    }
+    if (raw?.tools && typeof raw.tools === 'object') {
+      for (const [k, v] of Object.entries(raw.tools)) {
+        if (typeof k === 'string' && k.startsWith('ext:') && typeof v === 'boolean') {
+          tools[k] = v;
+        }
+      }
+    }
+    const cookie = typeof raw?.cursorCookie === 'string' ? raw.cursorCookie.trim() : '';
+    return {
+      enabled: typeof raw?.enabled === 'boolean' ? raw.enabled : true,
+      tools,
+      inlineEnabled: typeof raw?.inlineEnabled === 'boolean' ? raw.inlineEnabled : true,
+      inlineTools,
+      hasCursorCookie: Boolean(cookie),
+    };
+  } catch {
+    return defaults;
   }
 }
 
@@ -116,10 +155,7 @@ async function cmdStatus(jsonMode = false) {
   }
 
   if (jsonMode) {
-    const config = state?.config || {
-      enabled: true,
-      tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
-    };
+    const config = state?.config || readLocalPublicConfig();
     console.log(
       JSON.stringify({
         version: getPkgVersion(),
@@ -127,7 +163,7 @@ async function cmdStatus(jsonMode = false) {
         online,
         config,
         apps,
-        externalProviders: providersMeta?.providers || [],
+        externalProviders: online ? (providersMeta?.providers || []) : null,
         providersDir: providersMeta?.providersDir || null,
         state,
       })
@@ -343,8 +379,10 @@ export async function openSingleApp(
 
 async function cmdOpen(target) {
   if (target === 'all') {
+    const cfg = readLocalPublicConfig();
     let allOk = true;
     for (const k of ['antigravity', 'codex', 'cursor', 'codebuddy']) {
+      if (cfg.tools?.[k] === false) continue;
       if (resolveAppPaths(APP_SPECS[k]).installed) {
         const ok = await openSingleApp(k, { exitOnError: false });
         if (!ok) allOk = false;

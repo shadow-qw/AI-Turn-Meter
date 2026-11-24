@@ -2,9 +2,27 @@ import AITurnMeterCore
 import Foundation
 
 final class DaemonSSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-  var onConnected: (() -> Void)?
-  var onDisconnected: (() -> Void)?
-  var onEvent: ((SSEEvent) -> Void)?
+  private let stateLock = NSLock()
+  private var _onConnected: (() -> Void)?
+  private var _onDisconnected: (() -> Void)?
+  private var _onEvent: ((SSEEvent) -> Void)?
+  private var _stoppedGeneration: Int = 0
+  private var _clientRunning: Bool = false
+
+  var onConnected: (() -> Void)? {
+    get { stateLock.lock(); defer { stateLock.unlock() }; return _onConnected }
+    set { stateLock.lock(); defer { stateLock.unlock() }; _onConnected = newValue }
+  }
+
+  var onDisconnected: (() -> Void)? {
+    get { stateLock.lock(); defer { stateLock.unlock() }; return _onDisconnected }
+    set { stateLock.lock(); defer { stateLock.unlock() }; _onDisconnected = newValue }
+  }
+
+  var onEvent: ((SSEEvent) -> Void)? {
+    get { stateLock.lock(); defer { stateLock.unlock() }; return _onEvent }
+    set { stateLock.lock(); defer { stateLock.unlock() }; _onEvent = newValue }
+  }
 
   private let delegateQueue: OperationQueue = {
     let q = OperationQueue()
@@ -22,6 +40,9 @@ final class DaemonSSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendab
   private var reconnectGeneration: Int = 0
 
   func start(port: Int) {
+    stateLock.lock()
+    _clientRunning = true
+    stateLock.unlock()
     delegateQueue.addOperation { [weak self] in
       guard let self = self else { return }
       if self.isRunning && self.port == port && self.activeTask != nil {
@@ -35,6 +56,9 @@ final class DaemonSSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendab
   }
 
   func reconnect(port: Int? = nil) {
+    stateLock.lock()
+    _clientRunning = true
+    stateLock.unlock()
     delegateQueue.addOperation { [weak self] in
       guard let self = self else { return }
       if let port = port { self.port = port }
@@ -45,6 +69,10 @@ final class DaemonSSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendab
   }
 
   func stop() {
+    stateLock.lock()
+    _clientRunning = false
+    _stoppedGeneration &+= 1
+    stateLock.unlock()
     delegateQueue.addOperation { [weak self] in
       guard let self = self else { return }
       self.isRunning = false
@@ -108,8 +136,22 @@ final class DaemonSSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendab
     }
     if let http = response as? HTTPURLResponse, http.statusCode == 200 {
       backoffSeconds = 2.0
-      let cb = onConnected
-      DispatchQueue.main.async { cb?() }
+      stateLock.lock()
+      let cb = _onConnected
+      let stopGen = _stoppedGeneration
+      let canRun = _clientRunning
+      stateLock.unlock()
+      guard canRun else {
+        completionHandler(.cancel)
+        return
+      }
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.stateLock.lock()
+        let valid = self._clientRunning && self._stoppedGeneration == stopGen
+        self.stateLock.unlock()
+        if valid { cb?() }
+      }
       completionHandler(.allow)
     } else {
       completionHandler(.cancel)
@@ -120,8 +162,18 @@ final class DaemonSSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendab
     guard dataTask === activeTask else { return }
     let events = parser.feed(data)
     guard !events.isEmpty else { return }
-    let cb = onEvent
-    DispatchQueue.main.async {
+    stateLock.lock()
+    let cb = _onEvent
+    let stopGen = _stoppedGeneration
+    let canRun = _clientRunning
+    stateLock.unlock()
+    guard canRun else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.stateLock.lock()
+      let valid = self._clientRunning && self._stoppedGeneration == stopGen
+      self.stateLock.unlock()
+      guard valid else { return }
       for ev in events {
         cb?(ev)
       }
@@ -133,8 +185,20 @@ final class DaemonSSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendab
     activeTask = nil
     self.session?.invalidateAndCancel()
     self.session = nil
-    let cb = onDisconnected
-    DispatchQueue.main.async { cb?() }
-    scheduleReconnect()
+    stateLock.lock()
+    let cb = _onDisconnected
+    let stopGen = _stoppedGeneration
+    let canRun = _clientRunning
+    stateLock.unlock()
+    if canRun {
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.stateLock.lock()
+        let valid = self._clientRunning && self._stoppedGeneration == stopGen
+        self.stateLock.unlock()
+        if valid { cb?() }
+      }
+      scheduleReconnect()
+    }
   }
 }

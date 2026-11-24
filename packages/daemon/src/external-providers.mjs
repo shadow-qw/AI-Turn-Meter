@@ -310,20 +310,28 @@ function normalizeQuotaWindow(raw, idx, { key, currencySymbol, nowMs }) {
   if (remainingPct === null && usedPct !== null) {
     remainingPct = Math.max(0, Math.min(100, 100 - usedPct));
   }
+  if (remainingPct === null && remaining !== null && limit !== null && limit > 0) {
+    remainingPct = Math.max(0, Math.min(100, (remaining / limit) * 100));
+  }
   if (remainingPct === null) return null;
 
   const windowSeconds = toFiniteNumber(raw.windowSeconds);
   const resetAtMs = toFiniteNumber(raw.resetAtMs);
+  const group = typeof raw.group === 'string' && raw.group.trim() ? raw.group.trim() : null;
+  const windowKind =
+    typeof raw.windowKind === 'string' && raw.windowKind.trim() ? raw.windowKind.trim() : null;
 
+  const resolvedUsed =
+    used !== null ? used : remaining !== null && limit !== null && limit > 0 ? Math.max(0, limit - remaining) : null;
   let autoNote = null;
-  if (used !== null && limit !== null && limit > 0) {
-    const usedStr = formatMoneyAmount(used, currencySymbol);
+  if (resolvedUsed !== null && limit !== null && limit > 0) {
+    const usedStr = formatMoneyAmount(resolvedUsed, currencySymbol);
     const limitStr = formatMoneyAmount(limit, currencySymbol);
-    const remVal = remaining !== null ? remaining : Math.max(0, limit - used);
+    const remVal = remaining !== null ? remaining : Math.max(0, limit - resolvedUsed);
     const remStr = formatMoneyAmount(remVal, currencySymbol);
     autoNote = `已用 ${usedStr} / ${limitStr} · 剩余 ${remStr}`;
-  } else if (used !== null) {
-    autoNote = `已用 ${formatMoneyAmount(used, currencySymbol)}`;
+  } else if (resolvedUsed !== null) {
+    autoNote = `已用 ${formatMoneyAmount(resolvedUsed, currencySymbol)}`;
   }
 
   const explicitSub = typeof raw.subtitle === 'string' && raw.subtitle.trim() ? raw.subtitle.trim() : null;
@@ -335,6 +343,8 @@ function normalizeQuotaWindow(raw, idx, { key, currencySymbol, nowMs }) {
     resetAtMs,
     nowMs,
     extraNote: explicitSub ? null : autoNote,
+    group,
+    windowKind,
   });
   if (!computed) return null;
 
@@ -343,6 +353,8 @@ function normalizeQuotaWindow(raw, idx, { key, currencySymbol, nowMs }) {
 
   return {
     ...computed,
+    ...(group ? { group } : {}),
+    ...(windowKind ? { windowKind } : {}),
     resetText: explicitResetText ?? computed.resetText,
     subtitle: explicitSub ?? computed.subtitle,
   };
@@ -611,6 +623,26 @@ export function sanitizePluginFileName(raw) {
   return trimmed;
 }
 
+function resolveSafeExistingPluginFileName(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (
+    trimmed.startsWith('.') ||
+    trimmed.includes('/') ||
+    trimmed.includes('\\') ||
+    trimmed.includes('..') ||
+    trimmed.includes('\0') ||
+    basename(trimmed) !== trimmed ||
+    extname(trimmed).toLowerCase() !== '.mjs' ||
+    trimmed.endsWith('.example.mjs') ||
+    trimmed.endsWith('.disabled.mjs')
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+
 function parseLoadedPluginModule(mod, { stem, fileName, filePath }) {
   const def = mod?.default && typeof mod.default === 'object' ? mod.default : mod;
   const fetchFn =
@@ -843,6 +875,15 @@ export class ExternalProviderRegistry {
         fileName: cleanName,
         filePath: targetPath,
       });
+      const existing = await this.loadPlugins();
+      const collision = existing.find(
+        (e) => e.meta.key === parsed.meta.key && e.meta.fileName !== cleanName
+      );
+      if (collision) {
+        throw new Error(
+          `已存在相同 ID (${parsed.meta.providerId}) 的插件文件（${collision.meta.fileName}），请先移除旧插件或更换 ID。`
+        );
+      }
       renameSync(tmpPath, targetPath);
       try {
         chmodSync(targetPath, 0o600);
@@ -864,13 +905,20 @@ export class ExternalProviderRegistry {
   }
 
   async removePlugin({ fileName = null, key = null } = {}) {
-    let targetFile = fileName ? sanitizePluginFileName(fileName) : null;
+    let targetFile = fileName
+      ? sanitizePluginFileName(fileName) || resolveSafeExistingPluginFileName(fileName)
+      : null;
     let resolvedKey = typeof key === 'string' && isExternalProviderKey(key) ? key : null;
 
-    if (!targetFile && resolvedKey) {
+    if ((!targetFile && resolvedKey) || (targetFile && !resolvedKey)) {
       const loaded = await this.loadPlugins();
-      const found = loaded.find((e) => e.meta.key === resolvedKey);
-      if (found) targetFile = found.meta.fileName;
+      if (!targetFile && resolvedKey) {
+        const found = loaded.find((e) => e.meta.key === resolvedKey);
+        if (found) targetFile = found.meta.fileName;
+      } else if (targetFile && !resolvedKey) {
+        const found = loaded.find((e) => e.meta.fileName === targetFile);
+        if (found) resolvedKey = found.meta.key;
+      }
     }
     if (!targetFile) {
       return { deleted: false, fileName: null, key: resolvedKey };
@@ -1138,7 +1186,7 @@ export class ExternalProviderRegistry {
     return p;
   }
 
-  async fetchAll({ nowMs = Date.now(), forceRefresh = false, enabledTools = null } = {}) {
+  async fetchAll({ nowMs = Date.now(), forceRefresh = false, enabledTools = null, onlyKey = null } = {}) {
     const loaded = await this.loadPlugins();
     const results = await Promise.all(
       loaded.map(async (entry) => {
@@ -1153,7 +1201,10 @@ export class ExternalProviderRegistry {
             card: prev?.card || buildNormalizedCard(entry.meta, { statusText: '已关闭' }, { nowMs }),
           };
         }
-        const res = await this.fetchSingle(entry, { nowMs, forceRefresh });
+        const res = await this.fetchSingle(entry, {
+          nowMs,
+          forceRefresh: onlyKey ? entry.meta.key === onlyKey : forceRefresh,
+        });
         return { ...res, enabled: true };
       })
     );

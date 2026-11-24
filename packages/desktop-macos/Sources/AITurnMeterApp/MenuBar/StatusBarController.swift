@@ -231,7 +231,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     for key in keys {
       guard vm.isToolEnabled(key),
             let entry = vm.apps[key],
-            entry.installed,
+            (entry.installed || entry.latestTurn != nil),
             let turn = entry.latestTurn else { continue }
       let ts = turn.completedAtMs ?? 0
       if best == nil || ts > best!.ts {
@@ -317,6 +317,17 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       }
       return parts.joined(separator: " · ")
     case .tps:
+      if vm.isExternalProvider(vm.menuBarProvider),
+         vm.isToolEnabled(vm.menuBarProvider),
+         let card = vm.usageData?.cards?[vm.menuBarProvider] {
+        if let rem = card.quotaWindows?.first?.remainingPct {
+          let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: rem).rounded())
+          return "\(menuBarLabel(for: vm.menuBarProvider)) \(vm.quotaDisplayMode.compactPrefix)\(pct)%"
+        }
+        if let amt = resolvedBillingAmount(for: card) {
+          return "\(menuBarLabel(for: vm.menuBarProvider)) \(MeterFormat.compactMoney(amt, symbol: card.resolvedCurrencySymbol))"
+        }
+      }
       guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider), let tps = turn.tps, tps > 0 else { return "" }
       return MeterFormat.tps(tps)
     case .todayCost:
@@ -329,6 +340,17 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       }
       return "\(MeterFormat.tokens(today.tokens)) · \(MeterFormat.money(today.cost, symbol: today.symbol))"
     case .latestInline:
+      if vm.isExternalProvider(vm.menuBarProvider),
+         vm.isToolEnabled(vm.menuBarProvider),
+         let card = vm.usageData?.cards?[vm.menuBarProvider] {
+        if let amt = resolvedBillingAmount(for: card) {
+          return "\(menuBarLabel(for: vm.menuBarProvider)) \(MeterFormat.compactMoney(amt, symbol: card.resolvedCurrencySymbol))"
+        }
+        if let rem = card.quotaWindows?.first?.remainingPct {
+          let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: rem).rounded())
+          return "\(menuBarLabel(for: vm.menuBarProvider)) \(vm.quotaDisplayMode.compactPrefix)\(pct)%"
+        }
+      }
       guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider) else { return "" }
       let inTok = MeterFormat.tokens(turn.totalInputTokens)
       if let tps = turn.tps, tps > 0 {
@@ -373,7 +395,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
           }
         }
       } else {
-        guard let entry = vm.apps[key], entry.installed else { continue }
+        guard let entry = vm.apps[key], (entry.installed || entry.latestTurn != nil) else { continue }
         let title = vm.displayTitle(for: key)
         if !vm.isActiveOverall || !vm.isToolEnabled(key) {
           lines.append("\(title): 已暂停")

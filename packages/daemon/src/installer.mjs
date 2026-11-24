@@ -492,8 +492,10 @@ export function setAppAutostart(
     if (!existsSync(plistPath)) return { enabled: false, plistPath };
     log(`Disable app autostart: ${plistPath}`);
     if (!dryRun) {
+      const uid = process.getuid();
+      // Disable rather than bootout so disabling autostart never SIGTERMs the currently running app session.
       try {
-        execFileSync('launchctl', ['bootout', `gui/${process.getuid()}`, plistPath], { stdio: 'ignore' });
+        execFileSync('launchctl', ['disable', `gui/${uid}/${APP_LAUNCH_AGENT_LABEL}`], { stdio: 'ignore' });
       } catch {}
       rmSync(plistPath, { force: true });
     }
@@ -509,11 +511,9 @@ export function setAppAutostart(
     mkdirSync(dirname(plistPath), { recursive: true });
     writeFileSync(plistPath, plist);
     const uid = process.getuid();
+    // Mark enabled for next login without bootstrapping RunAtLoad=true right away (avoids spawning a duplicate instance).
     try {
-      execFileSync('launchctl', ['bootout', `gui/${uid}`, plistPath], { stdio: 'ignore' });
-    } catch {}
-    try {
-      execFileSync('launchctl', ['bootstrap', `gui/${uid}`, plistPath], { stdio: 'ignore' });
+      execFileSync('launchctl', ['enable', `gui/${uid}/${APP_LAUNCH_AGENT_LABEL}`], { stdio: 'ignore' });
     } catch {}
   }
   return { enabled: true, plistPath, appExe };

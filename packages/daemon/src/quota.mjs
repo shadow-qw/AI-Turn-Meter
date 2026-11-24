@@ -1584,9 +1584,9 @@ export function assembleAllQuotas(raw, enabledTools = null) {
   return { all, codex, antigravity, cursor, codebuddy };
 }
 
-function reconcileWithStaleGrace(toolKey, fresh, nowMs) {
+function reconcileWithStaleGrace(toolKey, fresh, nowMs, cookieKey = '') {
   if (fresh?.quotaWindows?.length > 0) {
-    lastGoodByTool[toolKey] = { snapshot: fresh, atMs: nowMs };
+    lastGoodByTool[toolKey] = { snapshot: fresh, atMs: nowMs, cookieKey };
     return fresh;
   }
   const prev = lastGoodByTool[toolKey];
@@ -1594,6 +1594,7 @@ function reconcileWithStaleGrace(toolKey, fresh, nowMs) {
     prev &&
     nowMs - prev.atMs <= STALE_GRACE_MS &&
     fresh?._errorKind === 'network' &&
+    (toolKey !== 'cursor' || (prev.cookieKey || '') === (cookieKey || '')) &&
     (!fresh.accountEmail ||
       !prev.snapshot.accountEmail ||
       fresh.accountEmail.toLowerCase() === prev.snapshot.accountEmail.toLowerCase())
@@ -1644,7 +1645,7 @@ export async function getAllQuotas(
     const antigravity = isEnabled('antigravity')
       ? reconcileWithStaleGrace('antigravity', antigravityRaw, nowMs)
       : emptySnap();
-    const cursor = isEnabled('cursor') ? reconcileWithStaleGrace('cursor', cursorRaw, nowMs) : emptySnap();
+    const cursor = isEnabled('cursor') ? reconcileWithStaleGrace('cursor', cursorRaw, nowMs, cookieKey) : emptySnap();
 
     const anyTransientFailure = Boolean(
       (isEnabled('codex') && codexRaw?._errorKind === 'network' && !codexRaw.quotaWindows?.length) ||

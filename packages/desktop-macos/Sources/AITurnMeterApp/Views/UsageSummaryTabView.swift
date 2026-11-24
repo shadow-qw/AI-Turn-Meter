@@ -358,7 +358,7 @@ struct UsageSummaryTabView: View {
               guard vm.isExternalProvider(key), vm.isToolEnabled(key) else { return nil }
               return vm.externalProviderMeta(for: key)
             }
-            if !activeExternal.isEmpty {
+            if !activeExternal.isEmpty && vm.usageToolFilter == "all" {
               SettingsGroupCard {
                 VStack(alignment: .leading, spacing: 10) {
                   HStack {
@@ -376,8 +376,15 @@ struct UsageSummaryTabView: View {
                     let card = data.cards?[meta.key]
                     let sym = card?.resolvedCurrencySymbol ?? meta.currencySymbol ?? "$"
                     let periodLabel = card?.billingSummary?.periodLabel ?? "本月"
-                    let periodCost = card?.billingSummary?.periodCost ?? card?.days30.costUsd
                     let periodLimit = card?.billingSummary?.periodLimit
+                    let derivedPeriodCost: Double? = {
+                      if let explicit = card?.billingSummary?.periodCost { return explicit }
+                      if let limit = periodLimit, let rem = card?.billingSummary?.periodRemaining {
+                        return max(0, limit - rem)
+                      }
+                      return card?.days30.costUsd
+                    }()
+                    let periodCost = derivedPeriodCost
                     let todayCost = card?.billingSummary?.todayCost ?? card?.today.costUsd
                     let firstWin = card?.quotaWindows?.first
 
@@ -415,12 +422,19 @@ struct UsageSummaryTabView: View {
 
                         if let win = firstWin {
                           let pct = vm.quotaDisplayMode.displayPct(fromRemaining: win.remainingPct)
+                          let barColor: Color = {
+                            switch win.healthLevel {
+                            case .critical: return .red
+                            case .warning: return .orange
+                            case .normal: return CodexBarPalette.tealBar
+                            }
+                          }()
                           HStack(spacing: 8) {
                             GeometryReader { geo in
                               ZStack(alignment: .leading) {
                                 Capsule().fill(Color.primary.opacity(0.08))
                                 Capsule()
-                                  .fill(CodexBarPalette.tealBar)
+                                  .fill(barColor)
                                   .frame(width: max(4, geo.size.width * CGFloat(min(1, max(0, pct / 100.0)))))
                               }
                             }

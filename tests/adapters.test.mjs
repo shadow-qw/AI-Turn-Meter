@@ -70,7 +70,9 @@ test('formatting helpers match specification', () => {
   assert.equal(formatTokens(341), '341');
   assert.equal(formatTokens(1400), '1.4k');
   assert.equal(formatTokens(97234), '97.2k');
+  assert.equal(formatTokens(999_950), '1M');
   assert.equal(formatTokens(1240000), '1.24M');
+  assert.equal(formatTokens(1_851_610_000), '1.85B');
   assert.equal(formatCacheRate(94000, 97200), '97%');
   assert.equal(formatCacheRate(0, 0), '--');
   assert.equal(formatTps(48.0), '48 tok/s');

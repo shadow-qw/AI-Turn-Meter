@@ -64,6 +64,10 @@ struct AITurnMeterCoreTests {
     #expect(UpdateChecker.compareSemver("0.2.25", "v0.2.25") == 0)
     #expect(UpdateChecker.compareSemver("0.2.24", "0.2.25") == -1)
     #expect(UpdateChecker.compareSemver("1.0", "0.9.9") == 1)
+    #expect(UpdateChecker.compareSemver("0.2.31-beta.1", "0.2.30") == 1)
+    #expect(UpdateChecker.compareSemver("0.2.31", "0.2.31-beta.1") == 1)
+    #expect(UpdateChecker.compareSemver("0.2.31-beta.2", "0.2.31-beta.1") == 1)
+    #expect(UpdateChecker.compareSemver("0.2.31+build1", "0.2.31") == 0)
 
     let latestUrl = URL(string: "https://github.com/shadow-qw/AI-Turn-Meter/releases/latest")!
     #expect(
@@ -78,6 +82,7 @@ struct AITurnMeterCoreTests {
   func parseReleaseJsonPicksArm64DmgAndSha256() throws {
     let payload: [String: Any] = [
       "tag_name": "v0.2.26",
+      "url": "https://api.github.com/repos/shadow-qw/AI-Turn-Meter/releases/987654",
       "body": "- Fix SSE reconnect\n- Add SHA-256 check",
       "assets": [
         [
@@ -108,6 +113,19 @@ struct AITurnMeterCoreTests {
     #expect(info.downloadUrl == "https://example.com/AI-Turn-Meter-0.2.26-arm64.dmg")
     #expect(info.sha256Url == "https://example.com/AI-Turn-Meter-0.2.26-arm64.dmg.sha256")
     #expect(info.notes == "- Fix SSE reconnect\n- Add SHA-256 check")
+
+    let flatPayload: [String: Any] = [
+      "version": "0.2.27",
+      "url": "https://example.com/app.dmg",
+    ]
+    let flatData = try JSONSerialization.data(withJSONObject: flatPayload)
+    let flatOutcome = UpdateChecker.parseReleaseJson(flatData, currentVersion: "0.2.26")
+    guard case .updateAvailable(let flatInfo) = flatOutcome else {
+      Issue.record("Expected .updateAvailable for flat feed, got \(flatOutcome)")
+      return
+    }
+    #expect(flatInfo.version == "0.2.27")
+    #expect(flatInfo.downloadUrl == "https://example.com/app.dmg")
 
     let upToDate = UpdateChecker.parseReleaseJson(data, currentVersion: "0.2.26")
     #expect(upToDate == .upToDate(currentVersion: "0.2.26"))
@@ -149,7 +167,9 @@ struct AITurnMeterCoreTests {
     #expect(MeterFormat.tokens(nil) == "N/A")
     #expect(MeterFormat.tokens(999) == "999")
     #expect(MeterFormat.tokens(1500) == "1.5k")
+    #expect(MeterFormat.tokens(999_950) == "1M")
     #expect(MeterFormat.tokens(2_000_000) == "2M")
+    #expect(MeterFormat.tokens(1_851_610_000) == "1.85B")
     #expect(MeterFormat.usd(0.0042) == "$0.0042")
     #expect(MeterFormat.usd(1.234) == "$1.23")
     #expect(MeterFormat.money(420.5, symbol: "¥") == "¥420.50")
@@ -719,5 +739,89 @@ struct AITurnMeterCoreTests {
       "quota:cursor:m:warning",
       "context200k:cursor:turn-cursor-200k",
     ]))
+  }
+
+  @Test("FingerprintRunResponse and DoctorResponse tolerate missing run metadata and decode vsixVersionMismatch")
+  func fingerprintRunAndDoctorTolerantDecoding() throws {
+    let runJson = """
+    {
+      "ok": false,
+      "mode": "manual_score",
+      "error": "manual failed",
+      "run": {
+        "targetType": "manual",
+        "targetName": "Clipboard",
+        "mode": "manual_score",
+        "verdict": "fail",
+        "summary": "manual failed"
+      }
+    }
+    """
+    let decodedRun = try JSONDecoder().decode(FingerprintRunResponse.self, from: Data(runJson.utf8))
+    #expect(decodedRun.ok == false)
+    #expect(decodedRun.error == "manual failed")
+    let run = try #require(decodedRun.run)
+    #expect(!run.id.isEmpty)
+    #expect(run.createdAtMs == 0)
+
+    let doctorJson = """
+    {
+      "version": "0.2.31",
+      "daemon": { "ok": true, "port": 47831 },
+      "launchAgent": { "plistPath": "/tmp/a.plist", "plistExists": false, "launchAgentLoaded": false },
+      "cursorHooks": { "validVersion": true, "configured": true },
+      "vsixVersionMismatch": true,
+      "apps": {}
+    }
+    """
+    let decodedDoctor = try JSONDecoder().decode(DoctorResponse.self, from: Data(doctorJson.utf8))
+    #expect(decodedDoctor.vsixVersionMismatch == true)
+  }
+
+  @Test("QuotaAlertEvaluator clears paused baseline, preserves ext:* windows, and bounds dedupe cache")
+  func quotaAlertEvaluatorPauseExtPrefixAndDedupeBound() {
+    let names = ["codex": "Codex", "ext:gw": "Gateway"]
+
+    // 1. Refill during masterEnabled == false must not emit stale reset alert upon resume
+    var pauseEval = QuotaAlertEvaluator()
+    let lowCodex = UsageSummaryResponse(cards: [
+      "codex": makeCard(quotaWindows: [CardQuotaWindow(id: "5h", title: "5h", remainingPct: 5)]),
+    ])
+    let fullCodex = UsageSummaryResponse(cards: [
+      "codex": makeCard(quotaWindows: [CardQuotaWindow(id: "5h", title: "5h", remainingPct: 100)]),
+    ])
+    #expect(pauseEval.evaluate(usage: lowCodex, apps: [:], displayNames: names).isEmpty)
+    #expect(pauseEval.evaluate(usage: fullCodex, apps: [:], displayNames: names, masterEnabled: false).isEmpty)
+    #expect(pauseEval.evaluate(usage: fullCodex, apps: [:], displayNames: names, masterEnabled: true).isEmpty)
+
+    // 2. ext:* key filter must keep lastRemainingByWindow for enabled external providers
+    var extEval = QuotaAlertEvaluator()
+    let lowExt = UsageSummaryResponse(cards: [
+      "ext:gw": makeCard(providerName: "Gateway", isExternal: true, quotaWindows: [CardQuotaWindow(id: "m", title: "月度", remainingPct: 5)]),
+    ])
+    let fullExt = UsageSummaryResponse(cards: [
+      "ext:gw": makeCard(providerName: "Gateway", isExternal: true, quotaWindows: [CardQuotaWindow(id: "m", title: "月度", remainingPct: 100)]),
+    ])
+    #expect(extEval.evaluate(usage: lowExt, apps: [:], displayNames: names, enabledTools: Set(["ext:gw"])).isEmpty)
+    let extResets = extEval.evaluate(usage: fullExt, apps: [:], displayNames: names, enabledTools: Set(["ext:gw"]))
+    #expect(extResets.map(\.dedupeKey) == ["quota-reset:ext:gw:m"])
+
+    // 3. >500 distinct alerts with cooldownSeconds == 0 continue emitting cleanly with bounded dedupe map
+    var bulkEval = QuotaAlertEvaluator(cooldownSeconds: 0)
+    let seedApp = StatusAppEntry(name: "Codex", appPath: nil, installed: true, running: true, cdpPort: nil, latestTurn: nil)
+    #expect(bulkEval.evaluate(usage: nil, apps: ["codex": seedApp], displayNames: names).isEmpty)
+    var totalEmitted = 0
+    for i in 0..<520 {
+      let app = StatusAppEntry(
+        name: "Codex",
+        appPath: nil,
+        installed: true,
+        running: true,
+        cdpPort: nil,
+        latestTurn: TurnSummary(turnUid: "turn-bulk-\(i)", tool: "codex", callCount: 1, totalInputTokens: 250_000)
+      )
+      totalEmitted += bulkEval.evaluate(usage: nil, apps: ["codex": app], displayNames: names).count
+    }
+    #expect(totalEmitted == 520)
   }
 }

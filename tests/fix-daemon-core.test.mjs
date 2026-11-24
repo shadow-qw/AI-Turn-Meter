@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -15,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { parseCodexSessionDetailed } from '../packages/daemon/src/adapters/codex.mjs';
 import { CdpInlineInjector } from '../packages/daemon/src/cdp-injector.mjs';
 import { ExternalProviderRegistry } from '../packages/daemon/src/external-providers.mjs';
 import {
@@ -23,6 +25,10 @@ import {
   runQuickCapabilityProbes,
   runTokenDistributionFingerprint,
 } from '../packages/daemon/src/fingerprint.mjs';
+import {
+  buildAppLaunchAgentPlist,
+  setAppAutostart,
+} from '../packages/daemon/src/installer.mjs';
 import {
   curlFetchRaw,
   getProxyState,
@@ -36,6 +42,7 @@ import {
   getAllQuotas,
   resetQuotaCacheForTests,
 } from '../packages/daemon/src/quota.mjs';
+import { renderReceiptAscii, renderReceiptSvg } from '../packages/daemon/src/receipt.mjs';
 import { createMeterServer } from '../packages/daemon/src/server.mjs';
 import { TurnStore } from '../packages/daemon/src/store.mjs';
 
@@ -1305,6 +1312,300 @@ test('server: drainCursorSpool respects config.enabled and tools.cursor on start
     assert.equal(turns[0].turnUid, 'cursor:spooled:t1');
   } finally {
     await meter.stop();
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 11. Regressions: curl -K headers & direct system proxy, store >90d streak &
+//     '独立对话' & cache_write_tokens change, receipt '0×', codex .jsonl.zst,
+//     CDP exceptionDetails, setAppAutostart dryRun & offline CLI status config
+// ---------------------------------------------------------------------------
+
+test('net: curlFetchRaw sends sensitive headers via -K config file and httpRequestRaw uses curl proxy directly when helperBin is missing', async () => {
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/echo-secret') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ secret: req.headers['x-secret'] || null }));
+      return;
+    }
+    if (req.url === 'http://example.test/proxied') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ proxied: true, secret: req.headers['x-secret'] || null }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = srv.address().port;
+    const directRes = await curlFetchRaw(`http://127.0.0.1:${port}/echo-secret`, {
+      headers: { 'X-Secret': 'top-secret-token' },
+      timeoutMs: 3000,
+    });
+    assert.equal(directRes.status, 200);
+    assert.equal(JSON.parse(directRes.text).secret, 'top-secret-token');
+
+    const proxyRes = await httpRequestRaw('http://example.test/proxied', {
+      headers: { 'X-Secret': 'proxy-secret' },
+      timeoutMs: 3000,
+      _nativeHelperBin: null,
+      _proxyState: { hasSystemProxy: true, fallbackProxyUrl: `http://127.0.0.1:${port}` },
+      _directFetch: () => {
+        throw new Error('directFetch must not run when curl proxy path succeeds');
+      },
+    });
+    assert.equal(proxyRes.status, 200);
+    assert.deepEqual(JSON.parse(proxyRes.text), { proxied: true, secret: 'proxy-secret' });
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((resolve) => srv.close(resolve));
+  }
+});
+
+test('store & receipt: cache_write_tokens triggers upsert change, streakDays exceeds 90, projects localize independent chats, and 0x renders', () => {
+  const store = new TurnStore(':memory:');
+  try {
+    const first = store.upsertTurn({
+      turnUid: 'cursor:cw:1',
+      tool: 'cursor',
+      sessionId: 'cw',
+      turnId: '1',
+      model: 'gpt-5',
+      completedAtMs: Date.now(),
+      totalInputTokens: 1000,
+      uncachedInputTokens: 500,
+      cacheReadTokens: 500,
+      cacheWriteTokens: 0,
+      outputTokens: 100,
+    });
+    assert.equal(first.changed, true);
+
+    const second = store.upsertTurn({
+      turnUid: 'cursor:cw:1',
+      tool: 'cursor',
+      sessionId: 'cw',
+      turnId: '1',
+      model: 'gpt-5',
+      completedAtMs: Date.now(),
+      totalInputTokens: 1000,
+      uncachedInputTokens: 500,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 500,
+      outputTokens: 100,
+    });
+    assert.equal(second.changed, true);
+
+    const now = new Date();
+    const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    for (let i = 0; i < 95; i += 1) {
+      const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i, 12, 0, 0, 0);
+      store.upsertTurn({
+        turnUid: `codex:streak:${i}`,
+        tool: 'codex',
+        sessionId: 'streak',
+        turnId: `d-${i}`,
+        model: 'gpt-5',
+        workspacePath: '',
+        completedAtMs: day.getTime(),
+        totalInputTokens: 1000,
+        outputTokens: 100,
+      });
+    }
+    const receipt = store.getReceiptData({ scope: 'day', date: todayKey, groupBy: 'project' });
+    assert.ok(receipt.streakDays >= 95, `expected streakDays >= 95, got ${receipt.streakDays}`);
+    assert.equal(receipt.highlights.topProject.name, '独立对话');
+    assert.equal(store.getUsageSummary({ days: 7 }).byProject[0].name, '独立对话');
+
+    const zeroRatioReceipt = { ...receipt, vsDailyAvgRatio: 0 };
+    const ascii = renderReceiptAscii(zeroRatioReceipt);
+    const svg = renderReceiptSvg(zeroRatioReceipt);
+    assert.equal(ascii.includes('0×'), true);
+    assert.equal(svg.includes('0×'), true);
+  } finally {
+    store.close();
+  }
+});
+
+test('codex: parseCodexSessionDetailed strips .jsonl.zst for sessionId and fork baseline detection', () => {
+  const ts1 = '2026-11-24T10:00:00.000Z';
+  const ts2 = '2026-11-24T10:00:01.000Z';
+  const ts3 = '2026-11-24T10:00:02.000Z';
+  const ts4 = '2026-11-24T10:00:04.000Z';
+
+  const plainContent = [
+    JSON.stringify({ type: 'turn_context', timestamp: ts1, payload: { turn_id: 't1', model: 'gpt-5' } }),
+    JSON.stringify({
+      type: 'token_usage_record',
+      timestamp: ts2,
+      payload: {
+        turn_id: 't1',
+        response_id: 'r1',
+        usage: { input_tokens: 100, output_tokens: 20 },
+      },
+    }),
+    JSON.stringify({ type: 'event_msg', timestamp: ts3, payload: { type: 'task_complete', turn_id: 't1' } }),
+  ].join('\n');
+
+  const plainParsed = parseCodexSessionDetailed(
+    plainContent,
+    '/tmp/rollout-2026-11-24T10-00-00-abc123.jsonl.zst'
+  );
+  assert.equal(plainParsed.turns.length, 1);
+  assert.equal(plainParsed.turns[0].sessionId, 'rollout-2026-11-24T10-00-00-abc123');
+  assert.equal(plainParsed.turns[0].turnUid, 'codex:rollout-2026-11-24T10-00-00-abc123:t1');
+
+  const forkContent = [
+    JSON.stringify({ type: 'turn_context', timestamp: ts1, payload: { turn_id: 't1', model: 'gpt-5' } }),
+    JSON.stringify({
+      type: 'event_msg',
+      timestamp: ts2,
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 5000, output_tokens: 200 },
+          last_token_usage: { input_tokens: 500, output_tokens: 50 },
+        },
+      },
+    }),
+    JSON.stringify({
+      type: 'event_msg',
+      timestamp: ts3,
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 5600, output_tokens: 260 },
+          last_token_usage: { input_tokens: 600, output_tokens: 60 },
+        },
+      },
+    }),
+    JSON.stringify({ type: 'event_msg', timestamp: ts4, payload: { type: 'task_complete', turn_id: 't1' } }),
+  ].join('\n');
+
+  const forkParsed = parseCodexSessionDetailed(
+    forkContent,
+    '/tmp/fork_11111111-2222-3333-4444-555555555555.jsonl.zst'
+  );
+  assert.equal(forkParsed.turns.length, 1);
+  assert.equal(forkParsed.turns[0].sessionId, 'fork_11111111-2222-3333-4444-555555555555');
+  assert.equal(forkParsed.turns[0].totalInputTokens, 600);
+  assert.equal(forkParsed.turns[0].outputTokens, 60);
+});
+
+test('cdp: evaluateOnTarget resolves false promptly when CDP payload contains exceptionDetails', async () => {
+  const wsServer = http.createServer();
+  const upgradedSockets = new Set();
+  wsServer.on('upgrade', (req, socket) => {
+    upgradedSockets.add(socket);
+    socket.on('close', () => upgradedSockets.delete(socket));
+    const key = req.headers['sec-websocket-key'];
+    const accept = createHash('sha1')
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64');
+    socket.write(
+      [
+        'HTTP/1.1 101 Switching Protocols',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Accept: ${accept}`,
+        '',
+        '',
+      ].join('\r\n')
+    );
+    socket.once('data', (chunk) => {
+      let reqId = 1;
+      try {
+        const masked = (chunk[1] & 0x80) !== 0;
+        const len = chunk[1] & 0x7f;
+        let off = 2;
+        if (len === 126) off = 4;
+        else if (len === 127) off = 10;
+        const mask = masked ? chunk.subarray(off, off + 4) : null;
+        const payload = Buffer.from(chunk.subarray(masked ? off + 4 : off));
+        if (mask) {
+          for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
+        }
+        reqId = JSON.parse(payload.toString('utf8')).id ?? 1;
+      } catch {}
+      const reply = Buffer.from(
+        JSON.stringify({ id: reqId, result: { exceptionDetails: { text: 'Uncaught ReferenceError' } } })
+      );
+      socket.write(Buffer.concat([Buffer.from([0x81, reply.length]), reply]));
+    });
+  });
+
+  await new Promise((resolve) => wsServer.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = wsServer.address().port;
+    const injector = new CdpInlineInjector({ specs: [] });
+    const t0 = Date.now();
+    const ok = await injector.evaluateOnTarget(`ws://127.0.0.1:${port}/page/1`, 'throw new Error("x")');
+    const elapsedMs = Date.now() - t0;
+    assert.equal(ok, false);
+    assert.ok(elapsedMs < 600, `expected fast exceptionDetails resolution (<600ms), got ${elapsedMs}ms`);
+  } finally {
+    for (const s of upgradedSockets) {
+      try {
+        s.destroy();
+      } catch {}
+    }
+    wsServer.closeAllConnections?.();
+    await new Promise((done) => wsServer.close(() => done()));
+  }
+});
+
+test('installer & cli: setAppAutostart dryRun and offline cli status --json expose sanitized local config', async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-cli-offline-'));
+  try {
+    const fakeExe = join(tmpDir, 'AITurnMeter');
+    writeFileSync(fakeExe, '');
+    const enRes = setAppAutostart(true, { homeDir: tmpDir, appExe: fakeExe, dryRun: true, log: () => {} });
+    assert.equal(enRes.enabled, true);
+    assert.equal(existsSync(enRes.plistPath), false);
+    const plistXml = buildAppLaunchAgentPlist({ appExe: fakeExe });
+    assert.equal(plistXml.includes(fakeExe), true);
+
+    mkdirSync(join(tmpDir, 'Library', 'LaunchAgents'), { recursive: true });
+    writeFileSync(enRes.plistPath, plistXml);
+    const disRes = setAppAutostart(false, { homeDir: tmpDir, dryRun: true, log: () => {} });
+    assert.equal(disRes.enabled, false);
+    assert.equal(existsSync(enRes.plistPath), true);
+
+    writeFileSync(
+      join(tmpDir, 'config.json'),
+      JSON.stringify({
+        enabled: false,
+        cursorCookie: 'WorkosCursorSessionToken=secret',
+        tools: { codex: false, cursor: true },
+      })
+    );
+
+    const probeSrv = http.createServer();
+    await new Promise((resolve) => probeSrv.listen(0, '127.0.0.1', resolve));
+    const closedPort = probeSrv.address().port;
+    await new Promise((resolve) => probeSrv.close(resolve));
+
+    const out = execFileSync(
+      process.execPath,
+      [join(process.cwd(), 'packages/daemon/bin/cli.mjs'), 'status', '--json'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          AI_TURN_METER_STATE_DIR: tmpDir,
+          AI_TURN_METER_PORT: String(closedPort),
+        },
+      }
+    );
+    const status = JSON.parse(out);
+    assert.equal(status.online, false);
+    assert.equal(status.config.enabled, false);
+    assert.equal(status.config.hasCursorCookie, true);
+    assert.equal(status.config.cursorCookie, undefined);
+    assert.equal(status.config.tools.codex, false);
+    assert.equal(status.externalProviders, null);
+  } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
 });

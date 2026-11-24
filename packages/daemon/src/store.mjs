@@ -493,12 +493,14 @@ export class TurnStore {
       prev.total_input_tokens !== t.totalInputTokens ||
       prev.uncached_input_tokens !== t.uncachedInputTokens ||
       prev.cache_read_tokens !== t.cacheReadTokens ||
+      prev.cache_write_tokens !== t.cacheWriteTokens ||
       prev.output_tokens !== t.outputTokens ||
       (t.thinkingTokens !== null && prev.thinking_tokens !== t.thinkingTokens) ||
       (!preserveStreaming && (prev.tps !== t.tps || (t.tps !== null && prev.tps_method !== t.tpsMethod))) ||
       prev.call_count !== t.callCount ||
       (!prev.reply_preview && Boolean(t.replyPreview)) ||
       (prev.model === 'unknown' && t.model !== 'unknown') ||
+      (!preserveStreaming && t.model !== 'unknown' && prev.model !== t.model) ||
       (!prev.workspace_path && Boolean(t.workspacePath)) ||
       prev.explicit_cost_usd !== t.explicitCostUsd;
 
@@ -1294,7 +1296,7 @@ export class TurnStore {
       const rawWs = typeof row.workspace_path === 'string' ? row.workspace_path.trim() : '';
       const projKey = rawWs || '__independent__';
       if (!projectMap.has(projKey)) {
-        const name = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : 'Independent chats';
+        const name = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : '独立对话';
         projectMap.set(projKey, {
           name,
           path: rawWs || '未绑定工作区目录',
@@ -1535,7 +1537,7 @@ export class TurnStore {
         const rawWs = typeof row.workspace_path === 'string' ? row.workspace_path.trim() : '';
         const projKey = rawWs || '__independent__';
         if (!projectMap.has(projKey)) {
-          const name = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : 'Independent chats';
+          const name = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : '独立对话';
           projectMap.set(projKey, {
             name,
             path: rawWs || '未绑定工作区目录',
@@ -1772,7 +1774,7 @@ export class TurnStore {
       }
 
       const rawWs = typeof row.workspace_path === 'string' ? row.workspace_path.trim() : '';
-      const projName = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : 'Independent chats';
+      const projName = rawWs ? (rawWs.split('/').filter(Boolean).pop() || rawWs) : '独立对话';
       const projKey = rawWs || '__independent__';
       if (!projectMap.has(projKey)) {
         projectMap.set(projKey, { name: projName, path: rawWs || '未绑定工作区目录', acc: createUsageAccumulator() });
@@ -1939,10 +1941,27 @@ export class TurnStore {
           (b.estimatedCostUsd ?? -1) - (a.estimatedCostUsd ?? -1) || b.totalTokens - a.totalTokens
       );
 
-    // Compute consecutive active streak ending on range.date (or latest active day <= range.date)
-    const activeDateSet = new Set(availableDates.map((d) => d.date));
-    let streakDays = 0;
+    // Compute consecutive active streak ending on range.date (querying 365 days ending at range.endMs)
     const [ay, am, ad] = range.date.split('-').map(Number);
+    const streakStartMs = new Date(ay, am - 1, ad - 365, 0, 0, 0, 0).getTime();
+    const streakRows = tool
+      ? this.db
+          .prepare(
+            `SELECT completed_at_ms, tool FROM turns WHERE tool = ? AND completed_at_ms >= ? AND completed_at_ms < ?`
+          )
+          .all(tool, streakStartMs, range.endMs)
+      : this.db
+          .prepare(
+            `SELECT completed_at_ms, tool FROM turns WHERE completed_at_ms >= ? AND completed_at_ms < ?`
+          )
+          .all(streakStartMs, range.endMs);
+    const filteredStreakRows =
+      !tool && enabledTools ? streakRows.filter((r) => enabledTools[r.tool] !== false) : streakRows;
+    const activeDateSet = new Set();
+    for (const r of filteredStreakRows) {
+      activeDateSet.add(toLocalDateKey(r.completed_at_ms));
+    }
+    let streakDays = 0;
     for (let offset = 0; offset < 365; offset += 1) {
       const probe = new Date(ay, am - 1, ad - offset);
       const key = toLocalDateKey(probe.getTime());

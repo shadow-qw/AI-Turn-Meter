@@ -4,9 +4,57 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
 
+enum ActiveMainSheet: Identifiable, Equatable {
+  case ssh
+  case cursorLogin
+  case cursorCookie
+  case pluginLogin(String)
+  case pluginCode
+  case update
+
+  var id: String {
+    switch self {
+    case .ssh: return "ssh"
+    case .cursorLogin: return "cursorLogin"
+    case .cursorCookie: return "cursorCookie"
+    case .pluginLogin(let key): return "pluginLogin:\(key)"
+    case .pluginCode: return "pluginCode"
+    case .update: return "update"
+    }
+  }
+}
+
 @MainActor
 final class MeterViewModel: ObservableObject {
+  nonisolated static let cursorSessionCookieNames: Set<String> = [
+    "WorkosCursorSessionToken",
+    "__Secure-next-auth.session-token",
+    "next-auth.session-token",
+    "wos-session",
+    "__Secure-wos-session",
+    "authjs.session-token",
+    "__Secure-authjs.session-token",
+  ]
+
   let runtime = MeterRuntime()
+  private let bundleVersion: String? = Bundle.main.bundlePath.hasSuffix(".app")
+    ? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
+    : nil
+
+  private static func resolveInitialDaemonPort() -> Int {
+    if let raw = ProcessInfo.processInfo.environment["AI_TURN_METER_PORT"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+       let p = Int(raw), (1...65535).contains(p) {
+      return p
+    }
+    return 47831
+  }
+
+  private nonisolated static func detectAppAutostartEnabled() -> Bool {
+    FileManager.default.fileExists(
+      atPath: (NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents/com.local.ai-turn-meter.app.plist")
+    )
+  }
 
   private enum PrefKey {
     static let showMenuBarExtra = "aiTurnMeter.showMenuBarExtra"
@@ -30,7 +78,7 @@ final class MeterViewModel: ObservableObject {
   @Published var daemonVersion: String? = nil
   @Published var updateFeedUrl: String? = nil
   @Published var daemonOnline: Bool = false
-  @Published var daemonPort: Int = 47831
+  @Published var daemonPort: Int = MeterViewModel.resolveInitialDaemonPort()
   @Published var launchAgentExists: Bool = false
   @Published var launchAgentLoaded: Bool = false
 
@@ -49,9 +97,77 @@ final class MeterViewModel: ObservableObject {
     "codebuddy": true,
   ]
   @Published var hasCursorCookie: Bool = false
-  @Published var showCursorCookieSheet: Bool = false
-  @Published var showCursorLoginSheet: Bool = false
+  @Published var activeSheet: ActiveMainSheet? = nil
   @Published var cursorCookieDraft: String = ""
+
+  var showCursorCookieSheet: Bool {
+    get { activeSheet == .cursorCookie }
+    set { setSheet(.cursorCookie, presented: newValue) }
+  }
+  var showCursorLoginSheet: Bool {
+    get { activeSheet == .cursorLogin }
+    set { setSheet(.cursorLogin, presented: newValue) }
+  }
+  var showPluginCodeSheet: Bool {
+    get { activeSheet == .pluginCode }
+    set { setSheet(.pluginCode, presented: newValue) }
+  }
+  var showSshSheet: Bool {
+    get { activeSheet == .ssh }
+    set { setSheet(.ssh, presented: newValue) }
+  }
+  var showUpdateSheet: Bool {
+    get { activeSheet == .update }
+    set { setSheet(.update, presented: newValue) }
+  }
+  var pluginLoginKey: String? {
+    get {
+      if case .pluginLogin(let k) = activeSheet { return k }
+      return nil
+    }
+    set {
+      if let k = newValue {
+        presentSheet(.pluginLogin(k))
+      } else if case .pluginLogin = activeSheet {
+        activeSheet = nil
+      }
+    }
+  }
+
+  private func setSheet(_ sheet: ActiveMainSheet, presented: Bool) {
+    if presented {
+      presentSheet(sheet)
+    } else if activeSheet == sheet {
+      activeSheet = nil
+    }
+  }
+
+  func presentSheet(_ target: ActiveMainSheet) {
+    if activeSheet == nil {
+      activeSheet = target
+    } else if activeSheet != target {
+      activeSheet = nil
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
+        self?.activeSheet = target
+      }
+    }
+  }
+
+  private func daemonUrl(_ path: String, query: [(String, String?)] = []) -> URL? {
+    var comps = URLComponents()
+    comps.scheme = "http"
+    comps.host = "127.0.0.1"
+    comps.port = daemonPort
+    comps.path = path.hasPrefix("/") ? path : "/\(path)"
+    let items = query.compactMap { name, val -> URLQueryItem? in
+      guard let val = val else { return nil }
+      return URLQueryItem(name: name, value: val)
+    }
+    if !items.isEmpty {
+      comps.queryItems = items
+    }
+    return comps.url
+  }
 
   @Published var showMenuBarExtra: Bool = UserDefaults.standard.object(forKey: PrefKey.showMenuBarExtra) as? Bool ?? true
   @Published var menuBarDisplayMode: MenuBarDisplayMode = {
@@ -93,9 +209,8 @@ final class MeterViewModel: ObservableObject {
   @Published var hideDockIcon: Bool = UserDefaults.standard.bool(forKey: PrefKey.hideDockIcon)
   @Published var showRecentWindowsInMenu: Bool = UserDefaults.standard.bool(forKey: PrefKey.showRecentWindowsInMenu)
   @Published var alertsEnabled: Bool = UserDefaults.standard.object(forKey: PrefKey.alertsEnabled) as? Bool ?? true
-  @Published var launchAtLogin: Bool = FileManager.default.fileExists(
-    atPath: (NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents/com.local.ai-turn-meter.app.plist")
-  )
+  @Published var alertDeliveryError: String? = nil
+  @Published var launchAtLogin: Bool = MeterViewModel.detectAppAutostartEnabled()
 
   @Published var settingsPane: SettingsPane = .provider("antigravity")
   @Published var activeTab: MainTab = .control
@@ -151,15 +266,12 @@ final class MeterViewModel: ObservableObject {
   @Published var externalProviders: [ExternalProviderMeta] = []
   @Published var providerOrder: [String] = UserDefaults.standard.stringArray(forKey: PrefKey.providerOrder) ?? ProviderOrder.defaultBuiltIn
   @Published var providersDir: String = (NSHomeDirectory() as NSString).appendingPathComponent(".local/share/ai-turn-meter/providers")
-  @Published var showPluginCodeSheet: Bool = false
-  @Published var pluginLoginKey: String? = nil
   @Published var pluginImportBusy: Bool = false
 
   @Published var busy: Bool = false
   @Published var statusBanner: String? = nil
   @Published var bannerIsError: Bool = false
   @Published var showUninstallAlert: Bool = false
-  @Published var showSshSheet: Bool = false
   @Published var sshHost: String = ""
   @Published var sshPreview: String = ""
   @Published var sshOneLiner: String = ""
@@ -168,9 +280,9 @@ final class MeterViewModel: ObservableObject {
   @Published var sshApplying: Bool = false
   @Published var knownSshHosts: [String] = []
 
-  @Published var showUpdateSheet: Bool = false
   @Published var updateChecking: Bool = false
   @Published var updateDownloading: Bool = false
+  @Published var updateDownloadProgress: Double? = nil
   @Published var availableUpdate: UpdateReleaseInfo? = nil
   @Published var updateStatusText: String = ""
 
@@ -183,15 +295,32 @@ final class MeterViewModel: ObservableObject {
   private var sseConnected: Bool = false
   private var sseTurnRefreshWorkItem: DispatchWorkItem?
   private var didBootstrap = false
+  private var doctorBootstrapInFlight = false
   private var didTryRestoreWebCookie = false
   private var hasStarted = false
   private var lastUsageRefreshAt: Date = .distantPast
   private var isReceiptDateAutoToday: Bool = true
   private var isUpdatingReceiptDateAutomatically: Bool = false
+  private var appsStatusSeq: UInt64 = 0
+  private var stateLightSeq: UInt64 = 0
   private var usageFetchSeq: UInt64 = 0
+  private var usageInFlightIsForce: Bool = false
+  private var usageLastStartedAt: Date = .distantPast
+  private var usageLastFilter: String = "all"
+  private var usageLastDays: Int = 7
   private var turnsFetchSeq: UInt64 = 0
   private var receiptFetchSeq: UInt64 = 0
+  private var fingerprintSeq: UInt64 = 0
   private var sshSnippetSeq: UInt64 = 0
+  private var activeUpdateDownloadTask: URLSessionDownloadTask? = nil
+  private var updateProgressObs: NSKeyValueObservation? = nil
+
+  init() {
+    if hideDockIcon && !showMenuBarExtra {
+      showMenuBarExtra = true
+      UserDefaults.standard.set(true, forKey: PrefKey.showMenuBarExtra)
+    }
+  }
 
   func isExternalProvider(_ key: String) -> Bool {
     key.hasPrefix("ext:")
@@ -314,6 +443,11 @@ export default {
   }
 
   func importPluginFileURLs(_ urls: [URL]) {
+    guard !pluginImportBusy else {
+      bannerIsError = true
+      statusBanner = "正在导入其他插件，请稍候"
+      return
+    }
     let mjsUrls = urls.filter { $0.pathExtension.lowercased() == "mjs" }
     guard !mjsUrls.isEmpty else {
       bannerIsError = true
@@ -321,15 +455,17 @@ export default {
       return
     }
     if mjsUrls.count == 1 {
-      importPluginFileURL(mjsUrls[0], overrideFileName: nil, navigateToImported: true)
+      importPluginFileURL(mjsUrls[0], overrideFileName: nil, navigateToImported: true, clearBusyOnFinish: true)
       return
     }
+    pluginImportBusy = true
     var remaining = mjsUrls
     var successCount = 0
     var lastError: String? = nil
 
     func next() {
       guard !remaining.isEmpty else {
+        self.pluginImportBusy = false
         if let err = lastError, successCount == 0 {
           self.bannerIsError = true
           self.statusBanner = err
@@ -343,7 +479,12 @@ export default {
         return
       }
       let url = remaining.removeFirst()
-      self.importPluginFileURL(url, overrideFileName: nil, navigateToImported: remaining.isEmpty && successCount == 0) { ok, err in
+      self.importPluginFileURL(
+        url,
+        overrideFileName: nil,
+        navigateToImported: remaining.isEmpty && successCount == 0,
+        clearBusyOnFinish: false
+      ) { ok, err in
         if ok { successCount += 1 }
         else if let err = err { lastError = err }
         next()
@@ -356,17 +497,25 @@ export default {
     _ fileUrl: URL,
     overrideFileName: String?,
     navigateToImported: Bool,
+    clearBusyOnFinish: Bool = true,
     completion: ((Bool, String?) -> Void)? = nil
   ) {
     guard let content = try? String(contentsOf: fileUrl, encoding: .utf8) else {
       let msg = "无法读取文件：\(fileUrl.lastPathComponent)"
       bannerIsError = true
       statusBanner = msg
+      if clearBusyOnFinish { pluginImportBusy = false }
       completion?(false, msg)
       return
     }
     let fileName = overrideFileName ?? fileUrl.lastPathComponent
-    importPlugin(fileName: fileName, content: content, navigateToImported: navigateToImported, completion: completion)
+    performImportPlugin(
+      fileName: fileName,
+      content: content,
+      navigateToImported: navigateToImported,
+      clearBusyOnFinish: clearBusyOnFinish,
+      completion: completion
+    )
   }
 
   func importPlugin(
@@ -375,11 +524,32 @@ export default {
     navigateToImported: Bool = true,
     completion: ((Bool, String?) -> Void)? = nil
   ) {
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/import"),
+    guard !pluginImportBusy else {
+      completion?(false, "正在导入其他插件，请稍候")
+      return
+    }
+    performImportPlugin(
+      fileName: fileName,
+      content: content,
+      navigateToImported: navigateToImported,
+      clearBusyOnFinish: true,
+      completion: completion
+    )
+  }
+
+  private func performImportPlugin(
+    fileName: String,
+    content: String,
+    navigateToImported: Bool,
+    clearBusyOnFinish: Bool,
+    completion: ((Bool, String?) -> Void)?
+  ) {
+    guard let url = daemonUrl("/v1/providers/import"),
           let jsonData = try? JSONSerialization.data(withJSONObject: [
             "fileName": fileName,
             "content": content,
           ]) else {
+      if clearBusyOnFinish { pluginImportBusy = false }
       completion?(false, "无法构建导入请求")
       return
     }
@@ -387,14 +557,16 @@ export default {
     bannerIsError = false
     statusBanner = "正在校验并导入插件 \(fileName)…"
 
-    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 15)
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 25)
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = jsonData
 
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
-        self.pluginImportBusy = false
+        if clearBusyOnFinish {
+          self.pluginImportBusy = false
+        }
         if let err = err {
           let msg = "导入失败：\(err.localizedDescription)"
           self.bannerIsError = true
@@ -447,16 +619,12 @@ export default {
   }
 
   func removeExternalPlugin(_ meta: ExternalProviderMeta) {
-    let queryPart: String
-    if let fileName = meta.fileName, let enc = fileName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-      queryPart = "fileName=\(enc)"
-    } else if let enc = meta.key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-      queryPart = "key=\(enc)"
-    } else {
-      return
+    var query: [(String, String?)] = [("key", meta.key)]
+    if let fileName = meta.fileName, !fileName.isEmpty {
+      query.append(("fileName", fileName))
     }
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers?\(queryPart)") else { return }
-    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 8)
+    guard let url = daemonUrl("/v1/providers", query: query) else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 10)
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
@@ -465,16 +633,24 @@ export default {
           self.statusBanner = "移除插件失败：\(err.localizedDescription)"
           return
         }
-        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-          self.bannerIsError = true
-          self.statusBanner = "移除插件失败"
-          return
-        }
         struct RemoveRes: Decodable {
           let ok: Bool?
+          let deleted: Bool?
+          let error: String?
           let providers: [ExternalProviderMeta]?
         }
-        if let data = data, let parsed = try? JSONDecoder().decode(RemoveRes.self, from: data), let list = parsed.providers {
+        let parsed = data.flatMap { try? JSONDecoder().decode(RemoveRes.self, from: $0) }
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200, parsed?.ok == true else {
+          self.bannerIsError = true
+          self.statusBanner = parsed?.error ?? "移除插件失败"
+          return
+        }
+        if parsed?.deleted == false {
+          self.bannerIsError = true
+          self.statusBanner = "移除插件失败（未找到插件文件：\(meta.fileName ?? meta.key)）"
+          return
+        }
+        if let list = parsed?.providers {
           self.applyExternalProviders(list)
         } else {
           self.externalProviders.removeAll(where: { $0.key == meta.key })
@@ -506,11 +682,11 @@ export default {
   }
 
   func savePluginCredentials(key: String, credentials: [String: Any]) {
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/auth"),
+    guard let url = daemonUrl("/v1/providers/auth"),
           let body = try? JSONSerialization.data(withJSONObject: ["key": key, "credentials": credentials]) else { return }
     bannerIsError = false
     statusBanner = "已获取登录凭证，正在同步额度…"
-    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 20)
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 25)
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = body
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
@@ -519,14 +695,20 @@ export default {
         struct AuthRes: Decodable {
           let ok: Bool?
           let error: String?
+          let provider: ExternalProviderMeta?
           let providers: [ExternalProviderMeta]?
         }
         let http = resp as? HTTPURLResponse
         let parsed = data.flatMap { try? JSONDecoder().decode(AuthRes.self, from: $0) }
         if err == nil, http?.statusCode == 200, parsed?.ok == true {
           if let list = parsed?.providers { self.applyExternalProviders(list) }
-          self.bannerIsError = false
-          self.statusBanner = "登录授权成功"
+          if let prov = parsed?.provider, prov.ok == false {
+            self.bannerIsError = true
+            self.statusBanner = prov.error ?? "已保存登录凭证，但同步额度失败"
+          } else {
+            self.bannerIsError = false
+            self.statusBanner = "登录授权成功"
+          }
           self.fetchAppsStatusHttp(forceRefresh: true)
           self.fetchUsageSummary(silent: false, forceRefresh: true)
         } else {
@@ -538,26 +720,41 @@ export default {
   }
 
   func clearPluginCredentials(_ key: String) {
-    guard let enc = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/auth?key=\(enc)") else { return }
-    if let auth = externalProviderMeta(for: key)?.auth, auth.isWebCookie {
-      let domains = (auth.cookieDomains ?? []).map { $0.lowercased() }
-      let store = WKWebsiteDataStore.default().httpCookieStore
-      store.getAllCookies { cookies in
-        for c in cookies {
-          let cd = c.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-          if domains.contains(where: { cd == $0 || $0.hasSuffix("." + cd) || cd.hasSuffix("." + $0) }) {
-            store.delete(c, completionHandler: nil)
-          }
-        }
-      }
-    }
-    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 15)
-    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, _, _ in
+    guard let url = daemonUrl("/v1/providers/auth", query: [("key", key)]) else { return }
+    let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 25)
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
-        struct Res: Decodable { let providers: [ExternalProviderMeta]? }
-        if let d = data, let r = try? JSONDecoder().decode(Res.self, from: d), let list = r.providers {
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "清除登录凭证失败：\(err.localizedDescription)"
+          return
+        }
+        struct Res: Decodable {
+          let ok: Bool?
+          let error: String?
+          let providers: [ExternalProviderMeta]?
+        }
+        let http = resp as? HTTPURLResponse
+        let parsed = data.flatMap { try? JSONDecoder().decode(Res.self, from: $0) }
+        guard http?.statusCode == 200, parsed?.ok == true else {
+          self.bannerIsError = true
+          self.statusBanner = parsed?.error ?? "清除登录凭证失败（HTTP \(http?.statusCode ?? 0)）"
+          return
+        }
+        if let auth = self.externalProviderMeta(for: key)?.auth, auth.isWebCookie {
+          let domains = (auth.cookieDomains ?? []).map { $0.lowercased() }
+          let store = WKWebsiteDataStore.default().httpCookieStore
+          store.getAllCookies { cookies in
+            for c in cookies {
+              let cd = c.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+              if domains.contains(where: { cd == $0 || cd.hasSuffix("." + $0) }) {
+                store.delete(c, completionHandler: nil)
+              }
+            }
+          }
+        }
+        if let list = parsed?.providers {
           self.applyExternalProviders(list)
         }
         self.bannerIsError = false
@@ -568,8 +765,8 @@ export default {
   }
 
   func reloadExternalProviders() {
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/providers/reload") else { return }
-    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 15)
+    guard let url = daemonUrl("/v1/providers/reload") else { return }
+    var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 25)
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = Data("{}".utf8)
     statusBanner = "正在重新扫描外部数据源插件…"
@@ -618,6 +815,14 @@ export default {
     }
     if isExternalProvider(popoverSelection) && !list.contains(where: { $0.key == popoverSelection && isToolEnabled($0.key) }) {
       popoverSelection = "all"
+    }
+    if isExternalProvider(menuBarProvider) && !list.contains(where: { $0.key == menuBarProvider }) {
+      setMenuBarProvider("auto")
+    }
+    if case .provider(let activeKey) = settingsPane,
+       isExternalProvider(activeKey),
+       !list.contains(where: { $0.key == activeKey }) {
+      settingsPane = .plugins
     }
   }
 
@@ -726,7 +931,13 @@ export default {
           self.statusBanner = enabled ? "已开启开机自动驻留顶部菜单栏" : "已关闭开机自动启动菜单栏"
         } else {
           self.bannerIsError = true
-          let msg = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+          struct CliErrRes: Decodable { let error: String? }
+          let stdoutErr = res.stdout.data(using: .utf8)
+            .flatMap { try? JSONDecoder().decode(CliErrRes.self, from: $0) }?
+            .error?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+          let stderrMsg = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+          let msg = (stdoutErr?.isEmpty == false ? stdoutErr! : stderrMsg)
           self.statusBanner = msg.isEmpty ? "设置开机自启失败" : msg
         }
       }
@@ -752,6 +963,12 @@ export default {
     alertsEnabled = value
     alertManager.enabled = value
     onPreferencesChanged?()
+  }
+
+  func openNotificationSettings() {
+    if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+      NSWorkspace.shared.open(url)
+    }
   }
 
   private func evaluateAlerts() {
@@ -782,12 +999,13 @@ export default {
     switch pane {
     case .usage:
       activeTab = .usage
-      fetchUsageSummary()
     case .turns:
       activeTab = .turns
-      fetchRecentTurns()
     default:
       activeTab = .control
+    }
+    if pane == .general {
+      alertManager.refreshPermissionStatus()
     }
   }
 
@@ -800,11 +1018,19 @@ export default {
   func start() {
     guard !hasStarted else { return }
     hasStarted = true
+    alertManager.onDeliveryErrorChanged = { [weak self] err in
+      self?.alertDeliveryError = err
+    }
     alertManager.enabled = alertsEnabled
     if alertsEnabled {
       alertManager.requestPermissionIfNeeded()
     }
-    knownSshHosts = MeterRuntime.readSshConfigHosts()
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      let hosts = MeterRuntime.readSshConfigHosts()
+      DispatchQueue.main.async { [weak self] in
+        self?.knownSshHosts = hosts
+      }
+    }
     configureSSE()
     sseClient.start(port: daemonPort)
     refreshDoctorAndBootstrap()
@@ -822,6 +1048,10 @@ export default {
     pollTimer = nil
     sseTurnRefreshWorkItem?.cancel()
     sseTurnRefreshWorkItem = nil
+    updateProgressObs?.invalidate()
+    updateProgressObs = nil
+    activeUpdateDownloadTask?.cancel()
+    activeUpdateDownloadTask = nil
     sseClient.stop()
     sseConnected = false
     hasStarted = false
@@ -832,7 +1062,12 @@ export default {
       self?.sseConnected = true
     }
     sseClient.onDisconnected = { [weak self] in
-      self?.sseConnected = false
+      guard let self = self else { return }
+      self.sseConnected = false
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        guard let self = self, !self.busy, !self.sseConnected else { return }
+        self.fetchDaemonStateLight()
+      }
     }
     sseClient.onEvent = { [weak self] ev in
       guard let self = self else { return }
@@ -872,11 +1107,18 @@ export default {
       MainActor.assumeIsolated {
         guard let self = self else { return }
         let hasVisibleWindow = self.hasVisibleAppWindow
-        if hasVisibleWindow || self.showMenuBarExtra {
+        if (hasVisibleWindow || self.showMenuBarExtra),
+           Date().timeIntervalSince(self.usageLastStartedAt) >= 0.6 {
           self.fetchUsageSummary(silent: true)
         }
         if self.activeTab == .turns && hasVisibleWindow {
           self.fetchRecentTurns(silent: true)
+        }
+        if self.settingsPane == .usage && self.usageGroupMode == "daily" && hasVisibleWindow {
+          _ = self.syncReceiptDateForCurrentDayIfNeeded()
+          if self.receiptDate == Self.currentIsoDayString() {
+            self.fetchReceipt(silent: true)
+          }
         }
       }
     }
@@ -887,13 +1129,13 @@ export default {
   func pollTick() {
     guard !busy else { return }
     let receiptRolledOver = syncReceiptDateForCurrentDayIfNeeded()
+    if receiptRolledOver {
+      fetchReceipt(silent: true)
+    }
     if hasVisibleAppWindow {
       fetchAppsStatusHttp()
       if Date().timeIntervalSince(lastUsageRefreshAt) >= 30 || receiptRolledOver {
         fetchUsageSummary(silent: true)
-      }
-      if receiptRolledOver && receiptData != nil {
-        fetchReceipt(silent: true)
       }
       if activeTab == .turns && !sseConnected {
         fetchRecentTurns(silent: true)
@@ -958,13 +1200,16 @@ export default {
   }
 
   func appSubtitle(for key: String) -> String {
-    guard let entry = apps[key], entry.installed else { return "未安装" }
+    guard let entry = apps[key], (entry.installed || entry.latestTurn != nil) else { return "未安装" }
     if !masterEnabled { return "全局已暂停显示" }
     if !isToolEnabled(key) { return "已关闭此软件显示" }
 
     if let turn = entry.latestTurn, let inline = turn.inlineText {
       let modelStr = (turn.model != nil && turn.model != "unknown") ? "\(turn.model!) · " : ""
       return "\(modelStr)\(inline)"
+    }
+    if !entry.installed {
+      return "CLI 已就绪，等待新对话记录"
     }
     if key == "cursor" || key == "codebuddy" {
       return entry.cdpPort != nil ? "已开启状态栏与消息旁胶囊，等待首轮对话" : "已在右下角状态栏就绪，等待首轮对话"
@@ -982,13 +1227,15 @@ export default {
 
   func fetchAppsStatusHttp(forceRefresh: Bool = false) {
     guard !busy else { return }
-    let qs = forceRefresh ? "?refresh=1" : ""
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/apps\(qs)") else { return }
+    let query: [(String, String?)] = forceRefresh ? [("refresh", "1")] : []
+    guard let url = daemonUrl("/v1/apps", query: query) else { return }
+    appsStatusSeq &+= 1
+    let seq = appsStatusSeq
     let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 4)
 
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
+        guard let self = self, self.appsStatusSeq == seq else { return }
         if err != nil {
           self.daemonOnline = false
           self.onStateUpdated?()
@@ -1005,12 +1252,14 @@ export default {
   }
 
   func fetchDaemonStateLight() {
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/state?limit=30") else { return }
+    guard let url = daemonUrl("/v1/state", query: [("limit", "30")]) else { return }
+    stateLightSeq &+= 1
+    let seq = stateLightSeq
     let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 2)
 
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
+        guard let self = self, self.stateLightSeq == seq else { return }
         if err != nil {
           self.daemonOnline = false
           self.onStateUpdated?()
@@ -1069,7 +1318,9 @@ export default {
     if let today = parsed.todaySummary {
       let prevTurns = self.todaySummary?.turnCount ?? -1
       self.todaySummary = today
-      if today.turnCount != prevTurns || self.usageData == nil {
+      if (today.turnCount != prevTurns || self.usageData == nil),
+         !self.usageInFlightIsForce,
+         Date().timeIntervalSince(self.usageLastStartedAt) >= 0.6 {
         self.fetchUsageSummary(silent: true)
       }
     }
@@ -1104,13 +1355,25 @@ export default {
 
   func fetchUsageSummary(silent: Bool = false, forceRefresh: Bool = false) {
     let toolFilter = usageToolFilter
-    let toolQs = toolFilter == "all" ? "" : "&tool=\(toolFilter)"
-    let refreshQs = forceRefresh ? "&refresh=1" : ""
-    guard let url = URL(
-      string: "http://127.0.0.1:\(daemonPort)/v1/usage?days=\(usageDays)\(toolQs)\(refreshQs)"
-    ) else { return }
+    let days = usageDays
+    if !forceRefresh {
+      if usageInFlightIsForce {
+        return
+      }
+      if silent && days == usageLastDays && toolFilter == usageLastFilter && Date().timeIntervalSince(usageLastStartedAt) < 0.5 && usageLoading {
+        return
+      }
+    }
+    var query: [(String, String?)] = [("days", "\(days)")]
+    if toolFilter != "all" { query.append(("tool", toolFilter)) }
+    if forceRefresh { query.append(("refresh", "1")) }
+    guard let url = daemonUrl("/v1/usage", query: query) else { return }
     usageFetchSeq &+= 1
     let seq = usageFetchSeq
+    usageInFlightIsForce = forceRefresh
+    usageLastStartedAt = Date()
+    usageLastFilter = toolFilter
+    usageLastDays = days
     if !silent { usageLoading = true }
     let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 20)
 
@@ -1118,6 +1381,7 @@ export default {
       DispatchQueue.main.async { [weak self] in
         guard let self = self, self.usageFetchSeq == seq else { return }
         self.usageLoading = false
+        self.usageInFlightIsForce = false
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let data = data,
               let parsed = try? JSONDecoder().decode(UsageSummaryResponse.self, from: data) else {
@@ -1142,8 +1406,9 @@ export default {
   }
 
   func fetchRecentTurns(silent: Bool = false) {
-    let qs = recentTurnsFilterTool == "all" ? "limit=80" : "limit=80&tool=\(recentTurnsFilterTool)"
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/turns?\(qs)") else { return }
+    var query: [(String, String?)] = [("limit", "80")]
+    if recentTurnsFilterTool != "all" { query.append(("tool", recentTurnsFilterTool)) }
+    guard let url = daemonUrl("/v1/turns", query: query) else { return }
     turnsFetchSeq &+= 1
     let seq = turnsFetchSeq
     if !silent { recentTurnsLoading = true }
@@ -1164,7 +1429,7 @@ export default {
   }
 
   private func applyStatus(_ st: StatusResponse) {
-    if let v = st.version { self.version = v }
+    if bundleVersion == nil, let v = st.version { self.version = v }
     self.daemonOnline = st.online
     if self.daemonPort != st.port {
       self.daemonPort = st.port
@@ -1178,6 +1443,8 @@ export default {
     }
     if let extList = st.externalProviders {
       self.applyExternalProviders(extList)
+    } else if st.online {
+      self.applyExternalProviders([])
     }
     self.lastSyncedAt = Date()
     if let cfg = st.config {
@@ -1187,7 +1454,9 @@ export default {
       if let today = state.todaySummary {
         let prevTurns = self.todaySummary?.turnCount ?? -1
         self.todaySummary = today
-        if today.turnCount != prevTurns || self.usageData == nil {
+        if (today.turnCount != prevTurns || self.usageData == nil),
+           !self.usageInFlightIsForce,
+           Date().timeIntervalSince(self.usageLastStartedAt) >= 0.6 {
           self.fetchUsageSummary(silent: true)
         }
       }
@@ -1198,7 +1467,7 @@ export default {
   }
 
   private func applyDoctor(_ doc: DoctorResponse) {
-    if let v = doc.version { self.version = v }
+    if bundleVersion == nil, let v = doc.version { self.version = v }
     self.daemonVersion = doc.daemon.version
     self.updateFeedUrl = doc.updateFeedUrl
     self.daemonOnline = doc.daemon.ok
@@ -1219,10 +1488,10 @@ export default {
   }
 
   func refreshDoctorAndBootstrap() {
-    guard !busy else { return }
+    guard !busy, !doctorBootstrapInFlight else { return }
     let rt = runtime
     let shouldAutoBootstrap = !didBootstrap
-    didBootstrap = true
+    doctorBootstrapInFlight = true
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let docRes = rt.runCli(["doctor", "--json"], timeoutSec: 12)
@@ -1233,16 +1502,20 @@ export default {
 
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
+        self.doctorBootstrapInFlight = false
         if let doc = doc { self.applyDoctor(doc) }
         if let st = st { self.applyStatus(st) }
 
-        if shouldAutoBootstrap, !rt.runningFromDmg, let doc = doc {
+        if shouldAutoBootstrap, !rt.runningFromDmg, let doc = doc, !self.busy {
+          self.didBootstrap = true
           let targetVersion = doc.version ?? self.version
           let isBundledApp = Bundle.main.bundlePath.hasSuffix(".app")
           let daemonVersionMismatch = doc.daemon.ok && doc.daemon.version != targetVersion
+          let vsixNeedsUpgrade = (doc.vsixVersionMismatch == true)
           let needsAppUpgrade =
             (isBundledApp && doc.launchAgent.pointsToCurrentRoot == false) ||
-            daemonVersionMismatch
+            daemonVersionMismatch ||
+            vsixNeedsUpgrade
 
           if !doc.launchAgent.plistExists {
             self.runAction(args: ["install"], successText: "已完成首次安装并开启") { [weak self] in
@@ -1274,6 +1547,7 @@ export default {
     if enabled && (!launchAgentExists || !daemonOnline) {
       let args = launchAgentExists ? ["start-daemon"] : ["install"]
       runAction(args: args, successText: "已一键开启") { [weak self] in
+        if let p = self?.daemonPort { self?.sseClient.reconnect(port: p) }
         self?.postConfig(["enabled": true], quietBanner: true)
       }
       return
@@ -1291,6 +1565,7 @@ export default {
       masterEnabled = true
       let args = launchAgentExists ? ["start-daemon"] : ["install"]
       runAction(args: args, successText: "\(displayTitle(for: key)) 已开启") { [weak self] in
+        if let p = self?.daemonPort { self?.sseClient.reconnect(port: p) }
         self?.postConfig(["enabled": true, "tools": [key: true]], quietBanner: true)
       }
       return
@@ -1332,30 +1607,52 @@ export default {
     )
   }
 
+  private final class CursorSyncBox: @unchecked Sendable {
+    private let lock = NSLock()
+    var syncOk = false
+    var email: String? = nil
+    var errorMsg: String? = nil
+    var timedOut = false
+
+    func finishWithResponse(_ data: Data?, error: Error?) {
+      lock.lock()
+      defer { lock.unlock() }
+      guard !timedOut else { return }
+      if let error = error {
+        errorMsg = "同步本机 Cursor 登录态失败：\(error.localizedDescription)"
+        return
+      }
+      if let data = data,
+         let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        syncOk = (obj["ok"] as? Bool) == true
+        email = obj["email"] as? String
+        errorMsg = obj["error"] as? String
+      }
+    }
+
+    func markTimedOut() {
+      lock.lock()
+      defer { lock.unlock() }
+      timedOut = true
+      errorMsg = "同步本机 Cursor 登录态超时，请重试或使用「网页登录同步…」"
+    }
+
+    func snapshot() -> (syncOk: Bool, email: String?, errorMsg: String?) {
+      lock.lock()
+      defer { lock.unlock() }
+      return (syncOk, email, errorMsg)
+    }
+  }
+
   func openAppWithInlineCdp(_ key: String) {
     guard !busy, !runtime.runningFromDmg else { return }
     let title = displayTitle(for: key)
-    terminateRunningAppGently(for: key)
     runAction(args: ["open", key], successText: "已为 \(title) 开启消息旁显示")
   }
 
   func openAllAppsWithInlineCdp() {
     guard !busy, !runtime.runningFromDmg else { return }
-    for key in appsNeedingInlineCdp {
-      terminateRunningAppGently(for: key)
-    }
     runAction(args: ["open", "all"], successText: "已开启全部消息旁显示")
-  }
-
-  private func terminateRunningAppGently(for key: String) {
-    guard let targetPath = apps[key]?.appPath else { return }
-    let targetStd = (targetPath as NSString).standardizingPath
-    for runningApp in NSWorkspace.shared.runningApplications {
-      if let bundlePath = runningApp.bundleURL?.path,
-         (bundlePath as NSString).standardizingPath == targetStd {
-        runningApp.terminate()
-      }
-    }
   }
 
   func saveCursorCookie(_ raw: String?) {
@@ -1366,8 +1663,12 @@ export default {
     if trimmed.isEmpty {
       let cookieStore = WKWebsiteDataStore.default().httpCookieStore
       cookieStore.getAllCookies { cookies in
-        for c in cookies where c.domain.lowercased().contains("cursor.com") && c.name == "WorkosCursorSessionToken" {
-          cookieStore.delete(c, completionHandler: nil)
+        for c in cookies {
+          let dom = c.domain.lowercased()
+          if (dom.contains("cursor.com") || dom.contains("cursor.sh")) &&
+              Self.cursorSessionCookieNames.contains(c.name) {
+            cookieStore.delete(c, completionHandler: nil)
+          }
         }
       }
     }
@@ -1375,8 +1676,7 @@ export default {
       ["cursorCookie": trimmed],
       quietBanner: false,
       bannerText: trimmed.isEmpty ? "已清除 Cursor 会话 Cookie" : "已保存 Cursor 会话 Cookie，正在同步额度…"
-    )
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+    ) { [weak self] in
       self?.fetchUsageSummary(silent: false, forceRefresh: true)
     }
   }
@@ -1390,9 +1690,7 @@ export default {
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let passwords = HeadlessCliHelper.readCursorSafeStoragePasswords(allowPrompt: true)
-      var syncOk = false
-      var email: String? = nil
-      var errorMsg: String? = nil
+      let box = CursorSyncBox()
 
       if let url = URL(string: "http://127.0.0.1:\(port)/v1/cursor/sync-local"),
          let jsonData = try? JSONSerialization.data(withJSONObject: ["passwords": passwords]) {
@@ -1400,47 +1698,59 @@ export default {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = jsonData
         let sem = DispatchSemaphore(value: 0)
-        DaemonAuth.localSession.dataTask(with: req) { data, _, _ in
-          if let data = data,
-             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            syncOk = (obj["ok"] as? Bool) == true
-            email = obj["email"] as? String
-            errorMsg = obj["error"] as? String
-          }
+        let task = DaemonAuth.localSession.dataTask(with: req) { data, _, err in
+          box.finishWithResponse(data, error: err)
           sem.signal()
-        }.resume()
-        _ = sem.wait(timeout: .now() + 16)
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + 16) == .timedOut {
+          box.markTimedOut()
+          task.cancel()
+        }
       } else {
-        errorMsg = "无法连接本地统计服务"
+        box.markTimedOut()
       }
 
+      let result = box.snapshot()
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
         self.busy = false
-        if syncOk {
+        if result.syncOk {
           self.hasCursorCookie = true
           self.bannerIsError = false
-          self.statusBanner = email != nil ? "已从本机 Cursor 同步账号（\(email!)）" : "已从本机 Cursor 同步套餐额度"
+          self.statusBanner = result.email != nil
+            ? "已从本机 Cursor 同步账号（\(result.email!)）"
+            : "已从本机 Cursor 同步套餐额度"
           self.fetchAppsStatusHttp()
           self.fetchUsageSummary(silent: false, forceRefresh: true)
         } else {
           self.bannerIsError = true
-          self.statusBanner = errorMsg ?? "未检测到本机 Cursor 登录态，请使用「登录同步…」"
+          self.statusBanner = result.errorMsg ?? "未检测到本机 Cursor 登录态，请使用「登录同步…」"
         }
       }
     }
   }
 
   private func restoreCursorWebCookieIfPresent() {
+    let now = Date()
     WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
-      let cursorCookies = cookies.filter { $0.domain.lowercased().contains("cursor.com") && !$0.value.isEmpty }
-      guard cursorCookies.contains(where: { $0.name == "WorkosCursorSessionToken" }) else { return }
-      let header = cursorCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+      let validCookies = cookies.filter { c in
+        let dom = c.domain.lowercased()
+        let isCursorDom = dom.contains("cursor.com") || dom.contains("cursor.sh")
+        let notExpired = c.expiresDate.map { $0 > now } ?? true
+        return isCursorDom && notExpired && !c.value.isEmpty
+      }
+      var deduped: [String: HTTPCookie] = [:]
+      for c in validCookies.sorted(by: { $0.domain.count < $1.domain.count || $0.path.count < $1.path.count }) {
+        deduped[c.name] = c
+      }
+      let finalCookies = Array(deduped.values).sorted { $0.name < $1.name }
+      guard finalCookies.contains(where: { Self.cursorSessionCookieNames.contains($0.name) }) else { return }
+      let header = finalCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
       DispatchQueue.main.async {
         guard let self = self, !self.hasCursorCookie else { return }
         self.hasCursorCookie = true
-        self.postConfig(["cursorCookie": header], quietBanner: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+        self.postConfig(["cursorCookie": header], quietBanner: true) { [weak self] in
           self?.fetchUsageSummary(silent: true, forceRefresh: true)
         }
       }
@@ -1459,9 +1769,14 @@ export default {
     panel.allowedContentTypes = [.commaSeparatedText]
     panel.nameFieldStringValue = "ai-turn-meter-usage-\(usageDays == 0 ? "all" : "\(usageDays)d").csv"
     if panel.runModal() == .OK, let url = panel.url {
-      try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
-      statusBanner = "已导出用量账单：\(url.lastPathComponent)"
-      bannerIsError = false
+      do {
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        statusBanner = "已导出用量账单：\(url.lastPathComponent)"
+        bannerIsError = false
+      } catch {
+        bannerIsError = true
+        statusBanner = "导出 CSV 失败：\(error.localizedDescription)"
+      }
     }
   }
 
@@ -1656,9 +1971,14 @@ export default {
         panel.allowedContentTypes = [.svg]
         panel.nameFieldStringValue = "ai-turn-meter-receipt-\(self.receiptDate).svg"
         if panel.runModal() == .OK, let outUrl = panel.url {
-          try? data.write(to: outUrl, options: .atomic)
-          self.bannerIsError = false
-          self.statusBanner = "已导出小票 SVG：\(outUrl.lastPathComponent)"
+          do {
+            try data.write(to: outUrl, options: .atomic)
+            self.bannerIsError = false
+            self.statusBanner = "已导出小票 SVG：\(outUrl.lastPathComponent)"
+          } catch {
+            self.bannerIsError = true
+            self.statusBanner = "导出 SVG 失败：\(error.localizedDescription)"
+          }
         }
       }
     }.resume()
@@ -1667,13 +1987,15 @@ export default {
   // MARK: - Model Fingerprint & Degradation Detection Actions
 
   func fetchFingerprintOverview(silent: Bool = false) {
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/overview?days=7") else { return }
+    guard let url = daemonUrl("/v1/fingerprint/overview", query: [("days", "7")]) else { return }
+    fingerprintSeq &+= 1
+    let seq = fingerprintSeq
     if !silent { fingerprintLoading = true }
     let req = DaemonAuth.authorizedRequest(url: url, method: "GET", timeout: 10)
 
     DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, _ in
       DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
+        guard let self = self, self.fingerprintSeq == seq else { return }
         self.fingerprintLoading = false
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let data = data,
@@ -1687,7 +2009,7 @@ export default {
 
   func runFingerprintCheck(actionId: String, payload: [String: Any], timeout: TimeInterval = 120) {
     guard fingerprintRunningAction == nil,
-          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/run"),
+          let url = daemonUrl("/v1/fingerprint/run"),
           let jsonData = try? JSONSerialization.data(withJSONObject: payload) else {
       return
     }
@@ -1705,9 +2027,18 @@ export default {
           self.statusBanner = "检测请求失败：\(err.localizedDescription)"
           return
         }
-        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
-              let data = data,
-              let parsed = try? JSONDecoder().decode(FingerprintRunResponse.self, from: data) else {
+        guard let http = resp as? HTTPURLResponse else {
+          self.bannerIsError = true
+          self.statusBanner = "后台服务无响应"
+          return
+        }
+        let parsed = data.flatMap { try? JSONDecoder().decode(FingerprintRunResponse.self, from: $0) }
+        if http.statusCode != 200 {
+          self.bannerIsError = true
+          self.statusBanner = parsed?.error ?? parsed?.run?.summary ?? "检测失败（HTTP \(http.statusCode)）"
+          return
+        }
+        guard let parsed = parsed else {
           self.bannerIsError = true
           self.statusBanner = "检测响应解析失败"
           return
@@ -1728,7 +2059,7 @@ export default {
   }
 
   func saveFingerprintEndpoint(name: String, protocolType: String, baseUrl: String, model: String, apiKey: String) {
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/endpoints"),
+    guard let url = daemonUrl("/v1/fingerprint/endpoints"),
           let jsonData = try? JSONSerialization.data(withJSONObject: [
             "name": name,
             "protocol": protocolType,
@@ -1742,7 +2073,7 @@ export default {
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = jsonData
 
-    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, resp, err in
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
         if let err = err {
@@ -1750,46 +2081,79 @@ export default {
           self.statusBanner = "保存端点失败：\(err.localizedDescription)"
           return
         }
-        if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+        struct SaveErrRes: Decodable { let ok: Bool?; let error: String? }
+        let parsed = data.flatMap { try? JSONDecoder().decode(SaveErrRes.self, from: $0) }
+        if let http = resp as? HTTPURLResponse, http.statusCode == 200, parsed?.ok != false {
           self.bannerIsError = false
           self.statusBanner = "已保存检测端点：\(name.isEmpty ? model : name)"
           self.fetchFingerprintOverview(silent: true)
         } else {
           self.bannerIsError = true
-          self.statusBanner = "保存端点失败，请检查 Base URL 与模型名"
+          self.statusBanner = parsed?.error ?? "保存端点失败，请检查 Base URL 与模型名"
         }
       }
     }.resume()
   }
 
   func deleteFingerprintEndpoint(id: String) {
-    guard let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/endpoints?id=\(encoded)") else { return }
+    guard let url = daemonUrl("/v1/fingerprint/endpoints", query: [("id", id)]) else { return }
     let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 6)
-    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, _, _ in
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
-        self?.bannerIsError = false
-        self?.statusBanner = "已删除检测端点"
-        self?.fetchFingerprintOverview(silent: true)
+        guard let self = self else { return }
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "删除端点失败：\(err.localizedDescription)"
+          return
+        }
+        struct DelRes: Decodable { let ok: Bool?; let error: String? }
+        let http = resp as? HTTPURLResponse
+        let parsed = data.flatMap { try? JSONDecoder().decode(DelRes.self, from: $0) }
+        guard http?.statusCode == 200, parsed?.ok != false else {
+          self.bannerIsError = true
+          self.statusBanner = parsed?.error ?? "删除端点失败（HTTP \(http?.statusCode ?? 0)）"
+          return
+        }
+        self.bannerIsError = false
+        self.statusBanner = "已删除检测端点"
+        self.fetchFingerprintOverview(silent: true)
       }
     }.resume()
   }
 
   func deleteFingerprintBaseline(id: String) {
-    guard let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-          let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/fingerprint/baselines?id=\(encoded)") else { return }
+    guard let url = daemonUrl("/v1/fingerprint/baselines", query: [("id", id)]) else { return }
     let req = DaemonAuth.authorizedRequest(url: url, method: "DELETE", timeout: 6)
-    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, _, _ in
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
-        self?.bannerIsError = false
-        self?.statusBanner = "已删除参考基线"
-        self?.fetchFingerprintOverview(silent: true)
+        guard let self = self else { return }
+        if let err = err {
+          self.bannerIsError = true
+          self.statusBanner = "删除基线失败：\(err.localizedDescription)"
+          return
+        }
+        struct DelRes: Decodable { let ok: Bool?; let error: String? }
+        let http = resp as? HTTPURLResponse
+        let parsed = data.flatMap { try? JSONDecoder().decode(DelRes.self, from: $0) }
+        guard http?.statusCode == 200, parsed?.ok != false else {
+          self.bannerIsError = true
+          self.statusBanner = parsed?.error ?? "删除基线失败（HTTP \(http?.statusCode ?? 0)）"
+          return
+        }
+        self.bannerIsError = false
+        self.statusBanner = "已删除参考基线"
+        self.fetchFingerprintOverview(silent: true)
       }
     }.resume()
   }
 
-  private func postConfig(_ bodyObj: [String: Any], quietBanner: Bool, bannerText: String = "") {
-    guard let url = URL(string: "http://127.0.0.1:\(daemonPort)/v1/config"),
+  private func postConfig(
+    _ bodyObj: [String: Any],
+    quietBanner: Bool,
+    bannerText: String = "",
+    onSuccess: (() -> Void)? = nil
+  ) {
+    guard let url = daemonUrl("/v1/config"),
           let jsonData = try? JSONSerialization.data(withJSONObject: bodyObj) else {
       return
     }
@@ -1797,15 +2161,20 @@ export default {
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = jsonData
 
-    DaemonAuth.localSession.dataTask(with: req) { [weak self] _, resp, err in
+    DaemonAuth.localSession.dataTask(with: req) { [weak self] data, resp, err in
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
         if let err = err {
-          self.bannerIsError = true
-          self.statusBanner = "设置同步失败：\(err.localizedDescription)"
+          if !quietBanner {
+            self.bannerIsError = true
+            self.statusBanner = "设置同步失败：\(err.localizedDescription)"
+          }
+          self.fetchDaemonStateLight()
           return
         }
-        if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+        struct CfgErrRes: Decodable { let ok: Bool?; let error: String? }
+        let parsed = data.flatMap { try? JSONDecoder().decode(CfgErrRes.self, from: $0) }
+        if let http = resp as? HTTPURLResponse, http.statusCode == 200, parsed?.ok != false {
           if !quietBanner && !bannerText.isEmpty {
             self.bannerIsError = false
             self.statusBanner = bannerText
@@ -1813,9 +2182,37 @@ export default {
           self.fetchAppsStatusHttp()
           self.fetchUsageSummary(silent: true)
           self.onStateUpdated?()
+          onSuccess?()
+        } else {
+          let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+          if !quietBanner {
+            self.bannerIsError = true
+            self.statusBanner = parsed?.error ?? "设置同步失败（HTTP \(code)）"
+          }
+          self.fetchDaemonStateLight()
         }
       }
     }.resume()
+  }
+
+  private nonisolated static func waitForDaemonHealth(port: Int, maxWaitSec: TimeInterval = 4.0) {
+    guard let url = URL(string: "http://127.0.0.1:\(port)/health") else { return }
+    let deadline = Date().addingTimeInterval(maxWaitSec)
+    while Date() < deadline {
+      let sem = DispatchSemaphore(value: 0)
+      var healthy = false
+      var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 0.6)
+      req.httpMethod = "GET"
+      DaemonAuth.localSession.dataTask(with: req) { _, resp, _ in
+        if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+          healthy = true
+        }
+        sem.signal()
+      }.resume()
+      _ = sem.wait(timeout: .now() + 0.7)
+      if healthy { return }
+      Thread.sleep(forTimeInterval: 0.2)
+    }
   }
 
   func runAction(args: [String], successText: String, onSuccess: (() -> Void)? = nil) {
@@ -1824,21 +2221,27 @@ export default {
     statusBanner = "正在处理…"
     bannerIsError = false
     let rt = runtime
+    let port = daemonPort
+    let openAllTimeout = max(45.0, Double(max(1, appsNeedingInlineCdp.count)) * 20.0)
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-      let cliTimeout = args.first == "open" ? 45.0 : 30.0
+      let cliTimeout: TimeInterval = (args == ["open", "all"]) ? openAllTimeout : (args.first == "open" ? 45.0 : 30.0)
       let res = rt.runCli(args, timeoutSec: cliTimeout)
-      if res.exitCode == 0 {
-        Thread.sleep(forTimeInterval: 0.5)
+      if res.exitCode == 0 && (args.first == "install" || args.first == "start-daemon") {
+        Self.waitForDaemonHealth(port: port)
       }
       let docRes = rt.runCli(["doctor", "--json"], timeoutSec: 12)
       let stRes = rt.runCli(["status", "--json"], timeoutSec: 6)
       let doc = docRes.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(DoctorResponse.self, from: $0) }
       let st = stRes.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(StatusResponse.self, from: $0) }
+      let autostartEnabled = args.first == "uninstall" ? Self.detectAppAutostartEnabled() : nil
 
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
         self.busy = false
+        if let autostart = autostartEnabled {
+          self.launchAtLogin = autostart
+        }
         if let doc = doc { self.applyDoctor(doc) }
         if let st = st { self.applyStatus(st) }
         if res.exitCode == 0 {
@@ -1898,7 +2301,12 @@ export default {
         self.sshApplying = false
         if res.exitCode == 0 {
           self.sshApplyIsError = false
-          self.knownSshHosts = MeterRuntime.readSshConfigHosts()
+          DispatchQueue.global(qos: .utility).async { [weak self] in
+            let hosts = MeterRuntime.readSshConfigHosts()
+            DispatchQueue.main.async { [weak self] in
+              self?.knownSshHosts = hosts
+            }
+          }
           self.sshApplyStatus = includeRemote
             ? "已完成：本机 ~/.ssh/config 与远端 \(targetHost) 的 ~/.cursor/hooks.json 均已自动配置"
             : "已安全写入本机 ~/.ssh/config（Host \(targetHost)），已自动保留原文件备份"
@@ -1920,7 +2328,12 @@ export default {
   }
 
   func checkForUpdates() {
+    guard !updateChecking, !updateDownloading else {
+      showUpdateSheet = true
+      return
+    }
     availableUpdate = nil
+    updateDownloadProgress = nil
     showUpdateSheet = true
     guard let rawUrl = updateFeedUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
           !rawUrl.isEmpty,
@@ -1970,8 +2383,12 @@ export default {
     var req = URLRequest(url: url, timeoutInterval: 10)
     req.setValue("AI-Turn-Meter/\(curVersion)", forHTTPHeaderField: "User-Agent")
     req.setValue("application/json", forHTTPHeaderField: "Accept")
+    let trimmedPath = url.path.hasSuffix("/") && url.path.count > 1
+      ? String(url.path.dropLast())
+      : url.path
+    let lowerHost = url.host?.lowercased() ?? ""
     let isGithubReleasesLatest =
-      (url.host == "github.com" || url.host == "www.github.com") && url.path.hasSuffix("/releases/latest")
+      (lowerHost == "github.com" || lowerHost == "www.github.com") && trimmedPath.hasSuffix("/releases/latest")
     if isGithubReleasesLatest {
       req.httpMethod = "HEAD"
     }
@@ -1995,15 +2412,19 @@ export default {
             self.updateStatusText = "当前仓库尚未发布 GitHub Release（当前运行 v\(curVersion)）。"
             return
           }
-          let rawTag = String(abs[range.upperBound...]).split(separator: "?").first.map(String.init) ?? ""
-          let remoteVer = rawTag.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+          let rawPart = String(abs[range.upperBound...])
+          let cleanTag = rawPart
+            .split(separator: "?", maxSplits: 1).first
+            .flatMap { $0.split(separator: "#", maxSplits: 1).first }
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/ \t\r\n")) } ?? ""
+          let remoteVer = cleanTag.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
           let repoPrefix = String(abs[..<range.lowerBound])
           if remoteVer.isEmpty {
             self.updateStatusText = "当前仓库尚未发布版本标签。"
             return
           }
           if UpdateChecker.compareSemver(remoteVer, curVersion) > 0 {
-            let dlUrl = "\(repoPrefix)/releases/download/\(rawTag)/AI-Turn-Meter-\(remoteVer)-arm64.dmg"
+            let dlUrl = "\(repoPrefix)/releases/download/\(cleanTag)/AI-Turn-Meter-\(remoteVer)-arm64.dmg"
             let sha256Url = "\(dlUrl).sha256"
             self.availableUpdate = UpdateReleaseInfo(
               version: remoteVer,
@@ -2035,9 +2456,20 @@ export default {
     }.resume()
   }
 
+  func cancelUpdateDownload() {
+    updateProgressObs?.invalidate()
+    updateProgressObs = nil
+    activeUpdateDownloadTask?.cancel()
+    activeUpdateDownloadTask = nil
+    updateDownloading = false
+    updateDownloadProgress = nil
+    updateStatusText = "已取消下载更新。"
+  }
+
   func downloadAndOpenUpdate(_ info: UpdateReleaseInfo) {
     guard !updateDownloading, let url = URL(string: info.downloadUrl) else { return }
     updateDownloading = true
+    updateDownloadProgress = 0
     updateStatusText = "正在下载 v\(info.version) 更新包…"
 
     let bundleUrl = Bundle.main.bundleURL
@@ -2046,11 +2478,25 @@ export default {
       bundleUrl.path.hasSuffix(".app") &&
       FileManager.default.isWritableFile(atPath: bundleUrl.deletingLastPathComponent().path)
 
-    URLSession.shared.downloadTask(with: url) { [weak self] tempUrl, resp, err in
+    let urlLast = url.lastPathComponent
+    let dmgFilename = urlLast.lowercased().hasSuffix(".dmg") ? urlLast : "AI-Turn-Meter-\(info.version).dmg"
+    let assetFilename = urlLast.isEmpty ? dmgFilename : urlLast
+
+    let task = URLSession.shared.downloadTask(with: url) { [weak self] tempUrl, resp, err in
       guard let self = self else { return }
+      DispatchQueue.main.async { [weak self] in
+        self?.updateProgressObs?.invalidate()
+        self?.updateProgressObs = nil
+        self?.activeUpdateDownloadTask = nil
+      }
       if let err = err {
+        let nsErr = err as NSError
         DispatchQueue.main.async {
+          if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
+            return
+          }
           self.updateDownloading = false
+          self.updateDownloadProgress = nil
           self.updateStatusText = "下载失败：\(err.localizedDescription)"
         }
         return
@@ -2058,6 +2504,7 @@ export default {
       if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
         DispatchQueue.main.async {
           self.updateDownloading = false
+          self.updateDownloadProgress = nil
           self.updateStatusText = "下载失败：HTTP \(http.statusCode)"
         }
         return
@@ -2065,12 +2512,12 @@ export default {
       guard let tempUrl = tempUrl else {
         DispatchQueue.main.async {
           self.updateDownloading = false
+          self.updateDownloadProgress = nil
           self.updateStatusText = "下载未返回文件。"
         }
         return
       }
 
-      let dmgFilename = "AI-Turn-Meter-\(info.version)-arm64.dmg"
       let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
       let dest = downloadsDir.appendingPathComponent(dmgFilename)
       let fm = FileManager.default
@@ -2081,13 +2528,11 @@ export default {
         let msg = error.localizedDescription
         DispatchQueue.main.async {
           self.updateDownloading = false
+          self.updateDownloadProgress = nil
           self.updateStatusText = "保存安装包失败：\(msg)"
         }
         return
       }
-
-      let urlName = URL(string: info.downloadUrl)?.lastPathComponent ?? ""
-      let assetFilename = urlName.isEmpty ? dmgFilename : urlName
 
       // Move post-download verification & installation off URLSession.shared's serial delegate queue
       // so checksum HTTP requests and hdiutil/ditto never deadlock or stall shared network callbacks.
@@ -2098,6 +2543,7 @@ export default {
           try? FileManager.default.removeItem(at: dest)
           DispatchQueue.main.async {
             self.updateDownloading = false
+            self.updateDownloadProgress = nil
             self.updateStatusText = "下载文件异常（大小不足 1 MB），已中止更新。"
           }
           return
@@ -2107,6 +2553,7 @@ export default {
           try? FileManager.default.removeItem(at: dest)
           DispatchQueue.main.async {
             self.updateDownloading = false
+            self.updateDownloadProgress = nil
             self.updateStatusText = shaErr
           }
           return
@@ -2114,11 +2561,13 @@ export default {
 
         if canSelfReplace {
           DispatchQueue.main.async {
+            self.updateDownloadProgress = 1.0
             self.updateStatusText = "正在安装 v\(info.version) 并准备重启…"
           }
           if let errMsg = Self.installAppUpdateAndRelaunch(dmgUrl: dest, targetAppUrl: bundleUrl) {
             DispatchQueue.main.async {
               self.updateDownloading = false
+              self.updateDownloadProgress = nil
               self.updateStatusText = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
               NSWorkspace.shared.open(dest)
             }
@@ -2132,11 +2581,22 @@ export default {
 
         DispatchQueue.main.async {
           self.updateDownloading = false
+          self.updateDownloadProgress = nil
           self.updateStatusText = "已下载到「下载」文件夹并打开安装包，拖入「应用程序」覆盖即可。"
           NSWorkspace.shared.open(dest)
         }
       }
-    }.resume()
+    }
+    updateProgressObs?.invalidate()
+    updateProgressObs = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
+      let frac = max(0.0, min(1.0, progress.fractionCompleted))
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.updateDownloading else { return }
+        self.updateDownloadProgress = frac
+      }
+    }
+    activeUpdateDownloadTask = task
+    task.resume()
   }
 
   private nonisolated static func verifyDownloadedDmgSha256IfAvailable(
@@ -2191,18 +2651,35 @@ export default {
     return nil
   }
 
-  private nonisolated static func runSync(_ launchPath: String, _ args: [String]) -> Int32 {
+  private nonisolated static func runSync(_ launchPath: String, _ args: [String], timeoutSec: TimeInterval = 60) -> Int32 {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: launchPath)
     p.arguments = args
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
+    let group = DispatchGroup()
+    group.enter()
+    p.terminationHandler = { _ in group.leave() }
     do {
       try p.run()
-      p.waitUntilExit()
-      return p.terminationStatus
     } catch {
+      group.leave()
       return -1
+    }
+    if group.wait(timeout: .now() + timeoutSec) == .timedOut {
+      if p.isRunning { p.terminate() }
+      if group.wait(timeout: .now() + 1.0) == .timedOut && p.isRunning {
+        kill(p.processIdentifier, SIGKILL)
+        _ = group.wait(timeout: .now() + 0.5)
+      }
+      return -1
+    }
+    return p.terminationStatus
+  }
+
+  private nonisolated static func detachDmg(at mntPath: String) {
+    if runSync("/usr/bin/hdiutil", ["detach", mntPath, "-quiet"], timeoutSec: 15) != 0 {
+      _ = runSync("/usr/bin/hdiutil", ["detach", mntPath, "-force", "-quiet"], timeoutSec: 15)
     }
   }
 
@@ -2226,20 +2703,19 @@ export default {
 
     let srcApp = mntDir.appendingPathComponent("AI Turn Meter.app", isDirectory: true)
     guard fm.fileExists(atPath: srcApp.appendingPathComponent("Contents/MacOS/AITurnMeter").path) else {
-      _ = runSync("/usr/bin/hdiutil", ["detach", mntDir.path, "-quiet"])
+      detachDmg(at: mntDir.path)
       try? fm.removeItem(at: stageDir)
       return "安装包内未找到应用文件"
     }
 
     let copyRc = runSync("/usr/bin/ditto", [srcApp.path, stagedApp.path])
-    _ = runSync("/usr/bin/hdiutil", ["detach", mntDir.path, "-quiet"])
+    detachDmg(at: mntDir.path)
     try? fm.removeItem(at: mntDir)
 
     guard copyRc == 0 else {
       try? fm.removeItem(at: stageDir)
       return "解压新版应用失败"
     }
-    try? fm.removeItem(at: dmgUrl)
 
     let pid = ProcessInfo.processInfo.processIdentifier
     let daemonPlistPath = (NSHomeDirectory() as NSString)
@@ -2250,6 +2726,7 @@ export default {
     backup="${target}.backup"
     uid="$(/usr/bin/id -u)"
     plist="$5"
+    dmgPath="$6"
 
     i=0
     while kill -0 "$1" 2>/dev/null && [ "$i" -lt 150 ]; do
@@ -2267,7 +2744,12 @@ export default {
 
     /bin/launchctl bootout "gui/${uid}/com.local.ai-turn-meter.daemon" >/dev/null 2>&1 || \
       ([ -n "$plist" ] && [ -f "$plist" ] && /bin/launchctl bootout "gui/${uid}" "$plist" >/dev/null 2>&1) || true
-    sleep 0.2
+    w=0
+    while /bin/launchctl print "gui/${uid}/com.local.ai-turn-meter.daemon" >/dev/null 2>&1 && [ "$w" -lt 25 ]; do
+      sleep 0.1
+      w=$((w + 1))
+    done
+    sleep 0.3
 
     rm -rf "$backup"
     if [ -e "$target" ]; then
@@ -2291,7 +2773,7 @@ export default {
       exit 1
     fi
 
-    rm -rf "$backup" "$4"
+    rm -rf "$backup" "$4" "$dmgPath"
     if [ -n "$plist" ] && [ -f "$plist" ]; then
       /bin/launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
     fi
@@ -2301,7 +2783,7 @@ export default {
     launcher.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
     launcher.arguments = [
       "/bin/zsh", "-c", script, "atm-updater",
-      "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path, daemonPlistPath,
+      "\(pid)", stagedApp.path, targetAppUrl.path, stageDir.path, daemonPlistPath, dmgUrl.path,
     ]
     launcher.standardInput = FileHandle.nullDevice
     launcher.standardOutput = FileHandle.nullDevice

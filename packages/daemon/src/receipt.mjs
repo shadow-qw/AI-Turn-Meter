@@ -223,7 +223,13 @@ export function renderReceiptAscii(
     padRow('连续使用', `${receipt.streakDays || 0} 天`, W),
     padRow('请求数', fmtCommaNumber(totals.callCount || 0), W),
     padRow('对话轮次', `${fmtCommaNumber(totals.turnCount || 0)} 轮`, W),
-    padRow('对比日均', receipt.vsDailyAvgRatio ? `${receipt.vsDailyAvgRatio}×` : '--', W),
+    padRow(
+      '对比日均',
+      typeof receipt.vsDailyAvgRatio === 'number' && Number.isFinite(receipt.vsDailyAvgRatio)
+        ? `${receipt.vsDailyAvgRatio}×`
+        : '--',
+      W
+    ),
     hr,
   ];
 
@@ -447,7 +453,12 @@ export function renderReceiptSvg(
     ['连续使用', `${receipt.streakDays || 0} 天`],
     ['请求数', fmtCommaNumber(totals.callCount || 0)],
     ['对话轮次', `${fmtCommaNumber(totals.turnCount || 0)}`],
-    ['对比日均', receipt.vsDailyAvgRatio ? `${receipt.vsDailyAvgRatio}×` : '--'],
+    [
+      '对比日均',
+      typeof receipt.vsDailyAvgRatio === 'number' && Number.isFinite(receipt.vsDailyAvgRatio)
+        ? `${receipt.vsDailyAvgRatio}×`
+        : '--',
+    ],
   ];
   for (const [k, v] of statsRows) {
     addText(padX, y, k, { size: 11.5, fill: muted, family: sans });

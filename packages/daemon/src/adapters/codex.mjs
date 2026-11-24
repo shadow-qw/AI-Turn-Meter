@@ -60,9 +60,9 @@ export function parseCodexSessionDetailed(
   { flushOpenTurns = false, onlyOpenAiModels = true } = {}
 ) {
   const lines = content.split(/\r?\n/);
-  let sessionId = filePath.split('/').pop()?.replace(/\.jsonl$/, '') || 'codex-session';
+  let sessionId = filePath.split('/').pop()?.replace(/\.jsonl(?:\.zst)?$/i, '') || 'codex-session';
   let hasSessionMetaId = false;
-  let isForkedRollout = /_[0-9a-f-]{20,}\.jsonl$/i.test(filePath);
+  let isForkedRollout = /_[0-9a-f-]{20,}\.jsonl(?:\.zst)?$/i.test(filePath);
   let workspacePath = null;
   let currentModel = 'unknown';
 

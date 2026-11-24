@@ -2,20 +2,36 @@ import AITurnMeterCore
 import AppKit
 import SwiftUI
 
+private final class FlyoutBackdropView: NSVisualEffectView {
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    effectiveAppearance.performAsCurrentDrawingAppearance {
+      layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+    }
+  }
+}
+
+private final class FlippedClipDocumentView: NSView {
+  override var isFlipped: Bool { true }
+}
+
 @MainActor
 final class CostHistoryFlyoutController: NSObject {
   static let shared = CostHistoryFlyoutController()
 
+  private static let flyoutWidth: CGFloat = 312
+
   weak var anchorPopover: NSPopover?
   private weak var attachedParentWindow: NSWindow?
   private var panel: NSPanel?
-  private var vfxView: NSVisualEffectView?
+  private var vfxView: FlyoutBackdropView?
+  private var scrollView: NSScrollView?
+  private var docView: FlippedClipDocumentView?
   private var hostingView: NSHostingView<CostHistoryDetailFlyoutView>?
   private var isCardHovered: Bool = false
   private var isFlyoutHovered: Bool = false
   private var hideWorkItem: DispatchWorkItem?
   private var showWorkItem: DispatchWorkItem?
-  private var lastMeasuredContentHeight: CGFloat = 0
 
   func setCardHovered(_ hovered: Bool, vm: MeterViewModel, card: CodexBarCardSnapshot, selection: String) {
     isCardHovered = hovered
@@ -85,7 +101,26 @@ final class CostHistoryFlyoutController: NSObject {
     }
 
     let hosting = NSHostingView(rootView: rootView)
-    let vfx = NSVisualEffectView()
+    hosting.translatesAutoresizingMaskIntoConstraints = true
+    hosting.frame = NSRect(x: 0, y: 0, width: Self.flyoutWidth, height: 340)
+
+    let doc = FlippedClipDocumentView(frame: NSRect(x: 0, y: 0, width: Self.flyoutWidth, height: 340))
+    doc.translatesAutoresizingMaskIntoConstraints = true
+    doc.addSubview(hosting)
+
+    let scroll = NSScrollView()
+    scroll.drawsBackground = false
+    scroll.contentView.drawsBackground = false
+    scroll.borderType = .noBorder
+    scroll.hasVerticalScroller = true
+    scroll.hasHorizontalScroller = false
+    scroll.autohidesScrollers = true
+    scroll.scrollerStyle = .overlay
+    scroll.automaticallyAdjustsContentInsets = false
+    scroll.contentInsets = NSEdgeInsetsZero
+    scroll.documentView = doc
+
+    let vfx = FlyoutBackdropView()
     vfx.material = .popover
     vfx.blendingMode = .behindWindow
     vfx.state = .active
@@ -93,18 +128,20 @@ final class CostHistoryFlyoutController: NSObject {
     vfx.layer?.cornerRadius = 12
     vfx.layer?.masksToBounds = true
     vfx.layer?.borderWidth = 0.5
-    vfx.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
-    vfx.addSubview(hosting)
-    hosting.translatesAutoresizingMaskIntoConstraints = false
+    vfx.effectiveAppearance.performAsCurrentDrawingAppearance {
+      vfx.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+    }
+    vfx.addSubview(scroll)
+    scroll.translatesAutoresizingMaskIntoConstraints = false
     NSLayoutConstraint.activate([
-      hosting.topAnchor.constraint(equalTo: vfx.topAnchor),
-      hosting.leadingAnchor.constraint(equalTo: vfx.leadingAnchor),
-      hosting.trailingAnchor.constraint(equalTo: vfx.trailingAnchor),
-      hosting.bottomAnchor.constraint(equalTo: vfx.bottomAnchor),
+      scroll.topAnchor.constraint(equalTo: vfx.topAnchor),
+      scroll.leadingAnchor.constraint(equalTo: vfx.leadingAnchor),
+      scroll.trailingAnchor.constraint(equalTo: vfx.trailingAnchor),
+      scroll.bottomAnchor.constraint(equalTo: vfx.bottomAnchor),
     ])
 
     let p = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 286, height: 340),
+      contentRect: NSRect(x: 0, y: 0, width: Self.flyoutWidth, height: 340),
       styleMask: [.borderless, .nonactivatingPanel],
       backing: .buffered,
       defer: false
@@ -120,8 +157,22 @@ final class CostHistoryFlyoutController: NSObject {
 
     self.panel = p
     self.vfxView = vfx
+    self.scrollView = scroll
+    self.docView = doc
     self.hostingView = hosting
     return p
+  }
+
+  private func scrollToTop() {
+    guard let scroll = scrollView, let doc = scroll.documentView else { return }
+    let clip = scroll.contentView
+    if doc.isFlipped {
+      clip.scroll(to: .zero)
+    } else {
+      let topY = max(0, doc.frame.height - clip.bounds.height)
+      clip.scroll(to: NSPoint(x: 0, y: topY))
+    }
+    scroll.reflectScrolledClipView(clip)
   }
 
   private func present(vm: MeterViewModel, card: CodexBarCardSnapshot, selection: String) {
@@ -131,15 +182,11 @@ final class CostHistoryFlyoutController: NSObject {
     }
     guard !card.daily30.isEmpty || !(card.projects ?? []).isEmpty || !(card.breakdowns ?? []).isEmpty else { return }
 
-    lastMeasuredContentHeight = 0
     let view = CostHistoryDetailFlyoutView(
       selection: selection,
       card: card,
       onHoverChanged: { [weak self] inside in
         self?.setFlyoutHovered(inside)
-      },
-      onContentHeightChanged: { [weak self] height in
-        self?.updatePanelHeight(height)
       }
     )
     let p = ensurePanel(rootView: view)
@@ -154,11 +201,12 @@ final class CostHistoryFlyoutController: NSObject {
     let screenFrame = (popWindow.screen ?? NSScreen.main)?.visibleFrame
       ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
     let maxH = min(620, max(240, screenFrame.height - 24))
+    let panelWidth = Self.flyoutWidth
 
+    hosting.frame.size.width = panelWidth
     hosting.layoutSubtreeIfNeeded()
-    let rawHeight = lastMeasuredContentHeight > 40 ? lastMeasuredContentHeight : hosting.fittingSize.height
-    let panelWidth: CGFloat = 286
-    let panelHeight = min(max(ceil(rawHeight), 200), maxH)
+    let contentHeight = ceil(max(hosting.fittingSize.height, 1))
+    let panelHeight = min(max(contentHeight, 180), maxH)
 
     let gap: CGFloat = 4
     let x: CGFloat = (visiblePopRect.minX - panelWidth - gap >= screenFrame.minX)
@@ -168,6 +216,9 @@ final class CostHistoryFlyoutController: NSObject {
     let y = min(screenFrame.maxY - panelHeight - 6, max(screenFrame.minY + 8, rawY))
 
     p.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
+    hosting.frame = NSRect(x: 0, y: 0, width: panelWidth, height: contentHeight)
+    docView?.frame = NSRect(x: 0, y: 0, width: panelWidth, height: max(contentHeight, panelHeight))
+
     if let oldParent = attachedParentWindow, oldParent !== popWindow {
       oldParent.removeChildWindow(p)
       attachedParentWindow = nil
@@ -177,37 +228,45 @@ final class CostHistoryFlyoutController: NSObject {
       attachedParentWindow = popWindow
     }
     p.orderFront(nil)
+    vfxView?.layoutSubtreeIfNeeded()
+    scrollView?.layoutSubtreeIfNeeded()
+    scrollToTop()
+    DispatchQueue.main.async { [weak self] in
+      self?.vfxView?.layoutSubtreeIfNeeded()
+      self?.scrollView?.layoutSubtreeIfNeeded()
+      self?.scrollToTop()
+    }
   }
 
-  func updatePanelHeight(_ rawHeight: CGFloat) {
-    guard rawHeight.isFinite, rawHeight > 40 else { return }
-    lastMeasuredContentHeight = rawHeight
-    guard let p = panel, p.isVisible else { return }
+  func refreshPanelHeightPreservingTop(preserveMinHeight: Bool = false) {
+    guard let p = panel, p.isVisible, let hosting = hostingView else { return }
+    let panelWidth = Self.flyoutWidth
+    hosting.frame.size.width = panelWidth
+    hosting.layoutSubtreeIfNeeded()
     let screenFrame = (p.screen ?? NSScreen.main)?.visibleFrame
       ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
     let maxH = min(620, max(240, screenFrame.height - 24))
-    let panelHeight = min(max(ceil(rawHeight), 180), maxH)
+    let contentHeight = ceil(max(hosting.fittingSize.height, 1))
+    let targetPanelHeight = min(max(contentHeight, 180), maxH)
+    let panelHeight = preserveMinHeight
+      ? min(max(ceil(p.frame.height), targetPanelHeight), maxH)
+      : targetPanelHeight
+
     var frame = p.frame
-    if abs(frame.height - panelHeight) < 1 { return }
-    let topY = frame.maxY
-    frame.size.height = panelHeight
-    frame.origin.y = max(screenFrame.minY + 8, topY - panelHeight)
-    p.setFrame(frame, display: true)
-  }
-
-  func refreshPanelHeightPreservingTop() {
-    guard let p = panel, p.isVisible, let hosting = hostingView else { return }
-    hosting.layoutSubtreeIfNeeded()
-    let rawHeight = lastMeasuredContentHeight > 40 ? lastMeasuredContentHeight : hosting.fittingSize.height
-    updatePanelHeight(rawHeight)
-  }
-}
-
-private struct FlyoutContentHeightKey: PreferenceKey {
-  static var defaultValue: CGFloat = 0
-  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-    let next = nextValue()
-    if next > 0 { value = next }
+    if abs(frame.height - panelHeight) >= 1 {
+      let topY = frame.maxY
+      frame.size.height = panelHeight
+      frame.origin.y = max(screenFrame.minY + 8, topY - panelHeight)
+      p.setFrame(frame, display: true)
+      vfxView?.layoutSubtreeIfNeeded()
+      scrollView?.layoutSubtreeIfNeeded()
+    }
+    hosting.frame = NSRect(x: 0, y: 0, width: panelWidth, height: contentHeight)
+    let targetDocHeight = max(contentHeight, panelHeight)
+    docView?.frame = NSRect(x: 0, y: 0, width: panelWidth, height: targetDocHeight)
+    if contentHeight <= panelHeight + 1 {
+      scrollToTop()
+    }
   }
 }
 
@@ -220,7 +279,6 @@ private struct CostHistoryDetailFlyoutView: View {
   let selection: String
   let card: CodexBarCardSnapshot
   let onHoverChanged: (Bool) -> Void
-  let onContentHeightChanged: (CGFloat) -> Void
 
   @State private var metric: FlyoutChartMetric = .tokens
   @State private var hoveredDate: String? = nil
@@ -265,23 +323,27 @@ private struct CostHistoryDetailFlyoutView: View {
     let projects = Array((card.projects ?? []).prefix(5))
     let breakdowns = card.breakdowns ?? []
 
-    ScrollView(.vertical, showsIndicators: false) {
-      VStack(alignment: .leading, spacing: 10) {
-        // 30-day vertical bar chart with Y-axis + yellow peak cap + continuous bar scrubbing
+    VStack(alignment: .leading, spacing: 10) {
+      // 30-day vertical bar chart with Y-axis + yellow peak cap + continuous bar scrubbing
       if !points.isEmpty {
         VStack(alignment: .leading, spacing: 4) {
           HStack(alignment: .bottom, spacing: 6) {
             VStack(alignment: .leading) {
               Text(maxVal > 0 ? axisLabel(maxVal) : (activeMetric == .tokens ? "0" : "\(curSym)0"))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
               Spacer()
               Text(maxVal > 0 ? axisLabel(maxVal / 2.0) : "")
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
               Spacer()
               Text("0")
+                .lineLimit(1)
             }
             .font(.system(size: 10))
             .monospacedDigit()
             .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-            .frame(width: 40, height: 102, alignment: .leading)
+            .frame(width: 44, height: 102, alignment: .leading)
 
             HStack(alignment: .bottom, spacing: 0) {
               ForEach(points, id: \.id) { pt in
@@ -326,15 +388,15 @@ private struct CostHistoryDetailFlyoutView: View {
           }
           .font(.system(size: 10))
           .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-          .padding(.leading, 46)
+          .padding(.leading, 50)
         }
 
-        // token | 费用 segmented toggle
+        // Token | 费用 segmented toggle
         if !isBillingOnly {
           HStack {
             Spacer()
             Picker("", selection: $metric) {
-              Text("token").tag(FlyoutChartMetric.tokens)
+              Text("Token").tag(FlyoutChartMetric.tokens)
               Text("费用").tag(FlyoutChartMetric.cost)
             }
             .pickerStyle(.segmented)
@@ -347,7 +409,16 @@ private struct CostHistoryDetailFlyoutView: View {
 
       // Selected day detail + per-model breakdown
       if let pt = selectedPt {
-        let dayModels: [CardDailyModelItem] = Array((pt.models ?? []).prefix(4))
+        let allDayModels: [CardDailyModelItem] = pt.models ?? []
+        let dayModels: [CardDailyModelItem] = Array(allDayModels.prefix(4))
+        let shownTokens = dayModels.reduce(0) { $0 + $1.totalTokens }
+        let shownCost = dayModels.compactMap(\.costUsd).reduce(0.0, +)
+        let extraModels = Array(allDayModels.dropFirst(4))
+        let remTokens = extraModels.isEmpty ? max(0, pt.totalTokens - shownTokens) : extraModels.reduce(0) { $0 + $1.totalTokens }
+        let remCost: Double? = extraModels.isEmpty
+          ? pt.costUsd.flatMap { max(0.0, $0 - shownCost) >= 0.005 ? max(0.0, $0 - shownCost) : nil }
+          : (extraModels.contains(where: { $0.costUsd != nil }) ? extraModels.compactMap(\.costUsd).reduce(0.0, +) : nil)
+        let hasRemainder = !extraModels.isEmpty || (!dayModels.isEmpty && (remTokens > 0 || remCost != nil))
         let daySummaryText = (isBillingOnly && pt.totalTokens == 0)
           ? "\(pt.label): \(MeterFormat.money(pt.costUsd, symbol: curSym))"
           : "\(pt.label): \(MeterFormat.money(pt.costUsd, symbol: curSym)) · \(MeterFormat.tokens(pt.totalTokens)) tokens"
@@ -376,6 +447,16 @@ private struct CostHistoryDetailFlyoutView: View {
                   .foregroundColor(Color(nsColor: .tertiaryLabelColor))
               }
             }
+          }
+
+          if hasRemainder {
+            let countLabel = extraModels.isEmpty ? "其余模型" : "其余 \(extraModels.count) 个模型"
+            let costStr = remCost.map { MeterFormat.money($0, symbol: curSym) } ?? "--"
+            Text("\(countLabel) · \(costStr) · \(MeterFormat.tokens(remTokens))")
+              .font(.system(size: 10.5))
+              .monospacedDigit()
+              .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+              .padding(.leading, 10)
           }
         }
       }
@@ -468,12 +549,15 @@ private struct CostHistoryDetailFlyoutView: View {
                   .font(.system(size: 11.5, weight: .medium))
                   .foregroundColor(.secondary)
                   .lineLimit(1)
+                  .truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text("\(MeterFormat.money(proj.costUsd, symbol: curSym)) · \(MeterFormat.tokens(proj.totalTokens)) token 用量")
+                Text("\(MeterFormat.money(proj.costUsd, symbol: curSym)) · \(MeterFormat.tokens(proj.totalTokens))")
                   .font(.system(size: 11))
                   .monospacedDigit()
                   .foregroundColor(.secondary)
                   .lineLimit(1)
+                  .fixedSize(horizontal: true, vertical: false)
+                  .layoutPriority(1)
               }
               Text(proj.path)
                 .font(.system(size: 10))
@@ -485,24 +569,21 @@ private struct CostHistoryDetailFlyoutView: View {
         }
       }
     }
-      .padding(16)
-      .frame(width: 286, alignment: .leading)
-      .fixedSize(horizontal: false, vertical: true)
-      .background(
-        GeometryReader { geo in
-          Color.clear.preference(key: FlyoutContentHeightKey.self, value: geo.size.height)
-        }
-      )
-    }
-    .frame(minWidth: 286, idealWidth: 286, maxWidth: 286, maxHeight: .infinity, alignment: .top)
+    .padding(16)
+    .frame(width: 312, alignment: .leading)
+    .fixedSize(horizontal: false, vertical: true)
     .contentShape(Rectangle())
     .onHover { onHoverChanged($0) }
-    .onPreferenceChange(FlyoutContentHeightKey.self) { height in
-      onContentHeightChanged(height)
+    .onChange(of: selection) { _ in
+      hoveredDate = nil
+      DispatchQueue.main.async {
+        CostHistoryFlyoutController.shared.refreshPanelHeightPreservingTop(preserveMinHeight: false)
+      }
     }
     .onChange(of: selectedPt?.date) { _ in
+      let scrubbing = hoveredDate != nil
       DispatchQueue.main.async {
-        CostHistoryFlyoutController.shared.refreshPanelHeightPreservingTop()
+        CostHistoryFlyoutController.shared.refreshPanelHeightPreservingTop(preserveMinHeight: scrubbing)
       }
     }
   }

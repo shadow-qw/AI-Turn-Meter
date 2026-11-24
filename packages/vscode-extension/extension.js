@@ -298,7 +298,12 @@ function activate(context) {
         }
         const items = turns.map((t) => ({
           label: `${t.toolLabel || t.tool} · ${t.inlineText}`,
-          description: `${t.model !== 'unknown' ? t.model : ''} · ${new Date(t.completedAtMs).toLocaleTimeString()}`,
+          description: [
+            t.model && t.model !== 'unknown' ? t.model : null,
+            new Date(t.completedAtMs).toLocaleTimeString(),
+          ]
+            .filter(Boolean)
+            .join(' · '),
           detail: `新 ${fmtTokens(t.uncachedInputTokens)} · 缓存 ${fmtTokens(t.cacheReadTokens)} · ${t.tpsMethodLabel}${t.sessionTotal ? ` · 会话(${t.sessionTotal.turnCount}轮): 输入 ${fmtTokens(t.sessionTotal.totalInputTokens)} / 输出 ${fmtTokens(t.sessionTotal.outputTokens)}` : ''}`,
         }));
         await vscode.window.showQuickPick(items, {

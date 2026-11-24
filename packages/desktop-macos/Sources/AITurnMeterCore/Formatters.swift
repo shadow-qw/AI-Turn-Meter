@@ -1,18 +1,40 @@
 import Foundation
 
 public enum MeterFormat {
-  public static func tokens(_ n: Int?) -> String {
-    guard let n = n, n >= 0 else { return "N/A" }
-    if n < 1000 { return "\(n)" }
-    if n < 1_000_000 {
-      return String(format: "%.1fk", Double(n) / 1000.0).replacingOccurrences(of: ".0k", with: "k")
-    }
-    let m = String(format: "%.2f", Double(n) / 1_000_000.0)
-    var trimmed = m
+  private static let timeFmtLock = NSLock()
+  private static let todayTimeFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.calendar = Calendar(identifier: .gregorian)
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "HH:mm"
+    return f
+  }()
+  private static let pastDateTimeFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.calendar = Calendar(identifier: .gregorian)
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "MM-dd HH:mm"
+    return f
+  }()
+
+  private static func trimFixedDecimal(_ raw: String) -> String {
+    var trimmed = raw
     while trimmed.contains(".") && (trimmed.hasSuffix("0") || trimmed.hasSuffix(".")) {
       trimmed.removeLast()
     }
-    return "\(trimmed)M"
+    return trimmed
+  }
+
+  public static func tokens(_ n: Int?) -> String {
+    guard let n = n, n >= 0 else { return "N/A" }
+    if n < 1000 { return "\(n)" }
+    if n < 999_950 {
+      return String(format: "%.1fk", Double(n) / 1000.0).replacingOccurrences(of: ".0k", with: "k")
+    }
+    if n < 999_995_000 {
+      return trimFixedDecimal(String(format: "%.2f", Double(n) / 1_000_000.0)) + "M"
+    }
+    return trimFixedDecimal(String(format: "%.2f", Double(n) / 1_000_000_000.0)) + "B"
   }
 
   public static func money(_ val: Double?, symbol: String = "$") -> String {
@@ -49,10 +71,13 @@ public enum MeterFormat {
   }
 
   public static func timeText(_ ms: Double?) -> String {
-    guard let ms = ms, ms > 0 else { return "" }
+    guard let ms = ms, ms.isFinite, ms > 0 else { return "" }
     let date = Date(timeIntervalSince1970: ms / 1000.0)
-    let fmt = DateFormatter()
-    fmt.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "MM-dd HH:mm"
+    let isToday = Calendar.current.isDateInToday(date)
+    timeFmtLock.lock()
+    defer { timeFmtLock.unlock() }
+    let fmt = isToday ? todayTimeFormatter : pastDateTimeFormatter
+    fmt.timeZone = TimeZone.current
     return fmt.string(from: date)
   }
 

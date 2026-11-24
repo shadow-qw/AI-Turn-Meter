@@ -7,15 +7,22 @@ enum HeadlessCliHelper {
     var results: [String] = []
     let accounts = ["Cursor Key", "Cursor"]
     for acct in accounts {
-      if let pw = readKeychainPassword(service: "Cursor Safe Storage", account: acct, allowPrompt: allowPrompt),
-         !results.contains(pw) {
+      let res = readKeychainPassword(service: "Cursor Safe Storage", account: acct, allowPrompt: allowPrompt)
+      if let pw = res.password, !results.contains(pw) {
         results.append(pw)
+        if allowPrompt {
+          return results
+        }
+      }
+      if allowPrompt && (res.status == errSecUserCanceled || res.status == errSecAuthFailed) {
+        return results
       }
     }
-    if results.isEmpty,
-       let pw = readKeychainPassword(service: "Cursor Safe Storage", account: nil, allowPrompt: allowPrompt),
-       !results.contains(pw) {
-      results.append(pw)
+    if results.isEmpty {
+      let res = readKeychainPassword(service: "Cursor Safe Storage", account: nil, allowPrompt: allowPrompt)
+      if let pw = res.password, !results.contains(pw) {
+        results.append(pw)
+      }
     }
     return results
   }
@@ -91,9 +98,13 @@ enum HeadlessCliHelper {
     return false
   }
 
-  private static func readKeychainPassword(service: String, account: String?, allowPrompt: Bool) -> String? {
+  private static func readKeychainPassword(
+    service: String,
+    account: String?,
+    allowPrompt: Bool
+  ) -> (password: String?, status: OSStatus) {
     if !allowPrompt && !isKeychainDecryptAllowedWithoutUI(service: service, account: account) {
-      return nil
+      return (nil, errSecInteractionNotAllowed)
     }
     var query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
@@ -111,8 +122,10 @@ enum HeadlessCliHelper {
     }
     var item: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &item)
-    guard status == errSecSuccess, let data = item as? Data else { return nil }
-    return String(data: data, encoding: .utf8)
+    guard status == errSecSuccess, let data = item as? Data else {
+      return (nil, status)
+    }
+    return (String(data: data, encoding: .utf8), status)
   }
 
   static func runIfRequested() -> Bool {
@@ -144,6 +157,54 @@ enum HeadlessCliHelper {
       completionHandler: @escaping (URLRequest?) -> Void
     ) {
       completionHandler(nil)
+    }
+  }
+
+  private final class FetchResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var payload: [String: Any] = ["ok": false]
+    private var completed = false
+
+    func finishFromResponse(data: Data?, resp: URLResponse?, err: Error?) -> Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      if completed { return false }
+      completed = true
+      if let http = resp as? HTTPURLResponse {
+        payload["status"] = http.statusCode
+        payload["ok"] = (200...299).contains(http.statusCode)
+        if let finalUrl = http.url?.absoluteString {
+          payload["url"] = finalUrl
+        }
+        var respHeaders: [String: String] = [:]
+        for (k, v) in http.allHeaderFields {
+          respHeaders[String(describing: k).lowercased()] = String(describing: v)
+        }
+        payload["headers"] = respHeaders
+      }
+      if let data = data, let text = String(data: data, encoding: .utf8) {
+        payload["body"] = text
+      }
+      if let err = err {
+        payload["error"] = err.localizedDescription
+      }
+      return true
+    }
+
+    func markTimedOutIfPending() {
+      lock.lock()
+      defer { lock.unlock() }
+      if !completed {
+        completed = true
+        payload["error"] = "timeout"
+      }
+    }
+
+    func snapshotJsonData() -> Data? {
+      lock.lock()
+      let copy = payload
+      lock.unlock()
+      return try? JSONSerialization.data(withJSONObject: copy)
     }
   }
 
@@ -179,35 +240,20 @@ enum HeadlessCliHelper {
     }
 
     let sem = DispatchSemaphore(value: 0)
-    var outPayload: [String: Any] = ["ok": false]
+    let box = FetchResultBox()
     let delegate: URLSessionTaskDelegate? = manualRedirect ? NoRedirectDelegate() : nil
     let session = URLSession(configuration: cfg, delegate: delegate, delegateQueue: nil)
-    session.dataTask(with: req) { data, resp, err in
-      if let http = resp as? HTTPURLResponse {
-        outPayload["status"] = http.statusCode
-        outPayload["ok"] = (200...299).contains(http.statusCode)
-        if let finalUrl = http.url?.absoluteString {
-          outPayload["url"] = finalUrl
-        }
-        var respHeaders: [String: String] = [:]
-        for (k, v) in http.allHeaderFields {
-          respHeaders[String(describing: k).lowercased()] = String(describing: v)
-        }
-        outPayload["headers"] = respHeaders
-      }
-      if let data = data, let text = String(data: data, encoding: .utf8) {
-        outPayload["body"] = text
-      }
-      if let err = err {
-        outPayload["error"] = err.localizedDescription
-      }
+    let task = session.dataTask(with: req) { data, resp, err in
+      _ = box.finishFromResponse(data: data, resp: resp, err: err)
       sem.signal()
-    }.resume()
+    }
+    task.resume()
     if sem.wait(timeout: .now() + timeoutSec + 2.0) == .timedOut {
-      outPayload["error"] = "timeout"
+      box.markTimedOutIfPending()
+      task.cancel()
     }
     session.invalidateAndCancel()
-    if let json = try? JSONSerialization.data(withJSONObject: outPayload),
+    if let json = box.snapshotJsonData(),
        let text = String(data: json, encoding: .utf8) {
       print(text)
     } else {
