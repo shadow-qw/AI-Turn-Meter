@@ -93,9 +93,13 @@ public enum UpdateChecker {
     let notes = ((json["body"] as? String) ?? (json["notes"] as? String) ?? "")
       .trimmingCharacters(in: .whitespacesAndNewlines)
 
+    let rawHtmlUrl = (json["html_url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let releasePageUrl: String? = (rawHtmlUrl?.isEmpty == false) ? rawHtmlUrl : nil
+
     let rawDmgUrl = (json["dmgUrl"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     var dmgUrl: String? = (rawDmgUrl?.isEmpty == false) ? rawDmgUrl : nil
     var dmgName: String? = dmgUrl.flatMap { URL(string: $0)?.lastPathComponent }
+    var assetSizeBytes: Int64? = (json["size"] as? NSNumber).flatMap { $0.int64Value > 0 ? $0.int64Value : nil }
     var sha256Url = json["sha256Url"] as? String
     let expectedSha256 = (json["sha256"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -114,6 +118,9 @@ public enum UpdateChecker {
         if let picked = anyDmg, let dl = picked["browser_download_url"] as? String {
           dmgUrl = dl
           dmgName = picked["name"] as? String
+          if let sz = (picked["size"] as? NSNumber)?.int64Value, sz > 0 {
+            assetSizeBytes = sz
+          }
         }
       }
 
@@ -143,6 +150,10 @@ public enum UpdateChecker {
     guard let finalDmgUrl = dmgUrl, !finalDmgUrl.isEmpty else {
       return .invalidResponse(message: "新版本 v\(remoteVer) 尚未附带 .dmg 安装包。")
     }
+    let lowerScheme = finalDmgUrl.lowercased()
+    guard lowerScheme.hasPrefix("https://") || lowerScheme.hasPrefix("http://") else {
+      return .invalidResponse(message: "安装包下载链接无效。")
+    }
 
     return .updateAvailable(
       UpdateReleaseInfo(
@@ -150,7 +161,9 @@ public enum UpdateChecker {
         downloadUrl: finalDmgUrl,
         notes: notes,
         sha256Url: sha256Url,
-        expectedSha256: (expectedSha256?.count == 64) ? expectedSha256 : nil
+        expectedSha256: (expectedSha256?.count == 64) ? expectedSha256 : nil,
+        assetSizeBytes: assetSizeBytes,
+        releasePageUrl: releasePageUrl
       )
     )
   }

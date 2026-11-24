@@ -37,6 +37,39 @@ public enum MeterFormat {
     return trimFixedDecimal(String(format: "%.2f", Double(n) / 1_000_000_000.0)) + "B"
   }
 
+  public static func bytes(_ count: Int64) -> String {
+    if count <= 0 { return "0 B" }
+    if count < 1024 { return "\(count) B" }
+    let kb = Double(count) / 1024.0
+    if count < 1024 * 1024 {
+      return trimFixedDecimal(String(format: "%.1f", kb)) + " KB"
+    }
+    let mb = kb / 1024.0
+    if count < 1024 * 1024 * 1024 {
+      return trimFixedDecimal(String(format: "%.1f", mb)) + " MB"
+    }
+    let gb = mb / 1024.0
+    return trimFixedDecimal(String(format: "%.2f", gb)) + " GB"
+  }
+
+  public static func byteRate(_ bytesPerSec: Double) -> String {
+    guard bytesPerSec.isFinite, bytesPerSec > 0 else { return "" }
+    let rounded = Int64(bytesPerSec.rounded())
+    guard rounded > 0 else { return "" }
+    return "\(bytes(rounded))/s"
+  }
+
+  public static func eta(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds >= 1 else { return "" }
+    if seconds < 60 {
+      return "剩余约 \(Int(seconds.rounded())) 秒"
+    }
+    if seconds < 3600 {
+      return "剩余约 \(Int((seconds / 60.0).rounded())) 分钟"
+    }
+    return ""
+  }
+
   public static func money(_ val: Double?, symbol: String = "$") -> String {
     guard let val = val, val.isFinite else { return "--" }
     let sym = symbol.isEmpty ? "$" : symbol

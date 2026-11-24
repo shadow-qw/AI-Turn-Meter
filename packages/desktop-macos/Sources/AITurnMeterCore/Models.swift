@@ -874,25 +874,44 @@ public struct DoctorResponse: Decodable {
   public let apps: [String: DoctorAppEntry]
 }
 
+public enum UpdateStage: Equatable, Sendable {
+  case idle
+  case checking
+  case upToDate
+  case available
+  case downloading
+  case verifying
+  case installing
+  case completedManualOpen
+  case failed
+  case cancelled
+}
+
 public struct UpdateReleaseInfo: Equatable, Sendable {
   public let version: String
   public let downloadUrl: String
   public let notes: String
   public let sha256Url: String?
   public let expectedSha256: String?
+  public let assetSizeBytes: Int64?
+  public let releasePageUrl: String?
 
   public init(
     version: String,
     downloadUrl: String,
     notes: String,
     sha256Url: String? = nil,
-    expectedSha256: String? = nil
+    expectedSha256: String? = nil,
+    assetSizeBytes: Int64? = nil,
+    releasePageUrl: String? = nil
   ) {
     self.version = version
     self.downloadUrl = downloadUrl
     self.notes = notes
     self.sha256Url = sha256Url
     self.expectedSha256 = expectedSha256
+    self.assetSizeBytes = assetSizeBytes
+    self.releasePageUrl = releasePageUrl
   }
 }
 

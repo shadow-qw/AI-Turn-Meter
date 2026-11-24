@@ -353,60 +353,7 @@ struct ContentView: View {
         .padding(18)
         .frame(width: 490)
       case .update:
-        VStack(alignment: .leading, spacing: 14) {
-          Text("检查软件更新")
-            .font(.headline)
-          Text(vm.updateStatusText)
-            .font(.system(size: 12.5))
-            .foregroundColor(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-          if vm.updateDownloading, let progress = vm.updateDownloadProgress {
-            HStack(spacing: 10) {
-              ProgressView(value: progress)
-              Text("\(Int((progress * 100).rounded()))%")
-                .font(.system(size: 11, design: .monospaced))
-                .monospacedDigit()
-                .foregroundColor(.secondary)
-                .frame(width: 36, alignment: .trailing)
-            }
-          }
-          if let info = vm.availableUpdate, !info.notes.isEmpty {
-            ScrollView {
-              Text(info.notes)
-                .font(.system(size: 11.5))
-                .foregroundColor(.primary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-                .padding(10)
-            }
-            .frame(maxHeight: 150)
-            .background(Color(nsColor: .textBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(
-              RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-            )
-          }
-          HStack {
-            if vm.updateChecking || (vm.updateDownloading && vm.updateDownloadProgress == nil) {
-              ProgressView().controlSize(.small)
-            }
-            Spacer()
-            if vm.updateDownloading {
-              Button("取消下载") {
-                vm.cancelUpdateDownload()
-              }
-            } else if let info = vm.availableUpdate {
-              Button("立即更新并重启") { vm.downloadAndOpenUpdate(info) }
-                .buttonStyle(.borderedProminent)
-            }
-            Button("关闭") { vm.activeSheet = nil }
-              .disabled(vm.updateDownloading)
-          }
-        }
-        .padding(18)
-        .frame(width: 460)
-        .interactiveDismissDisabled(vm.updateDownloading)
+        UpdateSheetView(vm: vm)
       }
     }
   }

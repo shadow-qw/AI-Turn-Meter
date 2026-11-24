@@ -283,6 +283,11 @@ final class MeterViewModel: ObservableObject {
   @Published var updateChecking: Bool = false
   @Published var updateDownloading: Bool = false
   @Published var updateDownloadProgress: Double? = nil
+  @Published var updateStage: UpdateStage = .idle
+  @Published var updateErrorDetail: String? = nil
+  @Published var updateDownloadedBytes: Int64 = 0
+  @Published var updateTotalBytes: Int64 = 0
+  @Published var updateSpeedBytesPerSec: Double? = nil
   @Published var availableUpdate: UpdateReleaseInfo? = nil
   @Published var updateStatusText: String = ""
 
@@ -312,8 +317,7 @@ final class MeterViewModel: ObservableObject {
   private var receiptFetchSeq: UInt64 = 0
   private var fingerprintSeq: UInt64 = 0
   private var sshSnippetSeq: UInt64 = 0
-  private var activeUpdateDownloadTask: URLSessionDownloadTask? = nil
-  private var updateProgressObs: NSKeyValueObservation? = nil
+  private var activeUpdateDownloader: UpdateDownloader? = nil
 
   init() {
     if hideDockIcon && !showMenuBarExtra {
@@ -1048,10 +1052,8 @@ export default {
     pollTimer = nil
     sseTurnRefreshWorkItem?.cancel()
     sseTurnRefreshWorkItem = nil
-    updateProgressObs?.invalidate()
-    updateProgressObs = nil
-    activeUpdateDownloadTask?.cancel()
-    activeUpdateDownloadTask = nil
+    activeUpdateDownloader?.cancel()
+    activeUpdateDownloader = nil
     sseClient.stop()
     sseConnected = false
     hasStarted = false
@@ -2334,12 +2336,20 @@ export default {
     }
     availableUpdate = nil
     updateDownloadProgress = nil
+    updateStage = .checking
+    updateErrorDetail = nil
+    updateDownloadedBytes = 0
+    updateTotalBytes = 0
+    updateSpeedBytesPerSec = nil
     showUpdateSheet = true
     guard let rawUrl = updateFeedUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
           !rawUrl.isEmpty,
           let url = URL(string: rawUrl) else {
       updateChecking = false
-      updateStatusText = "当前是离线独立安装包。\n\n收到新版 .dmg 时直接拖入「应用程序」覆盖原软件并打开一次，后台与扩展就会自动完成更新。"
+      updateStage = .failed
+      let msg = "当前是离线独立安装包。\n\n收到新版 .dmg 时直接拖入「应用程序」覆盖原软件并打开一次，后台与扩展就会自动完成更新。"
+      updateErrorDetail = msg
+      updateStatusText = msg
       return
     }
 
@@ -2360,10 +2370,13 @@ export default {
             case .updateAvailable(let info):
               self.updateChecking = false
               self.availableUpdate = info
+              self.updateStage = .available
+              self.updateTotalBytes = info.assetSizeBytes ?? 0
               self.updateStatusText = "发现新版本 v\(info.version)（当前 v\(curVersion)）"
               return
             case .upToDate(let v):
               self.updateChecking = false
+              self.updateStage = .upToDate
               self.updateStatusText = "当前已是最新版本（v\(v)）。"
               return
             case .invalidResponse:
@@ -2398,18 +2411,27 @@ export default {
         guard let self = self else { return }
         self.updateChecking = false
         if let err = err {
-          self.updateStatusText = "检查更新失败：\(err.localizedDescription)"
+          let msg = "检查更新失败：\(err.localizedDescription)"
+          self.updateStage = .failed
+          self.updateErrorDetail = msg
+          self.updateStatusText = msg
           return
         }
 
         if isGithubReleasesLatest {
           guard let finalUrl = (resp as? HTTPURLResponse)?.url else {
-            self.updateStatusText = "无法解析最新版本页面。"
+            let msg = "无法解析最新版本页面。"
+            self.updateStage = .failed
+            self.updateErrorDetail = msg
+            self.updateStatusText = msg
             return
           }
           let abs = finalUrl.absoluteString
           guard let range = abs.range(of: "/releases/tag/") else {
-            self.updateStatusText = "当前仓库尚未发布 GitHub Release（当前运行 v\(curVersion)）。"
+            let msg = "当前仓库尚未发布 GitHub Release（当前运行 v\(curVersion)）。"
+            self.updateStage = .failed
+            self.updateErrorDetail = msg
+            self.updateStatusText = msg
             return
           }
           let rawPart = String(abs[range.upperBound...])
@@ -2420,7 +2442,10 @@ export default {
           let remoteVer = cleanTag.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
           let repoPrefix = String(abs[..<range.lowerBound])
           if remoteVer.isEmpty {
-            self.updateStatusText = "当前仓库尚未发布版本标签。"
+            let msg = "当前仓库尚未发布版本标签。"
+            self.updateStage = .failed
+            self.updateErrorDetail = msg
+            self.updateStatusText = msg
             return
           }
           if UpdateChecker.compareSemver(remoteVer, curVersion) > 0 {
@@ -2430,47 +2455,83 @@ export default {
               version: remoteVer,
               downloadUrl: dlUrl,
               notes: "",
-              sha256Url: sha256Url
+              sha256Url: sha256Url,
+              releasePageUrl: abs
             )
+            self.updateStage = .available
+            self.updateTotalBytes = 0
             self.updateStatusText = "发现新版本 v\(remoteVer)（当前 v\(curVersion)）"
           } else {
+            self.updateStage = .upToDate
             self.updateStatusText = "当前已是最新版本（v\(curVersion)）。"
           }
           return
         }
 
         guard let data = data else {
-          self.updateStatusText = "更新源未返回数据。"
+          let msg = "更新源未返回数据。"
+          self.updateStage = .failed
+          self.updateErrorDetail = msg
+          self.updateStatusText = msg
           return
         }
         switch UpdateChecker.parseReleaseJson(data, currentVersion: curVersion) {
         case .updateAvailable(let info):
           self.availableUpdate = info
+          self.updateStage = .available
+          self.updateTotalBytes = info.assetSizeBytes ?? 0
           self.updateStatusText = "发现新版本 v\(info.version)（当前 v\(curVersion)）"
         case .upToDate(let v):
+          self.updateStage = .upToDate
           self.updateStatusText = "当前已是最新版本（v\(v)）。"
         case .invalidResponse(let msg):
+          self.updateStage = .failed
+          self.updateErrorDetail = msg
           self.updateStatusText = msg
         }
       }
     }.resume()
   }
 
+  func openUpdateReleasePage() {
+    let raw = availableUpdate?.releasePageUrl
+      ?? updateFeedUrl
+      ?? "https://github.com/shadow-qw/AI-Turn-Meter/releases/latest"
+    if let url = URL(string: raw) {
+      NSWorkspace.shared.open(url)
+    }
+  }
+
+  func openUpdateDirectDownload() {
+    if let raw = availableUpdate?.downloadUrl, let url = URL(string: raw) {
+      NSWorkspace.shared.open(url)
+      return
+    }
+    openUpdateReleasePage()
+  }
+
   func cancelUpdateDownload() {
-    updateProgressObs?.invalidate()
-    updateProgressObs = nil
-    activeUpdateDownloadTask?.cancel()
-    activeUpdateDownloadTask = nil
+    guard updateStage == .downloading else { return }
+    activeUpdateDownloader?.cancel()
+    activeUpdateDownloader = nil
     updateDownloading = false
     updateDownloadProgress = nil
-    updateStatusText = "已取消下载更新。"
+    updateSpeedBytesPerSec = nil
+    updateStage = .cancelled
+    updateStatusText = "已取消下载，你可以随时重新开始或改用浏览器下载。"
   }
 
   func downloadAndOpenUpdate(_ info: UpdateReleaseInfo) {
     guard !updateDownloading, let url = URL(string: info.downloadUrl) else { return }
+    let knownTotalBytes = info.assetSizeBytes ?? 0
     updateDownloading = true
-    updateDownloadProgress = 0
-    updateStatusText = "正在下载 v\(info.version) 更新包…"
+    updateStage = .downloading
+    updateErrorDetail = nil
+    updateDownloadedBytes = 0
+    updateTotalBytes = knownTotalBytes
+    updateDownloadProgress = knownTotalBytes > 0 ? 0.0 : nil
+    updateSpeedBytesPerSec = nil
+    updateStatusText = "正在下载 v\(info.version) 安装包…"
 
     let bundleUrl = Bundle.main.bundleURL
     let canSelfReplace =
@@ -2481,122 +2542,126 @@ export default {
     let urlLast = url.lastPathComponent
     let dmgFilename = urlLast.lowercased().hasSuffix(".dmg") ? urlLast : "AI-Turn-Meter-\(info.version).dmg"
     let assetFilename = urlLast.isEmpty ? dmgFilename : urlLast
+    let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+    let dest = downloadsDir.appendingPathComponent(dmgFilename)
 
-    let task = URLSession.shared.downloadTask(with: url) { [weak self] tempUrl, resp, err in
-      guard let self = self else { return }
-      DispatchQueue.main.async { [weak self] in
-        self?.updateProgressObs?.invalidate()
-        self?.updateProgressObs = nil
-        self?.activeUpdateDownloadTask = nil
-      }
-      if let err = err {
-        let nsErr = err as NSError
-        DispatchQueue.main.async {
-          if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
-            return
-          }
-          self.updateDownloading = false
-          self.updateDownloadProgress = nil
-          self.updateStatusText = "下载失败：\(err.localizedDescription)"
-        }
-        return
-      }
-      if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-        DispatchQueue.main.async {
-          self.updateDownloading = false
-          self.updateDownloadProgress = nil
-          self.updateStatusText = "下载失败：HTTP \(http.statusCode)"
-        }
-        return
-      }
-      guard let tempUrl = tempUrl else {
-        DispatchQueue.main.async {
-          self.updateDownloading = false
-          self.updateDownloadProgress = nil
-          self.updateStatusText = "下载未返回文件。"
-        }
-        return
-      }
-
-      let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
-      let dest = downloadsDir.appendingPathComponent(dmgFilename)
-      let fm = FileManager.default
-      try? fm.removeItem(at: dest)
-      do {
-        try fm.moveItem(at: tempUrl, to: dest)
-      } catch {
-        let msg = error.localizedDescription
-        DispatchQueue.main.async {
-          self.updateDownloading = false
-          self.updateDownloadProgress = nil
-          self.updateStatusText = "保存安装包失败：\(msg)"
-        }
-        return
-      }
-
-      // Move post-download verification & installation off URLSession.shared's serial delegate queue
-      // so checksum HTTP requests and hdiutil/ditto never deadlock or stall shared network callbacks.
-      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-        guard let self = self else { return }
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? NSNumber)?.int64Value ?? 0
-        guard fileSize >= 1_000_000 else {
-          try? FileManager.default.removeItem(at: dest)
-          DispatchQueue.main.async {
-            self.updateDownloading = false
-            self.updateDownloadProgress = nil
-            self.updateStatusText = "下载文件异常（大小不足 1 MB），已中止更新。"
-          }
-          return
-        }
-
-        if let shaErr = Self.verifyDownloadedDmgSha256IfAvailable(dest: dest, filename: assetFilename, info: info) {
-          try? FileManager.default.removeItem(at: dest)
-          DispatchQueue.main.async {
-            self.updateDownloading = false
-            self.updateDownloadProgress = nil
-            self.updateStatusText = shaErr
-          }
-          return
-        }
-
-        if canSelfReplace {
-          DispatchQueue.main.async {
-            self.updateDownloadProgress = 1.0
-            self.updateStatusText = "正在安装 v\(info.version) 并准备重启…"
-          }
-          if let errMsg = Self.installAppUpdateAndRelaunch(dmgUrl: dest, targetAppUrl: bundleUrl) {
-            DispatchQueue.main.async {
-              self.updateDownloading = false
-              self.updateDownloadProgress = nil
-              self.updateStatusText = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
-              NSWorkspace.shared.open(dest)
-            }
+    let downloader = UpdateDownloader(
+      url: url,
+      destinationUrl: dest,
+      userAgent: "AI-Turn-Meter/\(self.version)",
+      onProgress: { [weak self] written, expected, speed in
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self, self.updateStage == .downloading else { return }
+          self.updateDownloadedBytes = written
+          let resolvedTotal = expected > 0 ? expected : (info.assetSizeBytes ?? 0)
+          self.updateTotalBytes = resolvedTotal
+          if resolvedTotal > 0 {
+            self.updateDownloadProgress = min(1.0, max(0.0, Double(written) / Double(resolvedTotal)))
           } else {
-            DispatchQueue.main.async {
-              self.terminateForUpdateRelaunch()
+            self.updateDownloadProgress = nil
+          }
+          if let speed = speed {
+            self.updateSpeedBytesPerSec = speed
+          }
+        }
+      },
+      onFinish: { [weak self] result in
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self else { return }
+          self.activeUpdateDownloader = nil
+
+          switch result {
+          case .failure(let err):
+            let nsErr = err as NSError
+            if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
+              return
+            }
+            let msg = "下载失败：\(err.localizedDescription)"
+            self.updateDownloading = false
+            self.updateDownloadProgress = nil
+            self.updateSpeedBytesPerSec = nil
+            self.updateStage = .failed
+            self.updateErrorDetail = msg
+            self.updateStatusText = msg
+
+          case .success(let downloadedUrl):
+            self.updateStage = .verifying
+            self.updateDownloadProgress = nil
+            self.updateSpeedBytesPerSec = nil
+            self.updateStatusText = "正在校验安装包完整性（SHA-256）…"
+
+            // Run SHA-256 verification and hdiutil/ditto off the main thread.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+              guard let self = self else { return }
+              let fileSize = (try? FileManager.default.attributesOfItem(atPath: downloadedUrl.path)[.size] as? NSNumber)?.int64Value ?? 0
+              guard fileSize >= 1_000_000 else {
+                try? FileManager.default.removeItem(at: downloadedUrl)
+                let msg = "下载文件异常（仅 \(MeterFormat.bytes(fileSize))，不足 1 MB），可能是网络代理拦截或更新源链接失效。请重试或改用浏览器下载。"
+                DispatchQueue.main.async {
+                  self.updateDownloading = false
+                  self.updateDownloadProgress = nil
+                  self.updateSpeedBytesPerSec = nil
+                  self.updateStage = .failed
+                  self.updateErrorDetail = msg
+                  self.updateStatusText = msg
+                }
+                return
+              }
+
+              if let shaErr = Self.verifyDownloadedDmgSha256IfAvailable(dest: downloadedUrl, filename: assetFilename, info: info) {
+                try? FileManager.default.removeItem(at: downloadedUrl)
+                DispatchQueue.main.async {
+                  self.updateDownloading = false
+                  self.updateDownloadProgress = nil
+                  self.updateSpeedBytesPerSec = nil
+                  self.updateStage = .failed
+                  self.updateErrorDetail = shaErr
+                  self.updateStatusText = shaErr
+                }
+                return
+              }
+
+              if canSelfReplace {
+                DispatchQueue.main.async {
+                  self.updateStage = .installing
+                  self.updateDownloadProgress = 1.0
+                  self.updateStatusText = "校验通过，正在解压安装 v\(info.version) 并准备重启…"
+                }
+                if let errMsg = Self.installAppUpdateAndRelaunch(dmgUrl: downloadedUrl, targetAppUrl: bundleUrl) {
+                  let msg = "自动覆盖失败（\(errMsg)），已保存到「下载」并打开安装包。"
+                  DispatchQueue.main.async {
+                    self.updateDownloading = false
+                    self.updateDownloadProgress = nil
+                    self.updateSpeedBytesPerSec = nil
+                    self.updateStage = .failed
+                    self.updateErrorDetail = msg
+                    self.updateStatusText = msg
+                    NSWorkspace.shared.open(downloadedUrl)
+                  }
+                } else {
+                  DispatchQueue.main.async {
+                    self.terminateForUpdateRelaunch()
+                  }
+                }
+                return
+              }
+
+              DispatchQueue.main.async {
+                self.updateDownloading = false
+                self.updateDownloadProgress = nil
+                self.updateSpeedBytesPerSec = nil
+                self.updateStage = .completedManualOpen
+                self.updateStatusText = "已下载到「下载」文件夹并打开安装包，拖入「应用程序」覆盖即可。"
+                NSWorkspace.shared.open(downloadedUrl)
+              }
             }
           }
-          return
         }
+      }
+    )
 
-        DispatchQueue.main.async {
-          self.updateDownloading = false
-          self.updateDownloadProgress = nil
-          self.updateStatusText = "已下载到「下载」文件夹并打开安装包，拖入「应用程序」覆盖即可。"
-          NSWorkspace.shared.open(dest)
-        }
-      }
-    }
-    updateProgressObs?.invalidate()
-    updateProgressObs = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
-      let frac = max(0.0, min(1.0, progress.fractionCompleted))
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self, self.updateDownloading else { return }
-        self.updateDownloadProgress = frac
-      }
-    }
-    activeUpdateDownloadTask = task
-    task.resume()
+    activeUpdateDownloader = downloader
+    downloader.start()
   }
 
   private nonisolated static func verifyDownloadedDmgSha256IfAvailable(

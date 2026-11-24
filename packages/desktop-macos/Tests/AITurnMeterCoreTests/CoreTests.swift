@@ -82,6 +82,7 @@ struct AITurnMeterCoreTests {
   func parseReleaseJsonPicksArm64DmgAndSha256() throws {
     let payload: [String: Any] = [
       "tag_name": "v0.2.26",
+      "html_url": "https://github.com/shadow-qw/AI-Turn-Meter/releases/tag/v0.2.26",
       "url": "https://api.github.com/repos/shadow-qw/AI-Turn-Meter/releases/987654",
       "body": "- Fix SSE reconnect\n- Add SHA-256 check",
       "assets": [
@@ -95,6 +96,7 @@ struct AITurnMeterCoreTests {
         ],
         [
           "name": "AI-Turn-Meter-0.2.26-arm64.dmg",
+          "size": 48_555_137,
           "browser_download_url": "https://example.com/AI-Turn-Meter-0.2.26-arm64.dmg",
         ],
         [
@@ -113,6 +115,8 @@ struct AITurnMeterCoreTests {
     #expect(info.downloadUrl == "https://example.com/AI-Turn-Meter-0.2.26-arm64.dmg")
     #expect(info.sha256Url == "https://example.com/AI-Turn-Meter-0.2.26-arm64.dmg.sha256")
     #expect(info.notes == "- Fix SSE reconnect\n- Add SHA-256 check")
+    #expect(info.assetSizeBytes == 48_555_137)
+    #expect(info.releasePageUrl == "https://github.com/shadow-qw/AI-Turn-Meter/releases/tag/v0.2.26")
 
     let flatPayload: [String: Any] = [
       "version": "0.2.27",
@@ -177,6 +181,13 @@ struct AITurnMeterCoreTests {
     #expect(MeterFormat.tps(42.0) == "42 tok/s")
     #expect(MeterFormat.pct(87.0) == "87%")
     #expect(MeterFormat.shortDate("2026-11-19") == "11/19")
+    #expect(MeterFormat.bytes(0) == "0 B")
+    #expect(MeterFormat.bytes(512) == "512 B")
+    #expect(MeterFormat.bytes(48_555_137) == "46.3 MB")
+    #expect(MeterFormat.byteRate(4_404_019.2) == "4.2 MB/s")
+    #expect(MeterFormat.byteRate(0) == "")
+    #expect(MeterFormat.eta(12) == "剩余约 12 秒")
+    #expect(MeterFormat.eta(0.4) == "")
 
     let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("atm-auth-test-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
