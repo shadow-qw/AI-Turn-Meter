@@ -793,7 +793,7 @@ public enum MenuBarUsageScope: String, CaseIterable {
   public var title: String {
     switch self {
     case .all: return "全部软件汇总（默认）"
-    case .provider: return "仅当前展示软件"
+    case .provider: return "仅所选软件"
     }
   }
 }

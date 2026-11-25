@@ -334,12 +334,15 @@ private struct CodexBarStyleCardView: View {
   }
 
   private var visibleWindows: [CardRecentWindow] {
-    guard vm.showRecentWindowsInMenu else { return [] }
+    guard vm.menuBarConfig.popoverSections.showRecentWindows else { return [] }
     return card.recentWindows.filter { $0.index == 0 || $0.turnCount > 0 }
   }
 
   private var visibleSessions: [CardSessionSummary] {
-    guard !isBillingOnlyExternal, let sessions = card.recentSessions, !sessions.isEmpty else {
+    guard vm.menuBarConfig.popoverSections.showRecentSessions,
+          !isBillingOnlyExternal,
+          let sessions = card.recentSessions,
+          !sessions.isEmpty else {
       return []
     }
     return Array(sessions.prefix(3))
@@ -716,7 +719,7 @@ private struct CodexBarStyleCardView: View {
       }
 
       // 30-day Mini Usage Chart
-      if !card.daily30.isEmpty {
+      if vm.menuBarConfig.popoverSections.showMiniChart && !card.daily30.isEmpty {
         MiniUsageBarsView(
           points: card.daily30,
           cardHovered: isCardHovered,
@@ -763,23 +766,25 @@ private struct CodexBarStyleCardView: View {
 
       // Quiet Unboxed Footer Lines
       VStack(alignment: .leading, spacing: 2) {
-        if let topModel = card.topModel {
-          let tpsSuffix: String = resolvedTpsBadge.map {
-            let clean = $0.hasPrefix("均 ") ? String($0.dropFirst(2)) : $0
-            return " · \(clean)"
-          } ?? ""
-          Text("最常用模型: \(topModel)\(tpsSuffix)")
-            .font(.system(size: 10.5))
-            .monospacedDigit()
-            .foregroundColor(secondaryText)
-            .lineLimit(1)
-            .truncationMode(.middle)
-        } else if let tps = resolvedTpsBadge {
-          Text("最近速率: \(tps)")
-            .font(.system(size: 10.5))
-            .monospacedDigit()
-            .foregroundColor(secondaryText)
-            .lineLimit(1)
+        if vm.menuBarConfig.popoverSections.showFooterModelInfo {
+          if let topModel = card.topModel {
+            let tpsSuffix: String = resolvedTpsBadge.map {
+              let clean = $0.hasPrefix("均 ") ? String($0.dropFirst(2)) : $0
+              return " · \(clean)"
+            } ?? ""
+            Text("最常用模型: \(topModel)\(tpsSuffix)")
+              .font(.system(size: 10.5))
+              .monospacedDigit()
+              .foregroundColor(secondaryText)
+              .lineLimit(1)
+              .truncationMode(.middle)
+          } else if let tps = resolvedTpsBadge {
+            Text("最近速率: \(tps)")
+              .font(.system(size: 10.5))
+              .monospacedDigit()
+              .foregroundColor(secondaryText)
+              .lineLimit(1)
+          }
         }
         Text(card.footnote ?? "根据 Token 用量估算 · 不是订阅账单")
           .font(.system(size: 10))

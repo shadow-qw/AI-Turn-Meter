@@ -835,4 +835,220 @@ struct AITurnMeterCoreTests {
     }
     #expect(totalEmitted == 520)
   }
+
+  @Test("MenuBarCustomConfig migrates legacy prefs and decodes resiliently")
+  func menuBarCustomConfigMigrationAndResilience() throws {
+    let migrated = MenuBarCustomConfig.migrated(
+      displayMode: .quotaAndAmount,
+      provider: "ext:gw",
+      showRecentWindows: true
+    )
+    #expect(migrated.items == [.quotaPct, .billingAmount])
+    #expect(migrated.selectedProviders == ["ext:gw"])
+    #expect(migrated.popoverSections.showRecentWindows == true)
+    #expect(migrated.matchingPreset == .quotaAndAmount)
+
+    let latestMigrated = MenuBarCustomConfig.migrated(
+      displayMode: .latestInline,
+      provider: "auto",
+      showRecentWindows: false
+    )
+    #expect(latestMigrated.items == [.latestTokens, .latestTps])
+    #expect(latestMigrated.selectedProviders.isEmpty)
+    #expect(latestMigrated.matchingPreset == .performance)
+
+    let futureJson = """
+    {
+      "items": ["todayCost", "futureUnknownMetric", "latestTps", "todayCost"],
+      "selectedProviders": ["codex", "auto", "codex"],
+      "separator": "pipe",
+      "showProviderName": false,
+      "showQuotaPrefix": false,
+      "showMetricLabels": true
+    }
+    """
+    let decoded = try JSONDecoder().decode(MenuBarCustomConfig.self, from: Data(futureJson.utf8))
+    #expect(decoded.items == [.todayCost, .latestTps])
+    #expect(decoded.selectedProviders == ["codex"])
+    #expect(decoded.separator == .pipe)
+    #expect(decoded.showProviderName == false)
+    #expect(decoded.showQuotaPrefix == false)
+    #expect(decoded.showMetricLabels == true)
+    #expect(decoded.popoverSections.showMiniChart == true)
+    #expect(decoded.popoverSections.showRecentSessions == true)
+  }
+
+  @Test("MenuBarFormatter renders custom combinations, merged quota+amount, mixed currencies, and sample fallback")
+  func menuBarFormatterCustomCombinations() {
+    let allCard = CodexBarCardSnapshot(
+      accountEmail: nil,
+      planTitle: nil,
+      quotaWindows: nil,
+      resetCreditsText: nil,
+      quotaHint: nil,
+      latestTpsText: nil,
+      latestCacheText: nil,
+      latestTurnSubline: nil,
+      today: CardTodayMetrics(
+        costUsd: 12.50,
+        totalTokens: 1_500_000,
+        totalInputTokens: 1_200_000,
+        outputTokens: 300_000,
+        turnCount: 18,
+        callCount: 30,
+        cacheRatePct: nil,
+        avgTps: nil,
+        cacheSavingsUsd: nil
+      ),
+      currentWindow: CardWindowMetrics(costUsd: nil, totalTokens: 0, turnCount: 0),
+      days30: CardWindowMetrics(costUsd: 240.0, totalTokens: 20_000_000, turnCount: 300),
+      daily30: [],
+      projects: nil,
+      recentWindows: [],
+      topModel: nil
+    )
+
+    let codexCard = CodexBarCardSnapshot(
+      accountEmail: nil,
+      planTitle: nil,
+      quotaWindows: [CardQuotaWindow(id: "5h", title: "5h", remainingPct: 75)],
+      resetCreditsText: nil,
+      quotaHint: nil,
+      latestTpsText: nil,
+      latestCacheText: nil,
+      latestTurnSubline: nil,
+      today: CardTodayMetrics(
+        costUsd: 5.20,
+        totalTokens: 500_000,
+        totalInputTokens: 400_000,
+        outputTokens: 100_000,
+        turnCount: 8,
+        callCount: 12,
+        cacheRatePct: nil,
+        avgTps: nil,
+        cacheSavingsUsd: nil
+      ),
+      currentWindow: CardWindowMetrics(costUsd: nil, totalTokens: 0, turnCount: 0),
+      days30: CardWindowMetrics(costUsd: 80.0, totalTokens: 8_000_000, turnCount: 100),
+      daily30: [],
+      projects: nil,
+      recentWindows: [],
+      topModel: nil
+    )
+
+    let gwCard = CodexBarCardSnapshot(
+      accountEmail: nil,
+      planTitle: nil,
+      quotaWindows: [CardQuotaWindow(id: "m", title: "月度", remainingPct: 60)],
+      resetCreditsText: nil,
+      quotaHint: nil,
+      latestTpsText: nil,
+      latestCacheText: nil,
+      latestTurnSubline: nil,
+      today: CardTodayMetrics(
+        costUsd: 35.0,
+        totalTokens: 200_000,
+        totalInputTokens: 150_000,
+        outputTokens: 50_000,
+        turnCount: 4,
+        callCount: 6,
+        cacheRatePct: nil,
+        avgTps: nil,
+        cacheSavingsUsd: nil
+      ),
+      currentWindow: CardWindowMetrics(costUsd: nil, totalTokens: 0, turnCount: 0),
+      days30: CardWindowMetrics(costUsd: 420.0, totalTokens: 4_000_000, turnCount: 60),
+      daily30: [],
+      projects: nil,
+      recentWindows: [],
+      topModel: nil,
+      isExternal: true,
+      providerName: "司内",
+      currencySymbol: "¥",
+      billingSummary: CardBillingSummary(todayCost: 35.0, periodCost: 400.0, periodLimit: 1000.0, periodRemaining: 600.0)
+    )
+
+    let latestTurn = TurnSummary(
+      turnUid: "codex:s1:t1",
+      tool: "codex",
+      totalInputTokens: 64_200,
+      cacheRatePct: 94.2,
+      tps: 52.0
+    )
+
+    let snapshot = MenuBarRenderSnapshot(
+      isActiveOverall: true,
+      orderedProviderKeys: ["codex", "ext:gw"],
+      providerLabels: ["codex": "Codex", "ext:gw": "司内"],
+      cards: ["all": allCard, "codex": codexCard, "ext:gw": gwCard],
+      latestTurn: latestTurn
+    )
+
+    // 1. Custom order, pipe separator, metric labels, and todayTurns/days30Cost/cacheRate
+    let customCfg = MenuBarCustomConfig(
+      items: [.todayTokens, .days30Cost, .latestTokens, .latestTps, .latestCacheRate, .todayTurns],
+      separator: .pipe,
+      showMetricLabels: true
+    )
+    let customOut = MenuBarFormatter.format(
+      config: customCfg,
+      usageScope: .all,
+      quotaDisplayMode: .remaining,
+      snapshot: snapshot
+    )
+    #expect(customOut == "今 1.5M | 30d $240.00 | 末 64.2k | 末 52 tok/s | 缓 94% | 今 18 轮")
+
+    // 2. Adjacent quotaPct + billingAmount merges cleanly per provider, and reversed order respects user choice
+    let mergedCfg = MenuBarCustomConfig(
+      items: [.quotaPct, .billingAmount],
+      selectedProviders: ["ext:gw"],
+      separator: .dot,
+      showProviderName: true,
+      showQuotaPrefix: true
+    )
+    #expect(
+      MenuBarFormatter.format(config: mergedCfg, usageScope: .all, quotaDisplayMode: .used, snapshot: snapshot)
+        == "司内 用40% · ¥400"
+    )
+
+    let reversedMergedCfg = MenuBarCustomConfig(
+      items: [.billingAmount, .quotaPct],
+      selectedProviders: ["ext:gw"],
+      separator: .slash,
+      showProviderName: false,
+      showQuotaPrefix: false
+    )
+    #expect(
+      MenuBarFormatter.format(config: reversedMergedCfg, usageScope: .all, quotaDisplayMode: .remaining, snapshot: snapshot)
+        == "¥600 / 60%"
+    )
+
+    // 3. Non-adjacent quotaPct + todayCost + billingAmount does NOT merge quotaPct and billingAmount
+    let nonAdjCfg = MenuBarCustomConfig(
+      items: [.quotaPct, .todayCost, .billingAmount],
+      selectedProviders: ["codex", "ext:gw"],
+      separator: .dot
+    )
+    let nonAdjOut = MenuBarFormatter.format(
+      config: nonAdjCfg,
+      usageScope: .provider,
+      quotaDisplayMode: .remaining,
+      snapshot: snapshot
+    )
+    #expect(nonAdjOut == "Codex 剩75% · 司内 剩60% · $5.20 + ¥35.00 · 司内 ¥600")
+
+    // 4. Sample fallback populates metrics even when daemon is inactive / has no live cards
+    let emptySnapshot = MenuBarRenderSnapshot(
+      isActiveOverall: false,
+      orderedProviderKeys: [],
+      useSampleFallback: true
+    )
+    let sampleOut = MenuBarFormatter.format(
+      config: MenuBarCustomConfig(items: [.todayTokens, .todayCost, .latestTps], separator: .pipe, showMetricLabels: true),
+      usageScope: .all,
+      quotaDisplayMode: .remaining,
+      snapshot: emptySnapshot
+    )
+    #expect(sampleOut == "今 12.4M | 今 $18.20 | 末 52 tok/s")
+  }
 }

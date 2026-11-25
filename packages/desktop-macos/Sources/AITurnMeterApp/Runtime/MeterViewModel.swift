@@ -63,6 +63,7 @@ final class MeterViewModel: ObservableObject {
     static let menuBarIconStyle = "atm.menuBarIconStyle.v1"
     static let menuBarProvider = "atm.menuBarProvider.v1"
     static let menuBarUsageScope = "atm.menuBarUsageScope.v1"
+    static let menuBarCustomConfig = "atm.menuBarCustomConfig.v1"
     static let providerOrder = "atm.providerOrder.v1"
     static let quotaDisplayMode = "atm.quotaDisplayMode.v1"
     static let hideDockIcon = "aiTurnMeter.hideDockIcon"
@@ -208,6 +209,7 @@ final class MeterViewModel: ObservableObject {
   }()
   @Published var hideDockIcon: Bool = UserDefaults.standard.bool(forKey: PrefKey.hideDockIcon)
   @Published var showRecentWindowsInMenu: Bool = UserDefaults.standard.bool(forKey: PrefKey.showRecentWindowsInMenu)
+  @Published var menuBarConfig: MenuBarCustomConfig = MeterViewModel.loadMenuBarConfig()
   @Published var alertsEnabled: Bool = UserDefaults.standard.object(forKey: PrefKey.alertsEnabled) as? Bool ?? true
   @Published var alertDeliveryError: String? = nil
   @Published var launchAtLogin: Bool = MeterViewModel.detectAppAutostartEnabled()
@@ -319,11 +321,36 @@ final class MeterViewModel: ObservableObject {
   private var sshSnippetSeq: UInt64 = 0
   private var activeUpdateDownloader: UpdateDownloader? = nil
 
+  private static func loadMenuBarConfig() -> MenuBarCustomConfig {
+    let defaults = UserDefaults.standard
+    if let data = defaults.data(forKey: PrefKey.menuBarCustomConfig),
+       var decoded = try? JSONDecoder().decode(MenuBarCustomConfig.self, from: data) {
+      decoded.normalize()
+      return decoded
+    }
+    let legacyDisplay: MenuBarDisplayMode = {
+      if let raw = defaults.string(forKey: PrefKey.menuBarDisplayMode),
+         let mode = MenuBarDisplayMode(rawValue: raw) {
+        return mode
+      }
+      return .iconOnly
+    }()
+    let legacyProvider = defaults.string(forKey: PrefKey.menuBarProvider) ?? "auto"
+    let legacyRecent = defaults.bool(forKey: PrefKey.showRecentWindowsInMenu)
+    return MenuBarCustomConfig.migrated(
+      displayMode: legacyDisplay,
+      provider: legacyProvider,
+      showRecentWindows: legacyRecent
+    )
+  }
+
   init() {
     if hideDockIcon && !showMenuBarExtra {
       showMenuBarExtra = true
       UserDefaults.standard.set(true, forKey: PrefKey.showMenuBarExtra)
     }
+    showRecentWindowsInMenu = menuBarConfig.popoverSections.showRecentWindows
+    menuBarProvider = menuBarConfig.selectedProviders.first ?? "auto"
   }
 
   func isExternalProvider(_ key: String) -> Bool {
@@ -665,8 +692,10 @@ export default {
         if self.popoverSelection == meta.key {
           self.popoverSelection = "all"
         }
-        if self.menuBarProvider == meta.key {
-          self.setMenuBarProvider("auto")
+        if self.menuBarProvider == meta.key || self.menuBarConfig.selectedProviders.contains(meta.key) {
+          self.updateMenuBarConfig { cfg in
+            cfg.selectedProviders.removeAll { $0 == meta.key }
+          }
         }
         self.bannerIsError = false
         self.statusBanner = "已移除外部插件：\(meta.name)"
@@ -820,8 +849,11 @@ export default {
     if isExternalProvider(popoverSelection) && !list.contains(where: { $0.key == popoverSelection && isToolEnabled($0.key) }) {
       popoverSelection = "all"
     }
-    if isExternalProvider(menuBarProvider) && !list.contains(where: { $0.key == menuBarProvider }) {
-      setMenuBarProvider("auto")
+    if (isExternalProvider(menuBarProvider) && !list.contains(where: { $0.key == menuBarProvider })) ||
+       menuBarConfig.selectedProviders.contains(where: { key in isExternalProvider(key) && !list.contains(where: { $0.key == key }) }) {
+      updateMenuBarConfig { cfg in
+        cfg.selectedProviders.removeAll { key in isExternalProvider(key) && !list.contains(where: { $0.key == key }) }
+      }
     }
     if case .provider(let activeKey) = settingsPane,
        isExternalProvider(activeKey),
@@ -861,24 +893,112 @@ export default {
     onPreferencesChanged?()
   }
 
-  func setMenuBarDisplayMode(_ mode: MenuBarDisplayMode) {
-    menuBarDisplayMode = mode
-    UserDefaults.standard.set(mode.rawValue, forKey: PrefKey.menuBarDisplayMode)
-    UserDefaults.standard.set(mode != .iconOnly, forKey: PrefKey.showMenuBarSummary)
-    if mode == .iconOnly && menuBarIconStyle == .none {
+  func updateMenuBarConfig(_ mutate: (inout MenuBarCustomConfig) -> Void) {
+    var next = menuBarConfig
+    mutate(&next)
+    next.normalize()
+    if next.items.isEmpty && menuBarIconStyle == .none {
       menuBarIconStyle = .dualBar
       UserDefaults.standard.set(MenuBarIconStyle.dualBar.rawValue, forKey: PrefKey.menuBarIconStyle)
     }
+    menuBarConfig = next
+    if let data = try? JSONEncoder().encode(next) {
+      UserDefaults.standard.set(data, forKey: PrefKey.menuBarCustomConfig)
+    }
+    let firstProvider = next.selectedProviders.first ?? "auto"
+    if menuBarProvider != firstProvider {
+      menuBarProvider = firstProvider
+      UserDefaults.standard.set(firstProvider, forKey: PrefKey.menuBarProvider)
+    }
+    if showRecentWindowsInMenu != next.popoverSections.showRecentWindows {
+      showRecentWindowsInMenu = next.popoverSections.showRecentWindows
+      UserDefaults.standard.set(next.popoverSections.showRecentWindows, forKey: PrefKey.showRecentWindowsInMenu)
+    }
+    UserDefaults.standard.set(!next.items.isEmpty, forKey: PrefKey.showMenuBarSummary)
     onPreferencesChanged?()
+  }
+
+  func applyMenuBarPreset(_ preset: MenuBarPreset) {
+    updateMenuBarConfig { cfg in
+      cfg.items = preset.items
+    }
+  }
+
+  func resetMenuBarConfigToDefaults() {
+    menuBarIconStyle = .dualBar
+    UserDefaults.standard.set(MenuBarIconStyle.dualBar.rawValue, forKey: PrefKey.menuBarIconStyle)
+    menuBarUsageScope = .all
+    UserDefaults.standard.set(MenuBarUsageScope.all.rawValue, forKey: PrefKey.menuBarUsageScope)
+    quotaDisplayMode = .remaining
+    UserDefaults.standard.set(QuotaDisplayMode.remaining.rawValue, forKey: PrefKey.quotaDisplayMode)
+    updateMenuBarConfig { cfg in
+      cfg = MenuBarCustomConfig()
+    }
+  }
+
+  func buildMenuBarRenderSnapshot(useSampleFallback: Bool = false) -> MenuBarRenderSnapshot {
+    let enabledOrdered = orderedAllProviderKeys.filter { isToolEnabled($0) }
+    var labels: [String: String] = [:]
+    for key in orderedAllProviderKeys {
+      labels[key] = (key == "antigravity") ? "AGY" : toolShortTitle(for: key)
+    }
+
+    let turnCandidateKeys: [String] = menuBarConfig.selectedProviders.isEmpty
+      ? orderedKeys.filter { isToolEnabled($0) }
+      : menuBarConfig.selectedProviders.filter { !isExternalProvider($0) && isToolEnabled($0) }
+    var bestTurn: (turn: TurnSummary, ts: Double)? = nil
+    for key in turnCandidateKeys {
+      guard let entry = apps[key],
+            (entry.installed || entry.latestTurn != nil),
+            let turn = entry.latestTurn else { continue }
+      let ts = turn.completedAtMs ?? 0
+      if bestTurn == nil || ts > bestTurn!.ts {
+        bestTurn = (turn, ts)
+      }
+    }
+
+    return MenuBarRenderSnapshot(
+      isActiveOverall: isActiveOverall,
+      orderedProviderKeys: enabledOrdered,
+      providerLabels: labels,
+      cards: usageData?.cards ?? [:],
+      todayFallback: todaySummary,
+      latestTurn: bestTurn?.turn,
+      useSampleFallback: useSampleFallback
+    )
+  }
+
+  func formattedMenuBarTitle(useSampleFallback: Bool = false) -> String {
+    let snapshot = buildMenuBarRenderSnapshot(useSampleFallback: useSampleFallback)
+    return MenuBarFormatter.format(
+      config: menuBarConfig,
+      usageScope: menuBarUsageScope,
+      quotaDisplayMode: quotaDisplayMode,
+      snapshot: snapshot
+    )
+  }
+
+  func setMenuBarDisplayMode(_ mode: MenuBarDisplayMode) {
+    menuBarDisplayMode = mode
+    UserDefaults.standard.set(mode.rawValue, forKey: PrefKey.menuBarDisplayMode)
+    let migrated = MenuBarCustomConfig.migrated(
+      displayMode: mode,
+      provider: menuBarProvider,
+      showRecentWindows: showRecentWindowsInMenu
+    )
+    updateMenuBarConfig { cfg in
+      cfg.items = migrated.items
+    }
   }
 
   func setMenuBarIconStyle(_ style: MenuBarIconStyle) {
     menuBarIconStyle = style
     UserDefaults.standard.set(style.rawValue, forKey: PrefKey.menuBarIconStyle)
-    if style == .none && menuBarDisplayMode == .iconOnly {
-      menuBarDisplayMode = .todayTokensAndCost
-      UserDefaults.standard.set(MenuBarDisplayMode.todayTokensAndCost.rawValue, forKey: PrefKey.menuBarDisplayMode)
-      UserDefaults.standard.set(true, forKey: PrefKey.showMenuBarSummary)
+    if style == .none && menuBarConfig.items.isEmpty {
+      updateMenuBarConfig { cfg in
+        cfg.items = [.todayTokens, .todayCost]
+      }
+      return
     }
     onPreferencesChanged?()
   }
@@ -891,16 +1011,27 @@ export default {
       setMenuBarProvider("auto")
       return
     }
-    setMenuBarProvider(key)
-    setMenuBarDisplayMode(mode)
+    let migrated = MenuBarCustomConfig.migrated(
+      displayMode: mode,
+      provider: key,
+      showRecentWindows: showRecentWindowsInMenu
+    )
+    updateMenuBarConfig { cfg in
+      cfg.selectedProviders = [key]
+      cfg.items = migrated.items
+    }
     bannerIsError = false
     statusBanner = "已在菜单栏显示 \(toolShortTitle(for: key))"
   }
 
   func setMenuBarProvider(_ provider: String) {
-    menuBarProvider = provider
-    UserDefaults.standard.set(provider, forKey: PrefKey.menuBarProvider)
-    onPreferencesChanged?()
+    updateMenuBarConfig { cfg in
+      if provider.isEmpty || provider == "auto" {
+        cfg.selectedProviders = []
+      } else {
+        cfg.selectedProviders = [provider]
+      }
+    }
   }
 
   func setMenuBarUsageScope(_ scope: MenuBarUsageScope) {
@@ -959,8 +1090,9 @@ export default {
   }
 
   func setShowRecentWindowsInMenu(_ value: Bool) {
-    showRecentWindowsInMenu = value
-    UserDefaults.standard.set(value, forKey: PrefKey.showRecentWindowsInMenu)
+    updateMenuBarConfig { cfg in
+      cfg.popoverSections.showRecentWindows = value
+    }
   }
 
   func setAlertsEnabled(_ value: Bool) {

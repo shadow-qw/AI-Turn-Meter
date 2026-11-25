@@ -143,14 +143,17 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
 
   func updateButtonAppearance() {
     guard let btn = statusItem?.button else { return }
-    let usesGlobalToday =
-      (vm.menuBarDisplayMode == .todayCost || vm.menuBarDisplayMode == .todayTokensAndCost) &&
-      vm.menuBarUsageScope == .all &&
-      vm.menuBarIconStyle == .none
-    let pinnedPaused = !usesGlobalToday && vm.menuBarProvider != "auto" && !vm.isToolEnabled(vm.menuBarProvider)
+    let selected = vm.menuBarConfig.selectedProviders
+    let usesGlobalOnly =
+      vm.menuBarIconStyle == .none &&
+      !vm.menuBarConfig.items.isEmpty &&
+      vm.menuBarConfig.items.allSatisfy(\.usesUsageScope) &&
+      vm.menuBarUsageScope == .all
+    let allSelectedPaused = !selected.isEmpty && selected.allSatisfy { !vm.isToolEnabled($0) }
+    let pinnedPaused = !usesGlobalOnly && allSelectedPaused
     btn.appearsDisabled = !vm.isActiveOverall || pinnedPaused
 
-    let summary = compactMenuBarTitle()
+    let summary = vm.formattedMenuBarTitle(useSampleFallback: false)
     if vm.menuBarIconStyle == .none && !summary.isEmpty {
       btn.image = nil
       btn.title = summary
@@ -173,12 +176,13 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     guard vm.isActiveOverall else {
       return (nil, nil, true)
     }
+    let selected = vm.menuBarConfig.selectedProviders
     let candidateKeys: [String]
-    if vm.menuBarProvider != "auto" {
-      guard vm.isToolEnabled(vm.menuBarProvider) else {
+    if !selected.isEmpty {
+      candidateKeys = selected.filter { vm.isToolEnabled($0) }
+      if candidateKeys.isEmpty {
         return (nil, nil, true)
       }
-      candidateKeys = [vm.menuBarProvider]
     } else if vm.popoverSelection != "all", vm.isToolEnabled(vm.popoverSelection) {
       candidateKeys = [vm.popoverSelection] + vm.allQuotaProviderKeys.filter { $0 != vm.popoverSelection }
     } else {
@@ -202,9 +206,12 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     let (primary, secondary, stale) = resolvedIconQuotaPair()
     let pTenths = primary.map { Int((min(100.0, max(0.0, $0)) * 10.0).rounded()) }
     let sTenths = secondary.map { Int((min(100.0, max(0.0, $0)) * 10.0).rounded()) }
+    let providerKeyForCache = vm.menuBarConfig.selectedProviders.isEmpty
+      ? vm.popoverSelection
+      : vm.menuBarConfig.selectedProviders.joined(separator: ",")
     let key = IconCacheKey(
       style: vm.menuBarIconStyle,
-      provider: vm.menuBarProvider == "auto" ? vm.popoverSelection : vm.menuBarProvider,
+      provider: providerKeyForCache,
       quotaMode: vm.quotaDisplayMode,
       active: vm.isActiveOverall,
       stale: stale,
@@ -224,46 +231,6 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     return img
   }
 
-  private func latestActiveTurn(for providerFilter: String = "auto") -> (key: String, turn: TurnSummary)? {
-    guard vm.isActiveOverall else { return nil }
-    let keys = providerFilter == "auto" ? vm.orderedKeys : [providerFilter]
-    var best: (key: String, turn: TurnSummary, ts: Double)? = nil
-    for key in keys {
-      guard vm.isToolEnabled(key),
-            let entry = vm.apps[key],
-            (entry.installed || entry.latestTurn != nil),
-            let turn = entry.latestTurn else { continue }
-      let ts = turn.completedAtMs ?? 0
-      if best == nil || ts > best!.ts {
-        best = (key, turn, ts)
-      }
-    }
-    return best.map { ($0.key, $0.turn) }
-  }
-
-  private func menuBarLabel(for key: String) -> String {
-    key == "antigravity" ? "AGY" : vm.toolShortTitle(for: key)
-  }
-
-  private func scopedTodayMetrics() -> (tokens: Int, cost: Double?, symbol: String, isBillingOnly: Bool)? {
-    if vm.menuBarUsageScope == .provider && vm.menuBarProvider != "auto" {
-      guard vm.isToolEnabled(vm.menuBarProvider),
-            let card = vm.usageData?.cards?[vm.menuBarProvider] else { return nil }
-      let sym = card.resolvedCurrencySymbol
-      let isExtBillingOnly =
-        (card.isExternal == true || vm.isExternalProvider(vm.menuBarProvider)) &&
-        card.billingSummary?.todayTokens == nil &&
-        card.today.totalTokens == 0
-      return (card.today.totalTokens, card.billingSummary?.todayCost ?? card.today.costUsd, sym, isExtBillingOnly)
-    }
-    if let allToday = vm.usageData?.cards?["all"]?.today,
-       (allToday.totalTokens > 0 || (vm.todaySummary?.totalTokens ?? 0) == 0) {
-      return (allToday.totalTokens, allToday.costUsd, "$", false)
-    }
-    guard let today = vm.todaySummary else { return nil }
-    return (today.totalTokens, today.estimatedCostUsd, "$", false)
-  }
-
   private func resolvedBillingAmount(for card: CodexBarCardSnapshot) -> Double? {
     guard let b = card.billingSummary else { return nil }
     if vm.quotaDisplayMode == .used {
@@ -274,90 +241,6 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
       return nil
     }
     return b.periodRemaining
-  }
-
-  private func compactMenuBarTitle() -> String {
-    guard vm.isActiveOverall else { return "" }
-    switch vm.menuBarDisplayMode {
-    case .iconOnly:
-      return ""
-    case .quotaRemaining:
-      let keys = vm.menuBarProvider != "auto"
-        ? [vm.menuBarProvider]
-        : vm.allQuotaProviderKeys
-      var parts: [String] = []
-      for key in keys {
-        guard vm.isToolEnabled(key),
-              let rem = vm.usageData?.cards?[key]?.quotaWindows?.first?.remainingPct else { continue }
-        let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: rem).rounded())
-        parts.append("\(menuBarLabel(for: key)) \(vm.quotaDisplayMode.compactPrefix)\(pct)%")
-      }
-      if !parts.isEmpty { return parts.joined(separator: " · ") }
-      guard let today = scopedTodayMetrics() else { return "" }
-      return MeterFormat.money(today.cost, symbol: today.symbol)
-    case .remainingAmount, .quotaAndAmount:
-      let keys = vm.menuBarProvider != "auto"
-        ? [vm.menuBarProvider]
-        : vm.allQuotaProviderKeys
-      let withPct = vm.menuBarDisplayMode == .quotaAndAmount
-      var parts: [String] = []
-      for key in keys {
-        guard vm.isToolEnabled(key), let card = vm.usageData?.cards?[key] else { continue }
-        let amount = resolvedBillingAmount(for: card).map {
-          MeterFormat.compactMoney($0, symbol: card.resolvedCurrencySymbol)
-        }
-        let pct = card.quotaWindows?.first.map {
-          "\(vm.quotaDisplayMode.compactPrefix)\(Int(vm.quotaDisplayMode.displayPct(fromRemaining: $0.remainingPct).rounded()))%"
-        }
-        var pieces: [String] = []
-        if withPct, let pct = pct { pieces.append(pct) }
-        if let amount = amount { pieces.append(amount) }
-        if pieces.isEmpty { continue }
-        parts.append("\(menuBarLabel(for: key)) \(pieces.joined(separator: " · "))")
-      }
-      return parts.joined(separator: " · ")
-    case .tps:
-      if vm.isExternalProvider(vm.menuBarProvider),
-         vm.isToolEnabled(vm.menuBarProvider),
-         let card = vm.usageData?.cards?[vm.menuBarProvider] {
-        if let rem = card.quotaWindows?.first?.remainingPct {
-          let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: rem).rounded())
-          return "\(menuBarLabel(for: vm.menuBarProvider)) \(vm.quotaDisplayMode.compactPrefix)\(pct)%"
-        }
-        if let amt = resolvedBillingAmount(for: card) {
-          return "\(menuBarLabel(for: vm.menuBarProvider)) \(MeterFormat.compactMoney(amt, symbol: card.resolvedCurrencySymbol))"
-        }
-      }
-      guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider), let tps = turn.tps, tps > 0 else { return "" }
-      return MeterFormat.tps(tps)
-    case .todayCost:
-      guard let today = scopedTodayMetrics() else { return "" }
-      return MeterFormat.money(today.cost, symbol: today.symbol)
-    case .todayTokensAndCost:
-      guard let today = scopedTodayMetrics() else { return "" }
-      if today.isBillingOnly {
-        return MeterFormat.money(today.cost, symbol: today.symbol)
-      }
-      return "\(MeterFormat.tokens(today.tokens)) · \(MeterFormat.money(today.cost, symbol: today.symbol))"
-    case .latestInline:
-      if vm.isExternalProvider(vm.menuBarProvider),
-         vm.isToolEnabled(vm.menuBarProvider),
-         let card = vm.usageData?.cards?[vm.menuBarProvider] {
-        if let amt = resolvedBillingAmount(for: card) {
-          return "\(menuBarLabel(for: vm.menuBarProvider)) \(MeterFormat.compactMoney(amt, symbol: card.resolvedCurrencySymbol))"
-        }
-        if let rem = card.quotaWindows?.first?.remainingPct {
-          let pct = Int(vm.quotaDisplayMode.displayPct(fromRemaining: rem).rounded())
-          return "\(menuBarLabel(for: vm.menuBarProvider)) \(vm.quotaDisplayMode.compactPrefix)\(pct)%"
-        }
-      }
-      guard let (_, turn) = latestActiveTurn(for: vm.menuBarProvider) else { return "" }
-      let inTok = MeterFormat.tokens(turn.totalInputTokens)
-      if let tps = turn.tps, tps > 0 {
-        return "\(inTok) · \(MeterFormat.tps(tps))"
-      }
-      return inTok
-    }
   }
 
   private func buildTooltip() -> String {

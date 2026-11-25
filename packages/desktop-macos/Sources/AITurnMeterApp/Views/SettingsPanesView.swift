@@ -452,11 +452,13 @@ struct ExternalProviderDetailView: View {
               Text("状态栏显示")
                 .font(.system(size: 12.5))
               Spacer()
-              let pinned = vm.menuBarProvider == key
+              let pinned = vm.menuBarConfig.selectedProviders.contains(key)
               if pinned {
-                Text(vm.menuBarDisplayMode.title)
+                Text(vm.menuBarConfig.activeSummaryText)
                   .font(.system(size: 12))
                   .foregroundColor(.secondary)
+                  .lineLimit(1)
+                  .truncationMode(.tail)
               }
               Menu {
                 Button("剩余金额（如 \(curSym)1085）") { vm.pinProviderToMenuBar(key, mode: .remainingAmount) }
@@ -1434,115 +1436,6 @@ struct GeneralSettingsPaneView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .disabled(vm.busy)
-          }
-        }
-      }
-      .padding(24)
-    }
-  }
-}
-
-struct MenuBarSettingsPaneView: View {
-  @ObservedObject var vm: MeterViewModel
-
-  var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 18) {
-        SettingsGroupCard {
-          settingsControlRow(title: "显示顶部菜单栏图标") {
-            Toggle("", isOn: Binding(
-              get: { vm.showMenuBarExtra },
-              set: { vm.setShowMenuBarExtra($0) }
-            ))
-            .toggleStyle(.switch)
-            .labelsHidden()
-          }
-
-          if vm.showMenuBarExtra {
-            Divider().padding(.leading, 14)
-            settingsControlRow(title: "展示软件") {
-              Picker("", selection: Binding(
-                get: { vm.menuBarProvider },
-                set: { vm.setMenuBarProvider($0) }
-              )) {
-                Text("自动（默认）").tag("auto")
-                ForEach(vm.allQuotaProviderKeys, id: \.self) { key in
-                  Text(vm.toolShortTitle(for: key)).tag(key)
-                }
-              }
-              .labelsHidden()
-              .frame(width: 160)
-              .controlSize(.small)
-            }
-            Divider().padding(.leading, 14)
-            settingsControlRow(title: "菜单栏图标") {
-              Picker("", selection: Binding(
-                get: { vm.menuBarIconStyle },
-                set: { vm.setMenuBarIconStyle($0) }
-              )) {
-                ForEach(MenuBarIconStyle.allCases, id: \.self) { s in
-                  Text(s.title).tag(s)
-                }
-              }
-              .labelsHidden()
-              .frame(width: 160)
-              .controlSize(.small)
-            }
-            Divider().padding(.leading, 14)
-            settingsControlRow(title: "菜单栏文本") {
-              Picker("", selection: Binding(
-                get: { vm.menuBarDisplayMode },
-                set: { vm.setMenuBarDisplayMode($0) }
-              )) {
-                ForEach(MenuBarDisplayMode.allCases, id: \.self) { m in
-                  Text(m.title).tag(m)
-                }
-              }
-              .labelsHidden()
-              .frame(width: 160)
-              .controlSize(.small)
-            }
-            if vm.menuBarDisplayMode == .todayCost || vm.menuBarDisplayMode == .todayTokensAndCost {
-              Divider().padding(.leading, 14)
-              settingsControlRow(title: "用量与费用范围") {
-                Picker("", selection: Binding(
-                  get: { vm.menuBarUsageScope },
-                  set: { vm.setMenuBarUsageScope($0) }
-                )) {
-                  ForEach(MenuBarUsageScope.allCases, id: \.self) { sc in
-                    Text(sc.title).tag(sc)
-                  }
-                }
-                .labelsHidden()
-                .frame(width: 160)
-                .controlSize(.small)
-              }
-            }
-          }
-
-          Divider().padding(.leading, 14)
-          settingsControlRow(title: "配额展示方式") {
-            Picker("", selection: Binding(
-              get: { vm.quotaDisplayMode },
-              set: { vm.setQuotaDisplayMode($0) }
-            )) {
-              ForEach(QuotaDisplayMode.allCases, id: \.self) { mode in
-                Text(mode.title).tag(mode)
-              }
-            }
-            .labelsHidden()
-            .frame(width: 160)
-            .controlSize(.small)
-          }
-
-          Divider().padding(.leading, 14)
-          settingsControlRow(title: "在菜单卡片中显示「最近窗口」") {
-            Toggle("", isOn: Binding(
-              get: { vm.showRecentWindowsInMenu },
-              set: { vm.setShowRecentWindowsInMenu($0) }
-            ))
-            .toggleStyle(.switch)
-            .labelsHidden()
           }
         }
       }
