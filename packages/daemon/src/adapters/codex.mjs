@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync, watch } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { zstdDecompressSync } from 'node:zlib';
+import { accumulateUsageBucket, finalizeUsageBuckets, normalizeServiceTier } from '../pricing.mjs';
 
 const CODEX_OPENAI_MODEL_RE = /^(?:openai\/)?(?:gpt-|o1|o3|o4|codex-|chatgpt-)/i;
 const OPEN_TURN_FLUSH_MS = 120_000;
@@ -65,6 +66,7 @@ export function parseCodexSessionDetailed(
   let isForkedRollout = /_[0-9a-f-]{20,}\.jsonl(?:\.zst)?$/i.test(filePath);
   let workspacePath = null;
   let currentModel = 'unknown';
+  let currentServiceTier = null;
 
   /** @type {Map<string, any>} */
   const turns = new Map();
@@ -82,6 +84,8 @@ export function parseCodexSessionDetailed(
         turnId,
         model: currentModel,
         hasTurnContextModel: false,
+        serviceTier: currentServiceTier,
+        hasTurnContextTier: false,
         startedAtMs,
         lastEventMs: startedAtMs,
         calls: [],
@@ -94,6 +98,7 @@ export function parseCodexSessionDetailed(
         firstGenStartMs: null,
         genIntervals: [],
         fallbackTurnUsage: { input: 0, cached: 0, cacheWrite: 0, output: 0, thinking: 0, calls: 0 },
+        fallbackCalls: [],
         lastAgentText: null,
         flushed: false,
       };
@@ -107,6 +112,9 @@ export function parseCodexSessionDetailed(
     }
     if (!t.hasTurnContextModel && t.model === 'unknown' && currentModel !== 'unknown') {
       t.model = currentModel;
+    }
+    if (!t.hasTurnContextTier && t.serviceTier === null && currentServiceTier !== null) {
+      t.serviceTier = currentServiceTier;
     }
     return t;
   }
@@ -155,6 +163,72 @@ export function parseCodexSessionDetailed(
     }
 
     if (totalInputTokens <= 0 && outputTokens <= 0) return;
+
+    const effectiveTier = t.serviceTier ?? currentServiceTier;
+    const bucketMap = new Map();
+    if (t.calls.length > 0) {
+      let sumIn = 0;
+      let sumCr = 0;
+      let sumCw = 0;
+      let sumOut = 0;
+      let lastBucketCall = null;
+      for (const c of t.calls) {
+        if (!c.usage) continue;
+        const inp = Math.max(0, Number(c.usage.input_tokens) || 0);
+        const cr = Math.min(Math.max(0, Number(c.usage.cached_input_tokens) || 0), inp);
+        const cw = Math.min(Math.max(0, Number(c.usage.cache_write_input_tokens) || 0), Math.max(0, inp - cr));
+        const unc = Math.max(0, inp - cr - cw);
+        const out = Math.max(0, Number(c.usage.output_tokens) || 0);
+        sumIn += inp;
+        sumCr += cr;
+        sumCw += cw;
+        sumOut += out;
+        lastBucketCall = c;
+        accumulateUsageBucket(bucketMap, {
+          model: c.model && c.model !== 'unknown' ? c.model : effectiveModel,
+          serviceTier: c.serviceTier ?? effectiveTier,
+          uncachedInput: unc,
+          cacheRead: cr,
+          cacheWrite5m: cw,
+          cacheWrite1h: 0,
+          output: out,
+        });
+      }
+      if (totalInputTokens > sumIn || outputTokens > sumOut) {
+        const dIn = Math.max(0, totalInputTokens - sumIn);
+        const dCr = Math.min(dIn, Math.max(0, cacheReadTokens - sumCr));
+        const dCw = Math.min(Math.max(0, dIn - dCr), Math.max(0, cacheWriteTokens - sumCw));
+        const dUnc = Math.max(0, dIn - dCr - dCw);
+        const dOut = Math.max(0, outputTokens - sumOut);
+        accumulateUsageBucket(bucketMap, {
+          model: (lastBucketCall?.model && lastBucketCall.model !== 'unknown' ? lastBucketCall.model : null) || effectiveModel,
+          serviceTier: lastBucketCall?.serviceTier ?? effectiveTier,
+          uncachedInput: dUnc,
+          cacheRead: dCr,
+          cacheWrite5m: dCw,
+          cacheWrite1h: 0,
+          output: dOut,
+        });
+      }
+    } else if (t.fallbackCalls.length > 0) {
+      for (const fc of t.fallbackCalls) {
+        const inp = Math.max(0, fc.input);
+        const cr = Math.min(Math.max(0, fc.cached), inp);
+        const cw = Math.min(Math.max(0, fc.cacheWrite), Math.max(0, inp - cr));
+        const unc = Math.max(0, inp - cr - cw);
+        const out = Math.max(0, fc.output);
+        accumulateUsageBucket(bucketMap, {
+          model: fc.model && fc.model !== 'unknown' ? fc.model : effectiveModel,
+          serviceTier: fc.serviceTier ?? effectiveTier,
+          uncachedInput: unc,
+          cacheRead: cr,
+          cacheWrite5m: cw,
+          cacheWrite1h: 0,
+          output: out,
+        });
+      }
+    }
+    const usageBuckets = finalizeUsageBuckets(bucketMap);
 
     const resolvedCompletedMs = completedAtMs ?? t.lastEventMs ?? t.startedAtMs ?? Date.now();
     const durationMs =
@@ -218,6 +292,8 @@ export function parseCodexSessionDetailed(
       modelActiveMs,
       ttftMs,
       tpsMethod,
+      serviceTier: effectiveTier,
+      usageBuckets,
       replyPreview:
         typeof lastAgentMessage === 'string' && lastAgentMessage.trim()
           ? lastAgentMessage
@@ -266,6 +342,7 @@ export function parseCodexSessionDetailed(
 
     if (topType === 'turn_context') {
       if (typeof p.model === 'string' && p.model) currentModel = p.model;
+      if (typeof p.service_tier === 'string') currentServiceTier = normalizeServiceTier(p.service_tier);
       if (typeof p.cwd === 'string' && p.cwd && !workspacePath) workspacePath = p.cwd;
       if (typeof p.turn_id === 'string' && p.turn_id) {
         switchActiveTurn(p.turn_id, tsMs);
@@ -273,6 +350,10 @@ export function parseCodexSessionDetailed(
         if (t && typeof p.model === 'string' && p.model) {
           t.model = p.model;
           t.hasTurnContextModel = true;
+        }
+        if (t && typeof p.service_tier === 'string') {
+          t.serviceTier = normalizeServiceTier(p.service_tier);
+          t.hasTurnContextTier = true;
         }
       }
       continue;
@@ -301,6 +382,8 @@ export function parseCodexSessionDetailed(
       if (!respId || !t.seenResponseIds.has(respId)) {
         if (respId) t.seenResponseIds.add(respId);
         t.calls.push({
+          model: t.model !== 'unknown' ? t.model : currentModel,
+          serviceTier: t.serviceTier ?? currentServiceTier,
           usage: p.usage || null,
           turnUsage: p.turn_token_usage || null,
           tsMs,
@@ -331,6 +414,19 @@ export function parseCodexSessionDetailed(
         const activeTurn = activeTurnId ? turns.get(activeTurnId) : null;
         if (activeTurn && !activeTurn.hasTurnContextModel && activeTurn.model === 'unknown') {
           activeTurn.model = m;
+        }
+      }
+      const st = p.thread_settings?.service_tier;
+      if (typeof st === 'string') {
+        currentServiceTier = normalizeServiceTier(st);
+        const activeTurn = activeTurnId ? turns.get(activeTurnId) : null;
+        if (
+          activeTurn &&
+          !activeTurn.hasTurnContextTier &&
+          activeTurn.calls.length === 0 &&
+          activeTurn.fallbackTurnUsage.calls === 0
+        ) {
+          activeTurn.serviceTier = currentServiceTier;
         }
       }
       const cwd = p.thread_settings?.cwd;
@@ -367,12 +463,23 @@ export function parseCodexSessionDetailed(
           ) {
             skippedForkBaseline = true;
           } else {
+            const cachedIn = Number(last.cached_input_tokens) || 0;
+            const cacheWriteIn = Number(last.cache_write_input_tokens) || 0;
+            const outTok = Number(last.output_tokens) || 0;
             t.fallbackTurnUsage.input += lastIn;
-            t.fallbackTurnUsage.cached += Number(last.cached_input_tokens) || 0;
-            t.fallbackTurnUsage.cacheWrite += Number(last.cache_write_input_tokens) || 0;
-            t.fallbackTurnUsage.output += Number(last.output_tokens) || 0;
+            t.fallbackTurnUsage.cached += cachedIn;
+            t.fallbackTurnUsage.cacheWrite += cacheWriteIn;
+            t.fallbackTurnUsage.output += outTok;
             t.fallbackTurnUsage.thinking += Number(last.reasoning_output_tokens) || 0;
             t.fallbackTurnUsage.calls += 1;
+            t.fallbackCalls.push({
+              model: t.model !== 'unknown' ? t.model : currentModel,
+              serviceTier: t.serviceTier ?? currentServiceTier,
+              input: lastIn,
+              cached: cachedIn,
+              cacheWrite: cacheWriteIn,
+              output: outTok,
+            });
           }
         }
       }

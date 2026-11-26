@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { isCodexOpenAiModel } from './adapters/codex.mjs';
 import { formatCacheRate, formatInlineSummary, formatTps, normalizeTurn, TOOL_LABELS } from './format.mjs';
-import { defaultCustomPricingPath, estimateTurnCost, loadCustomPricing } from './pricing.mjs';
+import { defaultCustomPricingPath, estimateTurnCost, loadCustomPricing, sanitizeUsageBuckets } from './pricing.mjs';
 import { buildReceiptPunchlines, parseLocalDateRange } from './receipt.mjs';
 
 function setBoundedCache(map, key, val, maxSize = 16) {
@@ -47,7 +47,7 @@ function formatZhRange(startMs, endMs) {
 }
 
 const CARD_WINDOW_TITLES = ['当前窗口', '上一窗口', '2 个窗口前', '3 个窗口前'];
-const CARD_TOOL_KEYS = ['codex', 'cursor', 'antigravity', 'codebuddy'];
+const CARD_TOOL_KEYS = ['codex', 'claude', 'cursor', 'antigravity', 'codebuddy'];
 const UNBOUND_WORKSPACE_LABEL = '未关联工作区';
 const ACTIVE_SESSION_WINDOW_MS = 90_000;
 const RECENT_SESSIONS_CACHE_TTL_MS = 15_000;
@@ -123,7 +123,9 @@ function addTurnToAccumulator(acc, row, customRates) {
 
   const cost = estimateTurnCost(
     {
+      host: row.host,
       model: row.model,
+      completedAtMs: row.completed_at_ms,
       totalInputTokens: totalIn,
       uncachedInputTokens: uncachedIn,
       cacheReadTokens: cacheRead,
@@ -131,6 +133,7 @@ function addTurnToAccumulator(acc, row, customRates) {
       outputTokens: out,
       callCount: calls,
       explicitCostUsd: row.explicit_cost_usd,
+      usageBuckets: sanitizeUsageBuckets(row.usage_buckets_json),
     },
     customRates
   );
@@ -236,7 +239,8 @@ export class TurnStore {
         tps REAL,
         tps_method TEXT NOT NULL,
         reply_preview TEXT,
-        explicit_cost_usd REAL
+        explicit_cost_usd REAL,
+        usage_buckets_json TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_turns_completed ON turns(completed_at_ms DESC);
@@ -370,6 +374,18 @@ export class TurnStore {
       this.db.exec('PRAGMA user_version = 3;');
     }
 
+    if (schemaVer < 4) {
+      try {
+        this.db.exec('ALTER TABLE turns ADD COLUMN usage_buckets_json TEXT;');
+      } catch {
+        // Column already exists on initialized databases
+      }
+      // Clear ingested_files so historical Codex, Claude Code, Antigravity, and CodeBuddy CLI
+      // sessions are re-scanned once to populate per-call usage_buckets_json.
+      this.db.exec('DELETE FROM ingested_files;');
+      this.db.exec('PRAGMA user_version = 4;');
+    }
+
     // Purge any legacy third-party gateway proxy turns (e.g. workbuddy/claude-opus-5.5) recorded under Codex.
     const codexModels = this.db.prepare(`SELECT DISTINCT model FROM turns WHERE tool = 'codex'`).all();
     const staleCodexModels = codexModels.map((r) => r.model).filter((m) => !isCodexOpenAiModel(m));
@@ -392,14 +408,14 @@ export class TurnStore {
         call_count, total_input_tokens, uncached_input_tokens,
         cache_read_tokens, cache_write_tokens, output_tokens,
         thinking_tokens, cache_rate_pct, duration_ms, model_active_ms,
-        ttft_ms, tps, tps_method, reply_preview, explicit_cost_usd
+        ttft_ms, tps, tps_method, reply_preview, explicit_cost_usd, usage_buckets_json
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?, ?,
-        ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?
       )
       ON CONFLICT(turn_uid) DO UPDATE SET
         host = excluded.host,
@@ -441,7 +457,8 @@ export class TurnStore {
           ELSE turns.tps_method
         END,
         reply_preview = COALESCE(excluded.reply_preview, turns.reply_preview),
-        explicit_cost_usd = COALESCE(excluded.explicit_cost_usd, turns.explicit_cost_usd)
+        explicit_cost_usd = COALESCE(excluded.explicit_cost_usd, turns.explicit_cost_usd),
+        usage_buckets_json = COALESCE(excluded.usage_buckets_json, turns.usage_buckets_json)
     `);
 
     this.getExistingStmt = this.db.prepare(`SELECT * FROM turns WHERE turn_uid = ?`);
@@ -481,6 +498,58 @@ export class TurnStore {
     const t = normalizeTurn(rawTurn);
     const prev = this.getExistingStmt.get(t.turnUid);
 
+    let resolvedExplicitCostUsd = t.explicitCostUsd;
+    const matchedCloudUids = [];
+    // Bidirectional deduplication: if a local Cursor hook turn arrives after a cursor-cloud API event
+    // for the same session, remove the overlapping cloud placeholder while preserving its billed explicitCostUsd.
+    if (t.tool === 'cursor' && t.host !== 'cursor-cloud' && t.sessionId) {
+      const cloudRows = this.db
+        .prepare(
+          `SELECT turn_uid, completed_at_ms, total_input_tokens, output_tokens, explicit_cost_usd
+           FROM turns
+           WHERE tool = 'cursor' AND host = 'cursor-cloud' AND session_id = ?`
+        )
+        .all(t.sessionId);
+      if (cloudRows.length > 0) {
+        let recoveredCost = 0;
+        let hasRecoveredCost = false;
+        for (const cr of cloudRows) {
+          const crMs = Number(cr.completed_at_ms) || 0;
+          const crIn = Number(cr.total_input_tokens) || 0;
+          const crOut = Number(cr.output_tokens) || 0;
+          const closeInTime = Math.abs(crMs - t.completedAtMs) <= 6 * 3600_000;
+          const inputMatch = closeInTime && crIn > 0 && crIn === t.totalInputTokens;
+          const outputMatch = Math.abs(crMs - t.completedAtMs) <= 20_000 && crOut > 0 && crOut === t.outputTokens;
+          const midTurnWindowMatch =
+            Boolean(t.startedAtMs) &&
+            crMs >= t.startedAtMs - 60_000 &&
+            crMs <= t.completedAtMs + 20_000 &&
+            crIn <= t.totalInputTokens;
+          if (inputMatch || outputMatch || midTurnWindowMatch) {
+            matchedCloudUids.push(cr.turn_uid);
+            if (
+              typeof cr.explicit_cost_usd === 'number' &&
+              Number.isFinite(cr.explicit_cost_usd) &&
+              cr.explicit_cost_usd >= 0
+            ) {
+              recoveredCost += cr.explicit_cost_usd;
+              hasRecoveredCost = true;
+            }
+          }
+        }
+        if (
+          hasRecoveredCost &&
+          resolvedExplicitCostUsd === null &&
+          (!prev || prev.explicit_cost_usd === null)
+        ) {
+          resolvedExplicitCostUsd = Number(recoveredCost.toFixed(6));
+        }
+      }
+    }
+
+    const usageBucketsJson =
+      Array.isArray(t.usageBuckets) && t.usageBuckets.length > 0 ? JSON.stringify(t.usageBuckets) : null;
+
     const preserveStreaming =
       Boolean(prev) &&
       prev.tps_method === 'streaming_decode' &&
@@ -502,7 +571,8 @@ export class TurnStore {
       (prev.model === 'unknown' && t.model !== 'unknown') ||
       (!preserveStreaming && t.model !== 'unknown' && prev.model !== t.model) ||
       (!prev.workspace_path && Boolean(t.workspacePath)) ||
-      prev.explicit_cost_usd !== t.explicitCostUsd;
+      (resolvedExplicitCostUsd !== null && prev.explicit_cost_usd !== resolvedExplicitCostUsd) ||
+      (usageBucketsJson !== null && prev.usage_buckets_json !== usageBucketsJson);
 
     if (changed) {
       this.upsertStmt.run(
@@ -530,48 +600,31 @@ export class TurnStore {
         t.tps,
         t.tpsMethod,
         t.replyPreview,
-        t.explicitCostUsd
+        resolvedExplicitCostUsd,
+        usageBucketsJson
       );
+    }
 
-      // Bidirectional deduplication: if a local Cursor hook turn arrives after a cursor-cloud API event
-      // for the same session, remove the overlapping cloud placeholder so spend is never double-counted.
-      if (t.tool === 'cursor' && t.host !== 'cursor-cloud' && t.sessionId) {
-        const cloudRows = this.db
-          .prepare(
-            `SELECT turn_uid, completed_at_ms, total_input_tokens, output_tokens
-             FROM turns
-             WHERE tool = 'cursor' AND host = 'cursor-cloud' AND session_id = ?`
-          )
-          .all(t.sessionId);
-        if (cloudRows.length > 0) {
-          const delCloudStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
-          for (const cr of cloudRows) {
-            const crMs = Number(cr.completed_at_ms) || 0;
-            const crIn = Number(cr.total_input_tokens) || 0;
-            const crOut = Number(cr.output_tokens) || 0;
-            const closeInTime = Math.abs(crMs - t.completedAtMs) <= 6 * 3600_000;
-            const inputMatch = closeInTime && crIn > 0 && crIn === t.totalInputTokens;
-            const outputMatch = Math.abs(crMs - t.completedAtMs) <= 20_000 && crOut > 0 && crOut === t.outputTokens;
-            const midTurnWindowMatch =
-              Boolean(t.startedAtMs) &&
-              crMs >= t.startedAtMs - 60_000 &&
-              crMs <= t.completedAtMs + 20_000 &&
-              crIn <= t.totalInputTokens;
-            if (inputMatch || outputMatch || midTurnWindowMatch) {
-              delCloudStmt.run(cr.turn_uid);
-            }
-          }
-        }
+    if (matchedCloudUids.length > 0) {
+      const delCloudStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
+      for (const uid of matchedCloudUids) {
+        delCloudStmt.run(uid);
       }
+    }
 
+    if (changed || matchedCloudUids.length > 0) {
       this.writeGeneration += 1;
       this._recentSessionsCache.clear();
     }
 
     const mergedRow = prev ? (changed ? this.getExistingStmt.get(t.turnUid) : prev) : null;
+    const finalRecordInput =
+      resolvedExplicitCostUsd !== t.explicitCostUsd
+        ? { ...t, explicitCostUsd: resolvedExplicitCostUsd }
+        : t;
     return {
-      changed,
-      record: mergedRow ? this.rowToTurn(mergedRow) : this.enrichRecord(t),
+      changed: changed || matchedCloudUids.length > 0,
+      record: mergedRow ? this.rowToTurn(mergedRow) : this.enrichRecord(finalRecordInput),
     };
   }
 
@@ -655,6 +708,7 @@ export class TurnStore {
       tpsMethod: row.tps_method,
       replyPreview: row.reply_preview || null,
       explicitCostUsd: row.explicit_cost_usd ?? null,
+      usageBuckets: sanitizeUsageBuckets(row.usage_buckets_json),
     });
   }
 
@@ -760,7 +814,7 @@ export class TurnStore {
   }
 
   getLatestByTool() {
-    const tools = ['codex', 'antigravity', 'cursor', 'codebuddy'];
+    const tools = ['codex', 'claude', 'antigravity', 'cursor', 'codebuddy'];
     const stmt = this.db.prepare(
       `SELECT * FROM turns WHERE tool = ?
        ORDER BY (CASE WHEN host = 'cursor-cloud' THEN 0 ELSE 1 END) DESC, completed_at_ms DESC LIMIT 1`
@@ -988,10 +1042,10 @@ export class TurnStore {
       const rows = this.db
         .prepare(
           `SELECT
-            tool, session_id, model, workspace_path, completed_at_ms,
+            tool, host, session_id, model, workspace_path, completed_at_ms,
             call_count, total_input_tokens, uncached_input_tokens,
             cache_read_tokens, cache_write_tokens, output_tokens,
-            thinking_tokens, tps, reply_preview, explicit_cost_usd
+            thinking_tokens, tps, reply_preview, explicit_cost_usd, usage_buckets_json
            FROM turns
            WHERE ${pairClauses}
            ORDER BY completed_at_ms ASC, rowid ASC`
@@ -1152,7 +1206,7 @@ export class TurnStore {
         ? 0
         : Math.max(1, Math.round(Number(days) || 7));
 
-    const enabledKey = ['codex', 'cursor', 'antigravity', 'codebuddy']
+    const enabledKey = ['codex', 'claude', 'cursor', 'antigravity', 'codebuddy']
       .map((k) => (!enabledTools || enabledTools[k] !== false ? '1' : '0'))
       .join('');
     const pricingVer = this.getPricingVersionTag();
@@ -1724,7 +1778,7 @@ export class TurnStore {
   } = {}) {
     const range = parseLocalDateRange(date, scope, nowMs);
     const normalizedGroup = groupBy === 'tool' || groupBy === 'project' ? groupBy : 'model';
-    const enabledKey = ['codex', 'cursor', 'antigravity', 'codebuddy']
+    const enabledKey = ['codex', 'claude', 'cursor', 'antigravity', 'codebuddy']
       .map((k) => (!enabledTools || enabledTools[k] !== false ? '1' : '0'))
       .join('');
     const pricingVer = this.getPricingVersionTag();
@@ -1877,10 +1931,10 @@ export class TurnStore {
     const since90Ms = nowMs - 90 * 86_400_000;
     const histRows = tool
       ? this.db
-          .prepare(`SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, thinking_tokens, call_count, tps, model, explicit_cost_usd, tool FROM turns WHERE tool = ? AND completed_at_ms >= ? ORDER BY completed_at_ms DESC`)
+          .prepare(`SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, thinking_tokens, call_count, tps, model, explicit_cost_usd, tool, host, usage_buckets_json FROM turns WHERE tool = ? AND completed_at_ms >= ? ORDER BY completed_at_ms DESC`)
           .all(tool, since90Ms)
       : this.db
-          .prepare(`SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, thinking_tokens, call_count, tps, model, explicit_cost_usd, tool FROM turns WHERE completed_at_ms >= ? ORDER BY completed_at_ms DESC`)
+          .prepare(`SELECT completed_at_ms, total_input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, thinking_tokens, call_count, tps, model, explicit_cost_usd, tool, host, usage_buckets_json FROM turns WHERE completed_at_ms >= ? ORDER BY completed_at_ms DESC`)
           .all(since90Ms);
     const filteredHist =
       !tool && enabledTools ? histRows.filter((r) => enabledTools[r.tool] !== false) : histRows;

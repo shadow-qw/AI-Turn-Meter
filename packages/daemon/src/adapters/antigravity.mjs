@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
+import { accumulateUsageBucket, finalizeUsageBuckets } from '../pricing.mjs';
 
 const execFileAsync = promisify(execFile);
 const MIN_STREAMING_SEC = 0.15;
@@ -175,6 +176,7 @@ export function parseAntigravityTranscriptDetailed(
     let firstTtftMs = null;
     let replyPreview = null;
     const seenEntries = new Set();
+    const stepUsages = [];
 
     for (const ps of rt.plannerSteps) {
       if (typeof ps.content === 'string' && ps.content.trim()) {
@@ -194,6 +196,12 @@ export function parseAntigravityTranscriptDetailed(
         const stepWeight = Math.max(1, inp + cr + out);
         modelWeights.set(resolvedStepModel, (modelWeights.get(resolvedStepModel) || 0) + stepWeight);
       }
+      stepUsages.push({
+        model: resolvedStepModel || null,
+        uncachedInput: inp,
+        cacheRead: cr,
+        output: out,
+      });
 
       if (sp) {
         if (!seenEntries.has(sp)) {
@@ -226,6 +234,19 @@ export function parseAntigravityTranscriptDetailed(
     }
 
     if (uncachedInputTokens === 0 && cacheReadTokens === 0 && outputTokens === 0) continue;
+
+    const bucketMap = new Map();
+    for (const su of stepUsages) {
+      accumulateUsageBucket(bucketMap, {
+        model: su.model || model,
+        uncachedInput: su.uncachedInput,
+        cacheRead: su.cacheRead,
+        cacheWrite5m: 0,
+        cacheWrite1h: 0,
+        output: su.output,
+      });
+    }
+    const usageBuckets = finalizeUsageBuckets(bucketMap);
 
     const totalInputTokens = uncachedInputTokens + cacheReadTokens;
     const durationMs =
@@ -299,6 +320,7 @@ export function parseAntigravityTranscriptDetailed(
       ttftMs: firstTtftMs,
       tps,
       tpsMethod,
+      usageBuckets,
       replyPreview,
     });
   }

@@ -1,6 +1,7 @@
 /**
  * Shared formatting and metric normalization helpers for AI Turn Meter.
  */
+import { normalizeServiceTier, sanitizeUsageBuckets } from './pricing.mjs';
 
 export const TPS_METHOD_LABELS = {
   streaming_decode: '纯流式解码',
@@ -12,6 +13,7 @@ export const TPS_METHOD_LABELS = {
 
 export const TOOL_LABELS = {
   codex: 'Codex',
+  claude: 'Claude',
   antigravity: 'Antigravity',
   cursor: 'Cursor',
   codebuddy: 'CodeBuddy',
@@ -189,5 +191,7 @@ export function normalizeTurn(raw) {
     tpsMethodLabel: TPS_METHOD_LABELS[tpsMethod] || TPS_METHOD_LABELS.unavailable,
     replyPreview: normalizePreviewText(raw.replyPreview),
     explicitCostUsd: toNonNegFloat(raw.explicitCostUsd),
+    serviceTier: normalizeServiceTier(raw.serviceTier),
+    usageBuckets: sanitizeUsageBuckets(raw.usageBuckets),
   };
 }

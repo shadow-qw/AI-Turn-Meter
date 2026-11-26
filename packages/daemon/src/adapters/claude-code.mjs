@@ -2,6 +2,12 @@ import { existsSync, readdirSync, readFileSync, statSync, watch } from 'node:fs'
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { normalizePreviewText } from '../format.mjs';
+import {
+  accumulateUsageBucket,
+  finalizeUsageBuckets,
+  normalizeInferenceGeo,
+  normalizeServiceTier,
+} from '../pricing.mjs';
 
 function parseTimestampMs(ts) {
   if (typeof ts === 'number' && Number.isFinite(ts)) {
@@ -101,7 +107,7 @@ function contentHasToolUse(content) {
  */
 export function parseClaudeCodeSessionContent(
   content,
-  { sessionId = null, workspacePath = null, filePath = '' } = {}
+  { sessionId = null, workspacePath = null, filePath = '', tool = 'claude' } = {}
 ) {
   if (typeof content !== 'string' || !content.trim()) return [];
 
@@ -243,40 +249,64 @@ export function parseClaudeCodeSessionContent(
     if (!entry) {
       entry = {
         id: msgId,
+        model: null,
         hasUsage: false,
         uncachedInput: 0,
         cacheRead: 0,
         cacheWrite: 0,
+        cacheWrite5m: 0,
+        cacheWrite1h: 0,
         output: 0,
         thinking: null,
+        serviceTier: null,
+        inferenceGeo: null,
         textParts: [],
         seenTexts: new Set(),
       };
       current.calls.set(msgId, entry);
       current.callOrder.push(entry);
     }
+    if (rawModel && rawModel.toLowerCase() !== 'unknown') {
+      entry.model = rawModel;
+    }
 
     if (hasUsage) {
       entry.hasUsage = true;
       const uncached = toFiniteNonNeg(usage.input_tokens) ?? 0;
       const cacheRead = toFiniteNonNeg(usage.cache_read_input_tokens) ?? 0;
-      const cacheWrite =
-        toFiniteNonNeg(usage.cache_creation_input_tokens) ??
-        (usage.cache_creation && typeof usage.cache_creation === 'object'
-          ? (toFiniteNonNeg(usage.cache_creation.ephemeral_5m_input_tokens) ?? 0) +
-            (toFiniteNonNeg(usage.cache_creation.ephemeral_1h_input_tokens) ?? 0)
-          : 0);
+      const e5m =
+        usage.cache_creation && typeof usage.cache_creation === 'object'
+          ? toFiniteNonNeg(usage.cache_creation.ephemeral_5m_input_tokens)
+          : null;
+      const e1h =
+        usage.cache_creation && typeof usage.cache_creation === 'object'
+          ? toFiniteNonNeg(usage.cache_creation.ephemeral_1h_input_tokens)
+          : null;
+      const rawCW = toFiniteNonNeg(usage.cache_creation_input_tokens);
+      const cw1h = e1h ?? 0;
+      const cw5m = e5m !== null ? e5m : Math.max(0, (rawCW ?? 0) - cw1h);
+      const cacheWrite = Math.max(rawCW ?? 0, cw5m + cw1h);
       const output = toFiniteNonNeg(usage.output_tokens) ?? 0;
       const thinking =
-        toFiniteNonNeg(usage.thinking_tokens) ?? toFiniteNonNeg(usage.reasoning_output_tokens);
+        toFiniteNonNeg(usage.output_tokens_details?.thinking_tokens) ??
+        toFiniteNonNeg(usage.thinking_tokens) ??
+        toFiniteNonNeg(usage.reasoning_output_tokens);
 
       entry.uncachedInput = Math.max(entry.uncachedInput, uncached);
       entry.cacheRead = Math.max(entry.cacheRead, cacheRead);
+      entry.cacheWrite1h = Math.max(entry.cacheWrite1h, cw1h);
       entry.cacheWrite = Math.max(entry.cacheWrite, cacheWrite);
+      entry.cacheWrite5m = Math.max(0, entry.cacheWrite - entry.cacheWrite1h);
       entry.output = Math.max(entry.output, output);
       if (thinking !== null) {
         entry.thinking = entry.thinking === null ? thinking : Math.max(entry.thinking, thinking);
       }
+      const speedTier = normalizeServiceTier(usage.speed);
+      const rawTier = normalizeServiceTier(usage.service_tier);
+      const callTier = speedTier || rawTier;
+      if (callTier) entry.serviceTier = callTier;
+      const geo = normalizeInferenceGeo(usage.inference_geo);
+      if (geo) entry.inferenceGeo = geo;
     }
 
     for (const part of textParts) {
@@ -305,6 +335,7 @@ export function parseClaudeCodeSessionContent(
     let outputTokens = 0;
     let thinkingTokens = 0;
     let hasThinking = false;
+    const bucketMap = new Map();
 
     for (const c of usageCalls) {
       uncachedInputTokens += c.uncachedInput;
@@ -315,10 +346,21 @@ export function parseClaudeCodeSessionContent(
         thinkingTokens += c.thinking;
         hasThinking = true;
       }
+      accumulateUsageBucket(bucketMap, {
+        model: c.model || rt.model,
+        serviceTier: c.serviceTier,
+        inferenceGeo: c.inferenceGeo,
+        uncachedInput: c.uncachedInput,
+        cacheRead: c.cacheRead,
+        cacheWrite5m: c.cacheWrite5m,
+        cacheWrite1h: c.cacheWrite1h,
+        output: c.output,
+      });
     }
 
     const totalInputTokens = uncachedInputTokens + cacheReadTokens + cacheWriteTokens;
     if (totalInputTokens === 0 && outputTokens === 0) continue;
+    const usageBuckets = finalizeUsageBuckets(bucketMap);
 
     let replyPreview = null;
     for (let i = rt.callOrder.length - 1; i >= 0; i -= 1) {
@@ -368,9 +410,10 @@ export function parseClaudeCodeSessionContent(
     }
 
     const turnId = resolvedAgentId ? `agent-${resolvedAgentId}-turn-${rt.turnIndex}` : `turn-${rt.turnIndex}`;
+    const resolvedTool = typeof tool === 'string' && tool.trim() ? tool.trim() : 'claude';
     completed.push({
-      turnUid: `claude_code:${finalSessionId}:${turnId}`,
-      tool: 'claude_code',
+      turnUid: `${resolvedTool}:${finalSessionId}:${turnId}`,
+      tool: resolvedTool,
       host: 'claude-code',
       sessionId: finalSessionId,
       turnId,
@@ -390,6 +433,7 @@ export function parseClaudeCodeSessionContent(
       ttftMs: null,
       tps,
       tpsMethod,
+      usageBuckets,
       replyPreview,
     });
   }

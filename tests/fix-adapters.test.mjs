@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { zstdCompressSync } from 'node:zlib';
 
 import { TurnStore } from '../packages/daemon/src/store.mjs';
 import { normalizeTurn } from '../packages/daemon/src/format.mjs';
+import { estimateTurnCost } from '../packages/daemon/src/pricing.mjs';
+import { parseClaudeCodeSessionContent } from '../packages/daemon/src/adapters/claude-code.mjs';
 import {
   AntigravityAdapter,
   parseAntigravityTranscriptContent,
@@ -789,5 +792,389 @@ test('CodeBuddy CLI emits turns followed by acp-terminal-state / context-usage a
     assert.equal(cursorTurns[0].totalInputTokens, 1_300_000);
   } finally {
     store.close();
+  }
+});
+
+test('Codex parses service_tier multipliers, per-call >272K buckets, and token_count fallback buckets', () => {
+  const jsonl = [
+    JSON.stringify({ type: 'session_meta', payload: { id: 'sess-tier', cwd: '/tmp/ws' } }),
+    // Turn 1: priority tier (2x) with mixed calls: 100K (<=272K) + 300K (>272K), avg = 200K (<=272K)
+    JSON.stringify({
+      timestamp: '2026-11-25T01:00:00Z',
+      type: 'turn_context',
+      payload: { turn_id: 't1', model: 'gpt-6.2-sol', service_tier: 'priority' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:00:05Z',
+      type: 'token_usage_record',
+      payload: {
+        turn_id: 't1',
+        response_id: 'r1',
+        usage: { input_tokens: 100_000, cached_input_tokens: 80_000, output_tokens: 1_000 },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:00:10Z',
+      type: 'token_usage_record',
+      payload: {
+        turn_id: 't1',
+        response_id: 'r2',
+        usage: { input_tokens: 300_000, cached_input_tokens: 200_000, output_tokens: 2_000 },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:00:12Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 't1' },
+    }),
+    // Turn 2: resets to default tier via thread_settings_applied, then ultrafast (3x)
+    JSON.stringify({
+      timestamp: '2026-11-25T01:01:00Z',
+      type: 'turn_context',
+      payload: { turn_id: 't2', model: 'gpt-6.2-sol' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:01:01Z',
+      type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { service_tier: 'default' } },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:01:05Z',
+      type: 'token_usage_record',
+      payload: {
+        turn_id: 't2',
+        response_id: 'r3',
+        usage: { input_tokens: 100_000, cached_input_tokens: 100_000, output_tokens: 1_000 },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:01:06Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 't2' },
+    }),
+    // Turn 3: token_count fallback with ultrafast (3x)
+    JSON.stringify({
+      timestamp: '2026-11-25T01:02:00Z',
+      type: 'turn_context',
+      payload: { turn_id: 't3', model: 'gpt-6.2-sol', service_tier: 'ultrafast' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:02:05Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 100_000, cached_input_tokens: 100_000, output_tokens: 1_000 },
+          total_token_usage: { input_tokens: 100_000, cached_input_tokens: 100_000, output_tokens: 1_000 },
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-11-25T01:02:06Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 't3' },
+    }),
+  ].join('\n');
+
+  const turns = parseCodexSessionDetailed(jsonl, 'rollout-tier.jsonl').turns;
+  assert.equal(turns.length, 3);
+  assert.equal(turns[0].serviceTier, 'priority');
+  assert.equal(turns[0].usageBuckets.length, 2);
+
+  // Turn 1 expected:
+  // Call 1 (<=272k, priority 2x): (0.02*2 + 0.08*0.1 + 0.001*10)*2 = (0.04+0.008+0.01)*2 = 0.116
+  // Call 2 (>272k, priority 2x): (0.1*4 + 0.2*0.2 + 0.002*15)*2 = (0.4+0.04+0.03)*2 = 0.94
+  // Total = 1.056
+  assert.equal(estimateTurnCost(turns[0]).costUsd, 1.056);
+
+  // Turn 2 expected (default tier): 0.1*0.1 + 0.001*10 = 0.02
+  assert.equal(turns[1].serviceTier, null);
+  assert.equal(estimateTurnCost(turns[1]).costUsd, 0.02);
+
+  // Turn 3 expected (fallback ultrafast 3x): (0.1*0.1 + 0.001*10)*3 = 0.06
+  assert.equal(turns[2].serviceTier, 'ultrafast');
+  assert.equal(estimateTurnCost(turns[2]).costUsd, 0.06);
+});
+
+test('Claude Code parses 1h/5m cache writes, speed=fast, batch tier, us geo, thinking_tokens, and >200K per-call buckets', () => {
+  const jsonl = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: 'c-sess',
+      cwd: '/tmp/c',
+      timestamp: '2026-11-25T02:00:00Z',
+      message: { role: 'user', content: 'analyze' },
+    }),
+    // Call 1: claude-opus-5-5 with 1h cache write ($8/M) + 5m cache write ($5/M) + US geo (1.1x)
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: 'c-sess',
+      timestamp: '2026-11-25T02:00:05Z',
+      message: {
+        id: 'msg-1',
+        model: 'claude-opus-5-5',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'step1' }],
+        usage: {
+          input_tokens: 10_000,
+          cache_read_input_tokens: 100_000,
+          cache_creation_input_tokens: 60_000,
+          cache_creation: { ephemeral_5m_input_tokens: 20_000, ephemeral_1h_input_tokens: 40_000 },
+          output_tokens: 2_000,
+          output_tokens_details: { thinking_tokens: 500 },
+          speed: 'standard',
+          service_tier: 'standard',
+          inference_geo: 'us',
+        },
+      },
+    }),
+    // Call 2: claude-opus-4-6 fast mode (6x) + batch? Let's test speed='fast' (6x on opus-4-6)
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: 'c-sess',
+      timestamp: '2026-11-25T02:00:10Z',
+      message: {
+        id: 'msg-2',
+        model: 'claude-opus-4-6',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'fast done' }],
+        usage: {
+          input_tokens: 10_000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          output_tokens: 1_000,
+          speed: 'fast',
+          inference_geo: 'global',
+        },
+      },
+    }),
+    // Turn 2: claude-sonnet-4-5 mixed >200K + <=200K per-call buckets + batch (0.5x)
+    JSON.stringify({
+      type: 'user',
+      sessionId: 'c-sess',
+      timestamp: '2026-11-25T02:01:00Z',
+      message: { role: 'user', content: 'next' },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: 'c-sess',
+      timestamp: '2026-11-25T02:01:05Z',
+      message: {
+        id: 'msg-3',
+        model: 'claude-sonnet-4-5',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'short' }],
+        usage: {
+          input_tokens: 100_000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          output_tokens: 1_000,
+          service_tier: 'batch',
+        },
+      },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: 'c-sess',
+      timestamp: '2026-11-25T02:01:10Z',
+      message: {
+        id: 'msg-4',
+        model: 'claude-sonnet-4-5',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'long' }],
+        usage: {
+          input_tokens: 250_000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          output_tokens: 2_000,
+          service_tier: 'batch',
+        },
+      },
+    }),
+  ].join('\n');
+
+  const turns = parseClaudeCodeSessionContent(jsonl, { sessionId: 'c-sess' });
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].thinkingTokens, 500);
+  // Turn 1:
+  // Call 1 (opus-5-5, us 1.1x): (0.01*4 + 0.1*0.2 + 0.02*5 + 0.04*8 + 0.002*20)*1.1 = (0.04+0.02+0.10+0.32+0.04)*1.1 = 0.52*1.1 = 0.572
+  // Call 2 (opus-4-6, fast 6x): (0.01*5 + 0.001*25)*6 = 0.075*6 = 0.45
+  // Total = 1.022
+  assert.equal(estimateTurnCost(turns[0]).costUsd, 1.022);
+
+  // Turn 2: avg = 175K (<=200K), but Call 4 = 250K (>200K)
+  // Call 3 (<=200K, batch 0.5x): (0.1*3 + 0.001*15)*0.5 = 0.315*0.5 = 0.1575
+  // Call 4 (>200K, batch 0.5x): (0.25*6 + 0.002*22.5)*0.5 = (1.5+0.045)*0.5 = 0.7725
+  // Total = 0.93
+  assert.equal(estimateTurnCost(turns[1]).costUsd, 0.93);
+});
+
+test('Antigravity emits per-step usageBuckets for mixed >200K & multi-model turns', () => {
+  const transcript = [
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T03:00:00Z' }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-25T03:00:05Z',
+      model: 'gemini-3.1-pro',
+      input_tokens: 50_000,
+      cache_read_tokens: 100_000,
+      output_tokens: 1_000,
+      tool_calls: [{ id: 'tc1' }],
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-25T03:00:10Z',
+      model: 'gemini-3.1-pro',
+      input_tokens: 50_000,
+      cache_read_tokens: 200_000,
+      output_tokens: 2_000,
+      tool_calls: [],
+    }),
+    JSON.stringify({ step_index: 3, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T03:01:00Z' }),
+    JSON.stringify({
+      step_index: 4,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-25T03:01:05Z',
+      model: 'gemini-4-neon',
+      input_tokens: 100_000,
+      cache_read_tokens: 0,
+      output_tokens: 1_000,
+      tool_calls: [{ id: 'tc2' }],
+    }),
+    JSON.stringify({
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-25T03:01:10Z',
+      model: 'gemini-4-hydrogen',
+      input_tokens: 100_000,
+      cache_read_tokens: 0,
+      output_tokens: 1_000,
+      tool_calls: [],
+    }),
+  ].join('\n');
+
+  const turns = parseAntigravityTranscriptContent(transcript, { sessionId: 'ag-buckets' });
+  assert.equal(turns.length, 2);
+  // Turn 1: Step 1 (150K <=200K): 0.05*2 + 0.1*0.2 + 0.001*12 = 0.132
+  //         Step 2 (250K >200K):  0.05*4 + 0.2*0.4 + 0.002*18 = 0.316
+  // Total = 0.448 (turn avg is 200K, so naive avg would miss Step 2!)
+  assert.equal(estimateTurnCost(turns[0]).costUsd, 0.448);
+
+  // Turn 2: multi-model buckets: neon (0.1*3 + 0.001*15 = 0.315) + hydrogen (0.1*1.5 + 0.001*7.5 = 0.1575) = 0.4725
+  assert.equal(estimateTurnCost(turns[1]).costUsd, 0.4725);
+});
+
+test('TurnStore migrates v3->v4, preserves cursor-cloud explicitCostUsd on dedup, and aligns summary/session/receipt costs', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-v4-mig-'));
+  const dbPath = join(tmpDir, 'meter.db');
+  try {
+    // Seed a v3 database with an ingested_files row
+    const rawDb = new DatabaseSync(dbPath);
+    rawDb.exec(`
+      CREATE TABLE turns (
+        turn_uid TEXT PRIMARY KEY, tool TEXT NOT NULL, host TEXT NOT NULL,
+        session_id TEXT NOT NULL, turn_id TEXT NOT NULL, model TEXT NOT NULL,
+        workspace_path TEXT, workspace_hash TEXT, started_at_ms INTEGER,
+        completed_at_ms INTEGER NOT NULL, call_count INTEGER NOT NULL,
+        total_input_tokens INTEGER NOT NULL, uncached_input_tokens INTEGER NOT NULL,
+        cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL, thinking_tokens INTEGER,
+        cache_rate_pct REAL, duration_ms INTEGER, model_active_ms INTEGER,
+        ttft_ms INTEGER, tps REAL, tps_method TEXT NOT NULL,
+        reply_preview TEXT, explicit_cost_usd REAL
+      );
+      CREATE TABLE ingested_files (file_path TEXT PRIMARY KEY, mtime_ms REAL NOT NULL, size_bytes INTEGER);
+      INSERT INTO ingested_files VALUES ('/tmp/old.jsonl', 1000, 100);
+      PRAGMA user_version = 3;
+    `);
+    rawDb.close();
+
+    const store = new TurnStore(dbPath);
+    try {
+      const ver = store.db.prepare('PRAGMA user_version').get().user_version;
+      assert.equal(ver, 4);
+      const cols = store.db.prepare('PRAGMA table_info(turns)').all().map((c) => c.name);
+      assert.ok(cols.includes('usage_buckets_json'));
+      assert.equal(store.db.prepare('SELECT COUNT(*) c FROM ingested_files').get().c, 0);
+
+      // 1. Cursor cloud explicit_cost_usd preservation when local hook arrives
+      const nowMs = Date.UTC(2026, 10, 25, 12, 0, 0);
+      store.upsertTurn({
+        turnUid: 'cursor:api:cloud-1',
+        tool: 'cursor',
+        host: 'cursor-cloud',
+        sessionId: 'conv-preserve',
+        turnId: 'cloud-1',
+        model: 'grok-bot-default',
+        startedAtMs: nowMs - 20_000,
+        completedAtMs: nowMs - 10_000,
+        totalInputTokens: 50_000,
+        uncachedInputTokens: 10_000,
+        cacheReadTokens: 40_000,
+        outputTokens: 500,
+        explicitCostUsd: 1.25,
+      });
+      store.upsertTurn({
+        turnUid: 'cursor:conv-preserve:gen-1',
+        tool: 'cursor',
+        host: 'cursor-ide',
+        sessionId: 'conv-preserve',
+        turnId: 'gen-1',
+        model: 'grok-bot-default',
+        startedAtMs: nowMs - 25_000,
+        completedAtMs: nowMs,
+        totalInputTokens: 80_000,
+        uncachedInputTokens: 15_000,
+        cacheReadTokens: 65_000,
+        outputTokens: 800,
+      });
+      const curTurns = store.getRecentTurns(10, 'cursor');
+      assert.equal(curTurns.length, 1);
+      assert.equal(curTurns[0].host, 'cursor-ide');
+      assert.equal(curTurns[0].explicitCostUsd, 1.25);
+      assert.equal(curTurns[0].estimatedCostUsd, 1.25);
+
+      // 2. Query consistency across getUsageSummary, getRecentSessions, and getReceiptData (including availableDates)
+      store.upsertTurn({
+        turnUid: 'codex:s-cons:t-1',
+        tool: 'codex',
+        host: 'codex-desktop',
+        sessionId: 's-cons',
+        turnId: 't-1',
+        model: 'gpt-6.2-sol',
+        completedAtMs: nowMs,
+        callCount: 2,
+        totalInputTokens: 400_000,
+        uncachedInputTokens: 120_000,
+        cacheReadTokens: 280_000,
+        outputTokens: 3_000,
+        serviceTier: 'priority',
+        usageBuckets: [
+          { b: 'le_200k', st: 'priority', c: 1, in: 100_000, u: 20_000, cr: 80_000, cw5: 0, cw1h: 0, out: 1_000 },
+          { b: 'gt_272k', st: 'priority', c: 1, in: 300_000, u: 100_000, cr: 200_000, cw5: 0, cw1h: 0, out: 2_000 },
+        ],
+      });
+
+      const summary = store.getUsageSummary({ days: 7, tool: 'codex', nowMs });
+      const sessions = store.getRecentSessions({ tool: 'codex', limit: 5, nowMs });
+      const d = new Date(nowMs);
+      const localDay = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const receipt = store.getReceiptData({ date: localDay, scope: 'day', tool: 'codex', nowMs });
+
+      assert.equal(summary.totals.estimatedCostUsd, 1.056);
+      assert.equal(sessions[0].estimatedCostUsd, 1.056);
+      assert.equal(receipt.totals.estimatedCostUsd, 1.056);
+      assert.equal(receipt.availableDates[0].estimatedCostUsd, 1.056);
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
   }
 });

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync, watch } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { accumulateUsageBucket, finalizeUsageBuckets } from '../pricing.mjs';
 
 const OPEN_TURN_FLUSH_MS = 120_000;
 const CLI_TRAILING_META_EVENTS = new Set([
@@ -312,6 +313,7 @@ export function parseCodeBuddyCliDetailed(
       if (raw && typeof raw === 'object') {
         const key = pd.messageId || `${pd.conversationRequestId || ''}:${pd.stepSeq || ''}` || obj.id;
         current.calls.set(key, {
+          model: pd.requestModelName || pd.model || current.model,
           input: Number(raw.prompt_tokens) || 0,
           cacheRead: Number(raw.prompt_cache_hit_tokens || raw.cache_read_input_tokens) || 0,
           cacheWrite: Number(raw.cache_creation_input_tokens || raw.prompt_cache_write_tokens) || 0,
@@ -343,6 +345,7 @@ export function parseCodeBuddyCliDetailed(
     let outputTokens = 0;
     let thinkingTokens = 0;
     let hasThinking = false;
+    const bucketMap = new Map();
 
     for (const c of rt.calls.values()) {
       totalInputTokens += c.input;
@@ -353,8 +356,21 @@ export function parseCodeBuddyCliDetailed(
         thinkingTokens += c.thinking;
         hasThinking = true;
       }
+      const inp = Math.max(0, c.input);
+      const cr = Math.min(Math.max(0, c.cacheRead), inp);
+      const cw = Math.min(Math.max(0, c.cacheWrite), Math.max(0, inp - cr));
+      const unc = Math.max(0, inp - cr - cw);
+      accumulateUsageBucket(bucketMap, {
+        model: c.model && c.model !== 'unknown' ? c.model : rt.model,
+        uncachedInput: unc,
+        cacheRead: cr,
+        cacheWrite5m: cw,
+        cacheWrite1h: 0,
+        output: Math.max(0, c.output),
+      });
     }
     if (totalInputTokens === 0 && outputTokens === 0) continue;
+    const usageBuckets = finalizeUsageBuckets(bucketMap);
 
     const durationMs =
       rt.startedAtMs !== null && rt.lastAtMs !== null && rt.lastAtMs >= rt.startedAtMs
@@ -397,6 +413,7 @@ export function parseCodeBuddyCliDetailed(
       ttftMs: null,
       tps,
       tpsMethod,
+      usageBuckets,
       replyPreview: rt.replyPreview || null,
     });
   }

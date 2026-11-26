@@ -1609,3 +1609,126 @@ test('installer & cli: setAppAutostart dryRun and offline cli status --json expo
     rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('pricing: supports Grok 4.6/4.7, -fast multipliers, Gemini 4 schedule, Claude 1h cache/geo, Fable/DeepSeek, and cursor-ide cumulative guard', () => {
+  // 1. Grok 4.7 short vs >200K long context + -fast 2x multiplier
+  const grokShort = estimateTurnCost({
+    model: 'grok-4.7-xhigh',
+    totalInputTokens: 150_000,
+    uncachedInputTokens: 50_000,
+    cacheReadTokens: 100_000,
+    outputTokens: 10_000,
+    callCount: 1,
+  });
+  // 0.05*2 + 0.1*0.5 + 0.01*6 = 0.1 + 0.05 + 0.06 = 0.21
+  assert.equal(grokShort.costUsd, 0.21);
+
+  const grokLong = estimateTurnCost({
+    model: 'grok-4.7-xhigh',
+    totalInputTokens: 250_000,
+    uncachedInputTokens: 50_000,
+    cacheReadTokens: 200_000,
+    outputTokens: 10_000,
+    callCount: 1,
+  });
+  // 0.05*4 + 0.2*1 + 0.01*12 = 0.2 + 0.2 + 0.12 = 0.52
+  assert.equal(grokLong.costUsd, 0.52);
+
+  const grokFast = estimateTurnCost({
+    model: 'grok-4.7-xhigh-fast',
+    totalInputTokens: 150_000,
+    uncachedInputTokens: 50_000,
+    cacheReadTokens: 100_000,
+    outputTokens: 10_000,
+    callCount: 1,
+  });
+  assert.equal(grokFast.costUsd, 0.42);
+
+  // 2. claude-opus-5-5-xhigh-fast (2x on $4/$0.2/$20) vs composer-2.5-fast (dedicated rate, no double mult)
+  const opus55Fast = estimateTurnCost({
+    model: 'claude-opus-5-5-xhigh-fast',
+    totalInputTokens: 1_000_000,
+    uncachedInputTokens: 0,
+    cacheReadTokens: 1_000_000,
+    outputTokens: 100_000,
+    callCount: 10,
+  });
+  // (1*0.2 + 0.1*20) * 2 = 2.2 * 2 = 4.4
+  assert.equal(opus55Fast.costUsd, 4.4);
+
+  const compFast = estimateTurnCost({
+    model: 'composer-2.5-fast',
+    totalInputTokens: 1_000_000,
+    uncachedInputTokens: 1_000_000,
+    cacheReadTokens: 0,
+    outputTokens: 0,
+    callCount: 1,
+  });
+  assert.equal(compFast.costUsd, 3.0);
+
+  // 3. Claude Fable 5.1/5.2 & DeepSeek Flash
+  assert.equal(resolveModelPricing('claude-fable-5-1')?.cacheRead, 0.25);
+  assert.equal(resolveModelPricing('claude-fable-5-2')?.input, 8.0);
+  assert.equal(resolveModelPricing('deepseek-flash')?.input, 0.27);
+  assert.equal(resolveModelPricing('deepseek-v41-flash-1017-max')?.output, 1.1);
+
+  // 4. Gemini 4 updated flat 1M rates & Argon/Carbon Dec 1, 2026 schedule
+  const neon300k = estimateTurnCost({
+    model: 'gemini-4-neon',
+    totalInputTokens: 300_000,
+    uncachedInputTokens: 100_000,
+    cacheReadTokens: 200_000,
+    outputTokens: 10_000,
+    callCount: 1,
+  });
+  // flat 1M: 0.1*3 + 0.2*0.15 + 0.01*15 = 0.3 + 0.03 + 0.15 = 0.48
+  assert.equal(neon300k.costUsd, 0.48);
+
+  const hydroTiered = estimateTurnCost({
+    model: 'gemini-4-hydrogen-tiered-high',
+    totalInputTokens: 1_000_000,
+    uncachedInputTokens: 0,
+    cacheReadTokens: 1_000_000,
+    outputTokens: 100_000,
+    callCount: 5,
+  });
+  // 1*0.075 + 0.1*7.5 = 0.825
+  assert.equal(hydroTiered.costUsd, 0.825);
+
+  const argonNov = estimateTurnCost({
+    model: 'gemini-4-argon-high',
+    completedAtMs: Date.UTC(2026, 10, 30, 23, 59, 59),
+    totalInputTokens: 1_000_000,
+    uncachedInputTokens: 500_000,
+    cacheReadTokens: 500_000,
+    outputTokens: 100_000,
+    callCount: 5,
+  });
+  // Nov promo: 0.5*2 + 0.5*0.1 + 0.1*10 = 2.05
+  assert.equal(argonNov.costUsd, 2.05);
+
+  const argonDec = estimateTurnCost({
+    model: 'gemini-4-argon-high',
+    completedAtMs: Date.UTC(2026, 11, 1, 0, 0, 0),
+    totalInputTokens: 1_000_000,
+    uncachedInputTokens: 500_000,
+    cacheReadTokens: 500_000,
+    outputTokens: 100_000,
+    callCount: 5,
+  });
+  // Dec standard: 0.5*4 + 0.5*0.2 + 0.1*20 = 4.1
+  assert.equal(argonDec.costUsd, 4.1);
+
+  // 5. cursor-ide cumulative callCount=1 should NOT trigger >200K long-context 2x surcharge
+  const cursorHook = estimateTurnCost({
+    host: 'cursor-ide',
+    model: 'claude-sonnet-4-5',
+    totalInputTokens: 1_500_000,
+    uncachedInputTokens: 500_000,
+    cacheReadTokens: 1_000_000,
+    outputTokens: 20_000,
+    callCount: 1,
+  });
+  // Short tier: 0.5*3 + 1.0*0.3 + 0.02*15 = 1.5 + 0.3 + 0.3 = 2.1
+  assert.equal(cursorHook.costUsd, 2.1);
+});
