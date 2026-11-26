@@ -269,15 +269,15 @@ struct AITurnMeterCoreTests {
 
   @Test("ProviderOrder resolves saved order, moves built-in and external providers, and sorts overview windows")
   func providerOrderResolveMoveAndSort() {
-    let available = ["codex", "cursor", "antigravity", "codebuddy", "ext:gw", "ext:extra"]
+    let available = ["codex", "claude", "cursor", "antigravity", "codebuddy", "ext:gw", "ext:extra"]
     let resolved = ProviderOrder.resolve(saved: ["ext:gw", "cursor", "removed-key"], available: available)
-    #expect(resolved == ["ext:gw", "cursor", "codex", "antigravity", "codebuddy", "ext:extra"])
+    #expect(resolved == ["ext:gw", "cursor", "codex", "claude", "antigravity", "codebuddy", "ext:extra"])
 
     let moved = ProviderOrder.move(order: resolved, from: "codex", to: "ext:gw")
-    #expect(moved == ["codex", "ext:gw", "cursor", "antigravity", "codebuddy", "ext:extra"])
+    #expect(moved == ["codex", "ext:gw", "cursor", "claude", "antigravity", "codebuddy", "ext:extra"])
 
     let movedToEnd = ProviderOrder.move(order: moved, from: "codex", to: "ext:extra")
-    #expect(movedToEnd == ["ext:gw", "cursor", "antigravity", "codebuddy", "ext:extra", "codex"])
+    #expect(movedToEnd == ["ext:gw", "cursor", "claude", "antigravity", "codebuddy", "ext:extra", "codex"])
 
     let windows = [
       CardQuotaWindow(id: "overview-codex", title: "Codex", remainingPct: 80),
@@ -1050,5 +1050,114 @@ struct AITurnMeterCoreTests {
       snapshot: emptySnapshot
     )
     #expect(sampleOut == "今 12.4M | 今 $18.20 | 末 52 tok/s")
+  }
+
+  @Test("Built-in claude order, config payload, menu bar formatting, and alerts work end-to-end")
+  func claudeBuiltInProviderCoreSupport() throws {
+    #expect(ProviderOrder.defaultBuiltIn == ["codex", "claude", "cursor", "antigravity", "codebuddy"])
+
+    let cfgJson = """
+    {
+      "enabled": true,
+      "tools": { "codex": true, "claude": true, "cursor": true, "antigravity": true, "codebuddy": true },
+      "hasCursorCookie": false,
+      "hasClaudeCookie": true,
+      "claudeProxyUrl": "http://127.0.0.1:17890",
+      "effectiveClaudeProxyUrl": "http://127.0.0.1:17890",
+      "claudeProxySource": "config",
+      "claudeQuotaEnabled": true
+    }
+    """
+    let cfg = try JSONDecoder().decode(MeterConfigPayload.self, from: Data(cfgJson.utf8))
+    #expect(cfg.hasClaudeCookie == true)
+    #expect(cfg.tools["claude"] == true)
+    #expect(cfg.claudeProxyUrl == "http://127.0.0.1:17890")
+    #expect(cfg.effectiveClaudeProxyUrl == "http://127.0.0.1:17890")
+    #expect(cfg.claudeProxySource == "config")
+    #expect(cfg.claudeQuotaEnabled == true)
+
+    let legacyCfgJson = """
+    {
+      "enabled": true,
+      "tools": { "codex": true, "claude": true }
+    }
+    """
+    let legacyCfg = try JSONDecoder().decode(MeterConfigPayload.self, from: Data(legacyCfgJson.utf8))
+    #expect(legacyCfg.claudeProxyUrl == nil)
+    #expect(legacyCfg.effectiveClaudeProxyUrl == nil)
+    #expect(legacyCfg.claudeProxySource == nil)
+    #expect(legacyCfg.claudeQuotaEnabled == nil)
+
+    let claudeCard = CodexBarCardSnapshot(
+      accountEmail: "dev@anthropic.example",
+      planTitle: "Max 5x",
+      quotaWindows: [
+        CardQuotaWindow(id: "claude-5h", title: "Claude 会话", remainingPct: 68, group: "Claude", windowKind: "5h"),
+        CardQuotaWindow(id: "claude-weekly", title: "Claude 每周", remainingPct: 82, group: "Claude", windowKind: "weekly"),
+      ],
+      resetCreditsText: "$4.50 / $50.00",
+      quotaHint: nil,
+      latestTpsText: nil,
+      latestCacheText: nil,
+      latestTurnSubline: nil,
+      today: CardTodayMetrics(
+        costUsd: 2.4,
+        totalTokens: 120_000,
+        totalInputTokens: 100_000,
+        outputTokens: 20_000,
+        turnCount: 4,
+        callCount: 6,
+        cacheRatePct: 85.0,
+        avgTps: 62.0,
+        cacheSavingsUsd: 0.8
+      ),
+      currentWindow: CardWindowMetrics(costUsd: nil, totalTokens: 0, turnCount: 0),
+      days30: CardWindowMetrics(costUsd: 40.0, totalTokens: 1_200_000, turnCount: 40),
+      daily30: [],
+      projects: nil,
+      recentWindows: [],
+      topModel: "claude-sonnet-4-5"
+    )
+
+    let snap = MenuBarRenderSnapshot(
+      isActiveOverall: true,
+      orderedProviderKeys: ["claude"],
+      providerLabels: ["claude": "Claude"],
+      cards: ["claude": claudeCard]
+    )
+    let out = MenuBarFormatter.format(
+      config: MenuBarCustomConfig(items: [.quotaPct], selectedProviders: ["claude"]),
+      usageScope: .provider,
+      quotaDisplayMode: .remaining,
+      snapshot: snap
+    )
+    #expect(out == "Claude 剩68%")
+
+    var evaluator = QuotaAlertEvaluator(cooldownSeconds: 0)
+    let seed = UsageSummaryResponse(cards: ["claude": claudeCard])
+    #expect(evaluator.evaluate(usage: seed, apps: [:], displayNames: ["claude": "Claude Desktop"]).isEmpty)
+    let lowCard = CodexBarCardSnapshot(
+      accountEmail: "dev@anthropic.example",
+      planTitle: "Max 5x",
+      quotaWindows: [CardQuotaWindow(id: "claude-5h", title: "Claude 会话", remainingPct: 4.0)],
+      resetCreditsText: nil,
+      quotaHint: nil,
+      latestTpsText: nil,
+      latestCacheText: nil,
+      latestTurnSubline: nil,
+      today: claudeCard.today,
+      currentWindow: claudeCard.currentWindow,
+      days30: claudeCard.days30,
+      daily30: [],
+      projects: nil,
+      recentWindows: [],
+      topModel: nil
+    )
+    let alerts = evaluator.evaluate(
+      usage: UsageSummaryResponse(cards: ["claude": lowCard]),
+      apps: [:],
+      displayNames: ["claude": "Claude Desktop"]
+    )
+    #expect(alerts.map(\.dedupeKey) == ["quota:claude:claude-5h:critical"])
   }
 }

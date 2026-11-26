@@ -16,7 +16,7 @@ import { pathToFileURL } from 'node:url';
 import { httpRequestJson, httpRequestRaw } from './net.mjs';
 import { computeQuotaWindow, formatDurationZh } from './quota.mjs';
 
-const RESERVED_IDS = new Set(['all', 'antigravity', 'codex', 'cursor', 'codebuddy']);
+const RESERVED_IDS = new Set(['all', 'antigravity', 'codex', 'claude', 'cursor', 'codebuddy']);
 const VALID_SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const VALID_EXT_KEY_RE = /^ext:[a-z0-9][a-z0-9_-]{0,31}$/;
 const VALID_PLUGIN_FILENAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}\.mjs$/;

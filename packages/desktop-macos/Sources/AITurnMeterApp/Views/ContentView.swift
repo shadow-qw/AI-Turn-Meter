@@ -183,7 +183,11 @@ struct ContentView: View {
                   let isExternal = vm.isExternalProvider(key)
                   let meta = isExternal ? vm.externalProviderMeta(for: key) : nil
                   let entry = isExternal ? nil : vm.apps[key]
-                  let installed = isExternal ? true : (entry?.installed ?? false)
+                  let card = isExternal ? nil : vm.usageData?.cards?[key]
+                  let hasCliActivity = !isExternal && (
+                    entry?.latestTurn != nil || (card?.today.turnCount ?? 0) > 0 || (card?.days30.turnCount ?? 0) > 0
+                  )
+                  let installed = isExternal ? true : ((entry?.installed ?? false) || (key == "claude" && hasCliActivity))
                   let enabled = vm.isToolEnabled(key)
                   let pane = SettingsPane.provider(key)
                   let isSelected = vm.settingsPane == pane
@@ -192,6 +196,15 @@ struct ContentView: View {
                     if !installed || !enabled || !vm.isActiveOverall { return Color.gray.opacity(0.35) }
                     if isExternal {
                       return meta?.ok == false ? .orange : Color(red: 0.20, green: 0.72, blue: 0.42)
+                    }
+                    if key == "claude" {
+                      if !vm.claudeQuotaEnabled {
+                        return Color(red: 0.20, green: 0.72, blue: 0.42)
+                      }
+                      let hasQuotaOrAuth = !(card?.quotaWindows ?? []).isEmpty || card?.accountEmail != nil || vm.hasClaudeCookie
+                      return (vm.hasUsableClaudeProxy && hasQuotaOrAuth)
+                        ? Color(red: 0.20, green: 0.72, blue: 0.42)
+                        : .orange
                     }
                     if entry?.cdpPort == nil { return .orange }
                     return Color(red: 0.20, green: 0.72, blue: 0.42)
@@ -309,6 +322,8 @@ struct ContentView: View {
         RemoteSshSheetView(vm: vm)
       case .cursorLogin:
         CursorWebLoginSheetView(vm: vm)
+      case .claudeLogin:
+        ClaudeWebLoginSheetView(vm: vm)
       case .pluginLogin(let key):
         ExternalProviderLoginSheetView(vm: vm, key: key)
       case .pluginCode:
@@ -352,6 +367,86 @@ struct ContentView: View {
         }
         .padding(18)
         .frame(width: 490)
+      case .claudeCookie:
+        VStack(alignment: .leading, spacing: 12) {
+          Text("配置 Claude 会话 Cookie")
+            .font(.headline)
+          Text("1. 优先尝试在「设置 → Claude Desktop」点击「读取本机」或「网页登录同步…」；\n2. 若手动粘贴，请打开 claude.ai/settings/usage 开发者工具（⌥⌘I）→ Network，复制请求头中的 Cookie（含 sessionKey）或仅粘贴 sessionKey 值；\n3. 粘贴保存后即可同步 5 小时与每周套餐剩余额度。")
+            .font(.system(size: 12))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+          TextField("sessionKey=sk-ant-sid01-...", text: $vm.claudeCookieDraft)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 11.5, design: .monospaced))
+          HStack {
+            Button("网页登录同步…") {
+              vm.presentSheet(.claudeLogin)
+            }
+            .controlSize(.small)
+            if let url = URL(string: "https://claude.ai/settings/usage") {
+              Button("浏览器打开") { NSWorkspace.shared.open(url) }
+                .controlSize(.small)
+            }
+            if vm.hasClaudeCookie {
+              Button("清除", role: .destructive) {
+                vm.activeSheet = nil
+                vm.saveClaudeCookie(nil)
+              }
+              .controlSize(.small)
+            }
+            Spacer()
+            Button("取消") { vm.activeSheet = nil }
+            Button("保存") {
+              let val = vm.claudeCookieDraft
+              vm.activeSheet = nil
+              vm.saveClaudeCookie(val)
+            }
+            .buttonStyle(.borderedProminent)
+          }
+        }
+        .padding(18)
+        .frame(width: 490)
+      case .claudeProxy:
+        VStack(alignment: .leading, spacing: 12) {
+          Text("配置 Claude 专用代理")
+            .font(.headline)
+          Text("所有发往 api.anthropic.com 与 claude.ai 的额度请求及内置网页登录均强制走代理（防暴露真实 IP）；代理不可用或未配置时会直接阻止直连。\n留空可自动继承 ~/.claude/settings.json 的 HTTPS_PROXY 或 macOS 系统代理。")
+            .font(.system(size: 12))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+          HStack(spacing: 6) {
+            Text("当前生效：")
+              .font(.system(size: 11.5))
+              .foregroundColor(.secondary)
+            Text(vm.claudeActiveProxySummary)
+              .font(.system(size: 11.5, design: .monospaced))
+              .foregroundColor(vm.hasUsableClaudeProxy ? .primary : .orange)
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
+          TextField("http://127.0.0.1:17890", text: $vm.claudeProxyDraft)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12, design: .monospaced))
+          HStack {
+            if !vm.claudeProxyUrl.isEmpty {
+              Button("清除（恢复自动检测）", role: .destructive) {
+                vm.activeSheet = nil
+                vm.saveClaudeProxyUrl(nil)
+              }
+              .controlSize(.small)
+            }
+            Spacer()
+            Button("取消") { vm.activeSheet = nil }
+            Button("保存") {
+              let val = vm.claudeProxyDraft
+              vm.activeSheet = nil
+              vm.saveClaudeProxyUrl(val)
+            }
+            .buttonStyle(.borderedProminent)
+          }
+        }
+        .padding(18)
+        .frame(width: 500)
       case .update:
         UpdateSheetView(vm: vm)
       }

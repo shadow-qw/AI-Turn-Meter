@@ -430,11 +430,18 @@ private struct CodexBarStyleCardView: View {
   }
 
   var body: some View {
-    let rawWindows = card.quotaWindows ?? []
+    let baseRawWindows = card.quotaWindows ?? []
+    let rawWindows: [CardQuotaWindow] = {
+      if selection == "claude" && !vm.claudeQuotaEnabled { return [] }
+      if isAll && !vm.claudeQuotaEnabled { return baseRawWindows.filter { $0.id != "overview-claude" } }
+      return baseRawWindows
+    }()
     let windows = isAll
       ? ProviderOrder.sortOverviewWindows(rawWindows, by: vm.orderedAllProviderKeys)
       : rawWindows
     let showModeToggle = !windows.isEmpty || isBillingOnlyExternal
+    let displayEmail = (selection == "claude" && !vm.claudeQuotaEnabled) ? nil : card.accountEmail
+    let displayPlan = (selection == "claude" && !vm.claudeQuotaEnabled) ? nil : card.planTitle
 
     VStack(alignment: .leading, spacing: 8) {
       // Card Header (CodexBar compact density: concise title + Email / Plan)
@@ -472,11 +479,11 @@ private struct CodexBarStyleCardView: View {
         Spacer(minLength: 6)
 
         VStack(alignment: .trailing, spacing: 1.5) {
-          Text(card.accountEmail ?? statusLabel)
+          Text(displayEmail ?? statusLabel)
             .font(.system(size: 11.5, weight: .semibold))
             .foregroundColor(primaryText)
             .lineLimit(1)
-          Text(card.planTitle ?? (isExternal ? "外部插件" : "本地监控"))
+          Text(displayPlan ?? (isExternal ? "外部插件" : "本地监控"))
             .font(.system(size: 10))
             .foregroundColor(secondaryText)
             .lineLimit(1)
@@ -514,13 +521,19 @@ private struct CodexBarStyleCardView: View {
                             ? (vm.hasCursorCookie
                                 ? "未读取到套餐限额 · 请重新登录"
                                 : "需在「设置 → Cursor」授权读取或网页登录")
-                            : (selection == "codex"
-                                ? (card.accountEmail != nil
-                                    ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
-                                    : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
-                                : (selection == "antigravity"
-                                    ? "暂无法读取本地配额 · 请在 Antigravity 内查看剩余额度"
-                                    : "企业/团队按量模式 · 无固定个人会话限额"))))
+                            : (selection == "claude"
+                                ? (!vm.claudeQuotaEnabled
+                                    ? "纯本地离线模式 · 仅统计本地 Token、费用与轮次"
+                                    : (vm.hasClaudeCookie
+                                        ? "未读取到套餐限额 · 请刷新或重新登录"
+                                        : "需在「设置 → Claude」读取本机登录或网页登录"))
+                                : (selection == "codex"
+                                    ? (card.accountEmail != nil
+                                        ? "正在同步配额 · 请点击刷新或运行 Codex 后自动获取"
+                                        : "当前为 API Key / 企业按量模式，或尚未登录 ChatGPT 账号")
+                                    : (selection == "antigravity"
+                                        ? "暂无法读取本地配额 · 请在 Antigravity 内查看剩余额度"
+                                        : "企业/团队按量模式 · 无固定个人会话限额")))))
                       : "未检测到该客户端安装"))
           )
           .font(.system(size: 10.5))
@@ -576,6 +589,30 @@ private struct CodexBarStyleCardView: View {
               .controlSize(.mini)
               .tint(CodexBarPalette.accentBlue)
             }
+          } else if selection == "claude", vm.claudeQuotaEnabled, !vm.hasClaudeCookie, windows.isEmpty {
+            if isCardHovered {
+              Button {
+                onLoginRequested("claude")
+              } label: {
+                Text("网页登录…")
+                  .font(.system(size: 10, weight: .semibold))
+                  .foregroundColor(CodexBarPalette.cardBottom)
+                  .padding(.horizontal, 8)
+                  .padding(.vertical, 3)
+                  .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                      .fill(Color.white.opacity(0.95))
+                  )
+              }
+              .buttonStyle(.plain)
+            } else {
+              Button("网页登录…") {
+                onLoginRequested("claude")
+              }
+              .buttonStyle(.borderedProminent)
+              .controlSize(.mini)
+              .tint(CodexBarPalette.accentBlue)
+            }
           } else {
             Text(statusLabel)
               .font(.system(size: 10, weight: .medium))
@@ -584,11 +621,11 @@ private struct CodexBarStyleCardView: View {
         }
       }
 
-      if let resetCredits = card.resetCreditsText, !resetCredits.isEmpty {
-        if selection == "cursor" {
+      if !(selection == "claude" && !vm.claudeQuotaEnabled), let resetCredits = card.resetCreditsText, !resetCredits.isEmpty {
+        if selection == "cursor" || selection == "claude" {
           VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-              Text("按需超额用量")
+              Text(selection == "claude" ? "额外按量用量" : "按需超额用量")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(primaryText)
               Spacer(minLength: 4)
@@ -1415,6 +1452,8 @@ struct MenuBarPopoverView: View {
             DispatchQueue.main.async {
               if key == "cursor" {
                 vm.showCursorLoginSheet = true
+              } else if key == "claude" {
+                vm.showClaudeLoginSheet = true
               } else {
                 vm.startPluginLogin(key)
               }

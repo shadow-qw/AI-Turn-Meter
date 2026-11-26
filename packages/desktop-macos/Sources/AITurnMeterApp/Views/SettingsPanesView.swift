@@ -20,10 +20,11 @@ struct ProviderSettingsDetailView: View {
     let entry = vm.apps[key]
     let card = vm.usageData?.cards?[key]
     let latestTurn = entry?.latestTurn
-    let windows = card?.quotaWindows ?? []
+    let rawWindows = card?.quotaWindows ?? []
+    let windows = (key == "claude" && !vm.claudeQuotaEnabled) ? [] : rawWindows
     let appInstalled = entry?.installed ?? false
     let hasCliActivity = !windows.isEmpty
-      || card?.accountEmail != nil
+      || ((key != "claude" || vm.claudeQuotaEnabled) && card?.accountEmail != nil)
       || latestTurn != nil
       || (card?.today.turnCount ?? 0) > 0
       || (card?.days30.turnCount ?? 0) > 0
@@ -31,13 +32,19 @@ struct ProviderSettingsDetailView: View {
     let enabled = vm.isToolEnabled(key)
     let active = isAvailable && vm.isActiveOverall && enabled
     let isDimmed = !isAvailable || !enabled || !vm.masterEnabled
-    let needsInline = appInstalled && vm.isActiveOverall && enabled && entry?.cdpPort == nil
+    let needsInline = key != "claude" && appInstalled && vm.isActiveOverall && enabled && entry?.cdpPort == nil
 
     let statusText: String = {
       if !isAvailable { return "未安装" }
       if !vm.daemonOnline { return "后台未启动" }
       if !vm.masterEnabled { return "全局暂停" }
       if !enabled { return "已关闭" }
+      if key == "claude" {
+        if !vm.claudeQuotaEnabled {
+          return appInstalled ? ((entry?.running ?? false) ? "正常运行 · 纯本地" : "已安装 · 纯本地") : "正常运行 · CLI 纯本地"
+        }
+        return appInstalled ? ((entry?.running ?? false) ? "正常运行" : "已安装") : "正常运行 · CLI 模式"
+      }
       if let port = entry?.cdpPort { return "正常运行 · CDP:\(port)" }
       if !appInstalled { return "正常运行 · CLI 模式" }
       return "未开启调试口"
@@ -110,20 +117,47 @@ struct ProviderSettingsDetailView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
 
-            Divider().padding(.leading, 14)
-            settingsControlRow(title: "软件内置 TPS 显示") {
-              Toggle("", isOn: Binding(
-                get: { appInstalled && vm.inlineMasterEnabled && vm.isInlineToolEnabled(key) && vm.isActiveOverall },
-                set: { vm.setInlineToolEnabled(key, enabled: $0) }
-              ))
-              .toggleStyle(.switch)
-              .labelsHidden()
-              .controlSize(.small)
-              .disabled(!appInstalled || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
-              .help(appInstalled ? "在桌面客户端消息旁与 IDE 状态栏显示 TPS" : "仅桌面客户端支持内置 TPS 显示")
+            if key != "claude" {
+              Divider().padding(.leading, 14)
+              settingsControlRow(title: "软件内置 TPS 显示") {
+                Toggle("", isOn: Binding(
+                  get: { appInstalled && vm.inlineMasterEnabled && vm.isInlineToolEnabled(key) && vm.isActiveOverall },
+                  set: { vm.setInlineToolEnabled(key, enabled: $0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.small)
+                .disabled(!appInstalled || !enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
+                .help(appInstalled ? "在桌面客户端消息旁与 IDE 状态栏显示 TPS" : "仅桌面客户端支持内置 TPS 显示")
+              }
+            } else {
+              Divider().padding(.leading, 14)
+              HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text("联网同步 5h / 每周配额")
+                    .font(.system(size: 12.5))
+                    .foregroundColor(.primary)
+                  Text("默认关闭，仅纯本地离线统计 Token、费用与轮次（0 风控）")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                }
+                Spacer(minLength: 12)
+                Toggle("", isOn: Binding(
+                  get: { vm.claudeQuotaEnabled },
+                  set: { vm.setClaudeQuotaEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.small)
+                .disabled(!enabled || !vm.isActiveOverall || vm.busy || vm.runtime.runningFromDmg)
+                .help("开启后才会读取本机凭证或网页会话，并通过代理联网同步 Claude 5 小时与每周额度百分比")
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 10)
             }
 
-            if card?.accountEmail != nil || card?.planTitle != nil {
+            if (key != "claude" || vm.claudeQuotaEnabled), (card?.accountEmail != nil || card?.planTitle != nil) {
               Divider().padding(.leading, 14)
               settingsKVRow(
                 title: "账户",
@@ -134,7 +168,7 @@ struct ProviderSettingsDetailView: View {
           .opacity(isDimmed ? 0.42 : 1.0)
           .disabled(isDimmed)
 
-          if key == "cursor" || latestTurn != nil {
+          if key == "cursor" || (key == "claude" && vm.claudeQuotaEnabled) || latestTurn != nil {
             SettingsGroupCard {
               VStack(spacing: 0) {
                 if key == "cursor" {
@@ -157,12 +191,58 @@ struct ProviderSettingsDetailView: View {
                   }
                   .padding(.horizontal, 14)
                   .padding(.vertical, 10)
+                } else if key == "claude", vm.claudeQuotaEnabled {
+                  HStack(spacing: 8) {
+                    Text("会话授权")
+                      .font(.system(size: 12.5))
+                    Spacer()
+                    Button("读取本机") {
+                      vm.syncClaudeFromLocalApp()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(vm.busy)
+                    Button(vm.hasClaudeCookie ? "已连接 · 重新登录…" : "网页登录同步…") {
+                      vm.showClaudeLoginSheet = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    Button("Cookie…") {
+                      vm.claudeCookieDraft = ""
+                      vm.showClaudeCookieSheet = true
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+                    .foregroundColor(CodexBarPalette.accentBlue)
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.vertical, 10)
+                  Divider().padding(.leading, 14)
+                  HStack(spacing: 8) {
+                    Text("网络代理")
+                      .font(.system(size: 12.5))
+                    Spacer()
+                    Text(vm.claudeActiveProxySummary)
+                      .font(.system(size: 11.5))
+                      .monospacedDigit()
+                      .foregroundColor(vm.hasUsableClaudeProxy ? .secondary : .orange)
+                      .lineLimit(1)
+                      .truncationMode(.middle)
+                    Button("配置代理…") {
+                      vm.claudeProxyDraft = vm.claudeProxyUrl
+                      vm.showClaudeProxySheet = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.vertical, 10)
                 }
 
                 if let turn = latestTurn {
                   let summaryText = turn.inlineText ?? turn.tps.map { MeterFormat.tps($0) }
                   if let summary = summaryText, !summary.isEmpty {
-                    if key == "cursor" { Divider().padding(.leading, 14) }
+                    if key == "cursor" || (key == "claude" && vm.claudeQuotaEnabled) { Divider().padding(.leading, 14) }
                     HStack(spacing: 8) {
                       Text("最近轮次")
                         .font(.system(size: 12.5))
@@ -207,7 +287,10 @@ struct ProviderSettingsDetailView: View {
               }
               if let resetCredits = card?.resetCreditsText, !resetCredits.isEmpty {
                 Divider().padding(.leading, 14)
-                settingsKVRow(title: key == "cursor" ? "按需超额用量" : "附加额度", value: resetCredits)
+                settingsKVRow(
+                  title: key == "cursor" ? "按需超额用量" : (key == "claude" ? "额外按量用量" : "附加额度"),
+                  value: resetCredits
+                )
               }
               Divider().padding(.leading, 14)
             } else if key == "cursor" {
@@ -254,6 +337,74 @@ struct ProviderSettingsDetailView: View {
               if let resetCredits = card?.resetCreditsText, !resetCredits.isEmpty {
                 Divider().padding(.leading, 14)
                 settingsKVRow(title: "按需超额用量", value: resetCredits)
+              }
+              Divider().padding(.leading, 14)
+            } else if key == "claude", !vm.claudeQuotaEnabled {
+              HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text("套餐剩余额度（已关闭）")
+                    .font(.system(size: 12.5))
+                    .foregroundColor(.primary)
+                  Text("当前为纯本地离线模式，仅统计 ~/.claude 本地日志的 Token、费用与轮次，不联网请求 Claude")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                Button("开启同步") {
+                  vm.setClaudeQuotaEnabled(true)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(vm.busy || vm.runtime.runningFromDmg)
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 10)
+              Divider().padding(.leading, 14)
+            } else if key == "claude" {
+              HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text("套餐剩余额度")
+                    .font(.system(size: 12.5))
+                    .foregroundColor(.primary)
+                  Text(
+                    card?.quotaHint ?? (
+                      vm.hasClaudeCookie
+                        ? "未读取到套餐限额，可读取本机凭证或重新登录"
+                        : "可读取本机 Claude 桌面版登录态，或网页登录 claude.ai 同步额度"
+                    )
+                  )
+                  .font(.system(size: 11))
+                  .foregroundColor(.secondary)
+                  .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                Button("读取本机") {
+                  vm.syncClaudeFromLocalApp()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+                .tint(CodexBarPalette.accentBlue)
+                .disabled(vm.busy)
+
+                Button(vm.hasClaudeCookie ? "重登…" : "网页登录…") {
+                  vm.showClaudeLoginSheet = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+
+                Button("Cookie…") {
+                  vm.claudeCookieDraft = ""
+                  vm.showClaudeCookieSheet = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+              }
+              .padding(.horizontal, 14)
+              .padding(.vertical, 10)
+              if let resetCredits = card?.resetCreditsText, !resetCredits.isEmpty {
+                Divider().padding(.leading, 14)
+                settingsKVRow(title: "额外按量用量", value: resetCredits)
               }
               Divider().padding(.leading, 14)
             } else if let hint = card?.quotaHint, !hint.isEmpty {

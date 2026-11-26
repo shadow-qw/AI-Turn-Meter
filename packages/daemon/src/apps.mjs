@@ -24,6 +24,13 @@ export const APP_SPECS = {
     exeRelPath: 'Contents/MacOS/ChatGPT',
     port: Number(process.env.AI_TURN_METER_CODEX_CDP_PORT || 47921),
   },
+  claude: {
+    key: 'claude',
+    name: 'Claude',
+    bundleName: 'Claude.app',
+    exeRelPath: 'Contents/MacOS/Claude',
+    supportsCdp: false,
+  },
   cursor: {
     key: 'cursor',
     name: 'Cursor',

@@ -1,13 +1,35 @@
+import CFNetwork
 import Foundation
 import LocalAuthentication
 import Security
 
 enum HeadlessCliHelper {
   static func readCursorSafeStoragePasswords(allowPrompt: Bool) -> [String] {
+    readSafeStoragePasswords(service: "Cursor Safe Storage", accounts: ["Cursor Key", "Cursor"], allowPrompt: allowPrompt)
+  }
+
+  static func readClaudeCredentials(allowPrompt: Bool) -> (passwords: [String], cliCredentials: [String]) {
+    let passwords = readSafeStoragePasswords(
+      service: "Claude Safe Storage",
+      accounts: ["Claude Key", "Claude"],
+      allowPrompt: allowPrompt
+    )
+    var cliCredentials: [String] = []
+    let cliRes = readKeychainPassword(service: "Claude Code-credentials", account: nil, allowPrompt: allowPrompt)
+    if let raw = cliRes.password?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+      cliCredentials.append(raw)
+    }
+    return (passwords, cliCredentials)
+  }
+
+  private static func readSafeStoragePasswords(
+    service: String,
+    accounts: [String],
+    allowPrompt: Bool
+  ) -> [String] {
     var results: [String] = []
-    let accounts = ["Cursor Key", "Cursor"]
     for acct in accounts {
-      let res = readKeychainPassword(service: "Cursor Safe Storage", account: acct, allowPrompt: allowPrompt)
+      let res = readKeychainPassword(service: service, account: acct, allowPrompt: allowPrompt)
       if let pw = res.password, !results.contains(pw) {
         results.append(pw)
         if allowPrompt {
@@ -19,7 +41,7 @@ enum HeadlessCliHelper {
       }
     }
     if results.isEmpty {
-      let res = readKeychainPassword(service: "Cursor Safe Storage", account: nil, allowPrompt: allowPrompt)
+      let res = readKeychainPassword(service: service, account: nil, allowPrompt: allowPrompt)
       if let pw = res.password, !results.contains(pw) {
         results.append(pw)
       }
@@ -145,6 +167,22 @@ enum HeadlessCliHelper {
       }
       return true
     }
+    if args.contains("--read-claude-credentials") {
+      let allowPrompt = args.contains("--allow-prompt")
+      let creds = readClaudeCredentials(allowPrompt: allowPrompt)
+      let ok = !creds.passwords.isEmpty || !creds.cliCredentials.isEmpty
+      if let out = try? JSONSerialization.data(withJSONObject: [
+        "ok": ok,
+        "passwords": creds.passwords,
+        "cliCredentials": creds.cliCredentials,
+      ]),
+         let text = String(data: out, encoding: .utf8) {
+        print(text)
+      } else {
+        print("{\"ok\":false,\"passwords\":[],\"cliCredentials\":[]}")
+      }
+      return true
+    }
     return false
   }
 
@@ -208,6 +246,67 @@ enum HeadlessCliHelper {
     }
   }
 
+  static func hasActiveSystemProxy() -> Bool {
+    guard let raw = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
+      return false
+    }
+    let keys = ["HTTPEnable", "HTTPSEnable", "SOCKSEnable", "ProxyAutoConfigEnable", "ProxyAutoDiscoveryEnable"]
+    return keys.contains { key in
+      if let n = raw[key] as? NSNumber { return n.intValue == 1 }
+      if let b = raw[key] as? Bool { return b }
+      return false
+    }
+  }
+
+  private static func isLoopbackHost(_ host: String?) -> Bool {
+    let h = (host ?? "").lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+    return h == "127.0.0.1" || h == "localhost" || h == "::1"
+  }
+
+  private static func buildConnectionProxyDictionary(proxyUrl: String) -> [AnyHashable: Any]? {
+    guard let comps = URLComponents(string: proxyUrl),
+          let scheme = comps.scheme?.lowercased(),
+          let host = comps.host?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !host.isEmpty else {
+      return nil
+    }
+    let defaultPort: Int? = {
+      switch scheme {
+      case "http": return 80
+      case "https": return 443
+      case "socks5", "socks5h": return 1080
+      default: return nil
+      }
+    }()
+    guard let fallbackPort = defaultPort else { return nil }
+    let port = comps.port ?? fallbackPort
+    guard (1...65535).contains(port) else { return nil }
+
+    var dict: [AnyHashable: Any] = [
+      "ExcludeSimpleHostnames": 0,
+      "ExceptionsList": [] as [String],
+    ]
+    if scheme == "socks5" || scheme == "socks5h" {
+      dict["SOCKSEnable"] = 1
+      dict["SOCKSProxy"] = host
+      dict["SOCKSPort"] = port
+    } else {
+      dict["HTTPEnable"] = 1
+      dict["HTTPProxy"] = host
+      dict["HTTPPort"] = port
+      dict["HTTPSEnable"] = 1
+      dict["HTTPSProxy"] = host
+      dict["HTTPSPort"] = port
+    }
+    if let user = comps.user, !user.isEmpty {
+      dict[kCFProxyUsernameKey as String] = user
+    }
+    if let pass = comps.password, !pass.isEmpty {
+      dict[kCFProxyPasswordKey as String] = pass
+    }
+    return dict
+  }
+
   private static func runNetFetchJson() {
     let inputData = FileHandle.standardInput.readDataToEndOfFile()
     guard let obj = try? JSONSerialization.jsonObject(with: inputData) as? [String: Any],
@@ -220,6 +319,8 @@ enum HeadlessCliHelper {
     let timeoutMs = (obj["timeoutMs"] as? Double) ?? 8000.0
     let timeoutSec = max(1.0, timeoutMs / 1000.0)
     let manualRedirect = (obj["redirect"] as? String)?.lowercased() == "manual"
+    let proxyUrl = (obj["proxyUrl"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let strictProxy = (obj["strictProxy"] as? Bool) ?? false
 
     let cfg = URLSessionConfiguration.ephemeral
     cfg.httpShouldSetCookies = false
@@ -227,6 +328,17 @@ enum HeadlessCliHelper {
     cfg.urlCache = nil
     cfg.timeoutIntervalForRequest = timeoutSec
     cfg.timeoutIntervalForResource = timeoutSec + 2.0
+
+    if !proxyUrl.isEmpty {
+      guard let proxyDict = buildConnectionProxyDictionary(proxyUrl: proxyUrl) else {
+        print("{\"ok\":false,\"error\":\"invalid proxyUrl\"}")
+        return
+      }
+      cfg.connectionProxyDictionary = proxyDict
+    } else if strictProxy && !isLoopbackHost(url.host) && !hasActiveSystemProxy() {
+      print("{\"ok\":false,\"error\":\"strictProxy: no system proxy\"}")
+      return
+    }
 
     var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeoutSec)
     req.httpMethod = method

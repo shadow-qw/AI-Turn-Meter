@@ -1,21 +1,43 @@
 import assert from 'node:assert/strict';
+import { createCipheriv, createHash, pbkdf2Sync } from 'node:crypto';
 import { appendFileSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { openSingleApp } from '../packages/daemon/bin/cli.mjs';
 import {
   ClaudeCodeAdapter,
   parseClaudeCodeSessionContent,
 } from '../packages/daemon/src/adapters/claude-code.mjs';
+import { APP_SPECS } from '../packages/daemon/src/apps.mjs';
+import { getDefaultCdpSpecs } from '../packages/daemon/src/cdp-injector.mjs';
+import { httpRequestRaw, isLoopbackUrl, normalizeProxyUrl } from '../packages/daemon/src/net.mjs';
 import { estimateTurnCost } from '../packages/daemon/src/pricing.mjs';
 import {
   assembleAllQuotas,
   computeQuotaWindow,
+  decryptClaudeCookieValue,
+  decryptClaudeSafeStorageString,
+  decryptElectronSafeStorageBuffer,
+  extractOAuthTokensFromClaudeConfig,
   fetchAntigravityQuota,
+  fetchClaudeQuota,
+  formatClaudePlan,
+  getAllQuotas,
+  normalizeClaudeCookieInput,
   normalizeCodexRateWindows,
+  parseClaudeCliCredentialsJson,
+  parseClaudeQuotaUsage,
+  readClaudeDesktopCookies,
+  readClaudePlanUsageHistory,
+  readClaudeSettingsProxyUrl,
+  resetQuotaCacheForTests,
+  resolveClaudeProxyConfig,
 } from '../packages/daemon/src/quota.mjs';
+import { createMeterServer } from '../packages/daemon/src/server.mjs';
 import { TurnStore } from '../packages/daemon/src/store.mjs';
 
 function startMockAntigravityServer({ userStatus, quotaSummary, summaryStatus = 200 }) {
@@ -395,8 +417,8 @@ test('parseClaudeCodeSessionContent groups turns, deduplicates message.id chunks
 
   // Turn 1 assertions
   const t1 = turns[0];
-  assert.equal(t1.turnUid, 'claude_code:cc-sess-1:turn-1');
-  assert.equal(t1.tool, 'claude_code');
+  assert.equal(t1.turnUid, 'claude:cc-sess-1:turn-1');
+  assert.equal(t1.tool, 'claude');
   assert.equal(t1.host, 'claude-code');
   assert.equal(t1.sessionId, 'cc-sess-1');
   assert.equal(t1.turnId, 'turn-1');
@@ -425,7 +447,7 @@ test('parseClaudeCodeSessionContent groups turns, deduplicates message.id chunks
 
   // Turn 2 assertions
   const t2 = turns[1];
-  assert.equal(t2.turnUid, 'claude_code:cc-sess-1:turn-2');
+  assert.equal(t2.turnUid, 'claude:cc-sess-1:turn-2');
   assert.equal(t2.callCount, 1);
   assert.equal(t2.uncachedInputTokens, 100);
   assert.equal(t2.cacheReadTokens, 14000);
@@ -527,8 +549,8 @@ test('ClaudeCodeAdapter discovers ~/.claude/projects/*.jsonl and performs increm
     assert.ok(store.getIngestedFile(sessFileA));
     assert.ok(store.getIngestedFile(sessFileB));
     // sess-b lacked sessionId field in JSONL, so filename fallback 'sess-b' is used
-    assert.ok(first.some((r) => r.turnUid === 'claude_code:sess-b:turn-1'));
-    assert.ok(first.some((r) => r.turnUid === 'claude_code:sess-a:turn-1'));
+    assert.ok(first.some((r) => r.turnUid === 'claude:sess-b:turn-1'));
+    assert.ok(first.some((r) => r.turnUid === 'claude:sess-a:turn-1'));
 
     // Re-scanning unchanged files produces 0 changes (both in-memory and fresh adapter via ingested_files)
     assert.equal(adapter.scan().length, 0);
@@ -566,7 +588,7 @@ test('ClaudeCodeAdapter discovers ~/.claude/projects/*.jsonl and performs increm
 
     const second = adapter.scan();
     assert.equal(second.length, 1);
-    assert.equal(second[0].turnUid, 'claude_code:sess-a:turn-2');
+    assert.equal(second[0].turnUid, 'claude:sess-a:turn-2');
     assert.equal(second[0].totalInputTokens, 5200);
     assert.equal(second[0].outputTokens, 250);
     assert.equal(second[0].replyPreview, 'Reply A2');
@@ -581,5 +603,730 @@ test('ClaudeCodeAdapter discovers ~/.claude/projects/*.jsonl and performs increm
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function encryptElectronSafeStorage(plainBuffer, password) {
+  const key = pbkdf2Sync(Buffer.from(password, 'utf8'), Buffer.from('saltysalt', 'utf8'), 1003, 16, 'sha1');
+  const iv = Buffer.alloc(16, 0x20);
+  const cipher = createCipheriv('aes-128-cbc', key, iv);
+  const enc = Buffer.concat([cipher.update(plainBuffer), cipher.final()]);
+  return Buffer.concat([Buffer.from('v10', 'utf8'), enc]);
+}
+
+function startMockClaudeServer(handler) {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      handler(req, res);
+    });
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      resolve({
+        url: `http://127.0.0.1:${addr.port}`,
+        close: () => new Promise((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
+test('Claude Safe Storage decryption strips Chromium v24 host hash prefix on cookies but not oauth cache strings', () => {
+  const pw = 'synthetic-claude-keychain-pw';
+  const secretTokenJson = JSON.stringify({
+    'acct:user-1|client:org-1': { token: 'sk-ant-oat01-test', expiresAt: Date.now() + 3600_000 },
+  });
+  const encStringB64 = encryptElectronSafeStorage(Buffer.from(secretTokenJson, 'utf8'), pw).toString('base64');
+  assert.equal(decryptClaudeSafeStorageString(encStringB64, ['wrong', pw]), secretTokenJson);
+  assert.equal(decryptElectronSafeStorageBuffer(Buffer.from('plain'), [pw]), null);
+
+  const hostHash = createHash('sha256').update('.claude.ai').digest();
+  const cookiePlain = Buffer.concat([hostHash, Buffer.from('sk-ant-sid01-abc', 'utf8')]);
+  const encCookieV24 = encryptElectronSafeStorage(cookiePlain, pw);
+  assert.equal(decryptClaudeCookieValue(encCookieV24, '.claude.ai', [pw], 24), 'sk-ant-sid01-abc');
+
+  const encCookieLegacy = encryptElectronSafeStorage(Buffer.from('sk-ant-sid01-legacy', 'utf8'), pw);
+  assert.equal(decryptClaudeCookieValue(encCookieLegacy, '.claude.ai', [pw], 23), 'sk-ant-sid01-legacy');
+
+  assert.equal(normalizeClaudeCookieInput('Cookie: sessionKey=abc; cf_clearance=xyz'), 'sessionKey=abc; cf_clearance=xyz');
+  assert.equal(normalizeClaudeCookieInput('sk-ant-sid01-raw'), 'sessionKey=sk-ant-sid01-raw');
+});
+
+test('extractOAuthTokensFromClaudeConfig, readClaudeDesktopCookies, and readClaudePlanUsageHistory extract local state cleanly', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-local-'));
+  try {
+    const pw = 'synthetic-claude-keychain-pw';
+    const nowMs = Date.UTC(2026, 10, 25, 12, 0, 0);
+    const futureExp = nowMs + 7200_000;
+
+    const tokenMap = {
+      'acct:other-uuid|k1': { token: 'sk-ant-oat01-other', expiresAt: futureExp + 1000, subscriptionType: 'pro' },
+      'acct:active-uuid|k2': {
+        token: 'sk-ant-oat01-active',
+        expiresAt: futureExp,
+        subscriptionType: 'max',
+        rateLimitTier: 'default_claude_max_5x',
+      },
+      'acct:active-uuid|expired': { token: 'sk-ant-oat01-expired', expiresAt: nowMs - 1000 },
+    };
+    const cfg = {
+      lastKnownAccountUuid: 'ACTIVE-UUID',
+      'dxt:allowlistEnabled:11111111-2222-3333-4444-555555555555': true,
+      'oauth:tokenCacheV2': encryptElectronSafeStorage(Buffer.from(JSON.stringify(tokenMap), 'utf8'), pw).toString('base64'),
+    };
+    const extracted = extractOAuthTokensFromClaudeConfig(cfg, [pw], nowMs);
+    assert.equal(extracted.hasEncryptedOAuthCache, false);
+    assert.equal(extracted.fallbackOrgUuid, '11111111-2222-3333-4444-555555555555');
+    assert.equal(extracted.tokens.length, 2);
+    assert.equal(extracted.tokens[0].token, 'sk-ant-oat01-active');
+
+    const locked = extractOAuthTokensFromClaudeConfig(cfg, [], nowMs);
+    assert.equal(locked.hasEncryptedOAuthCache, true);
+    assert.equal(locked.tokens.length, 0);
+
+    const cliParsed = parseClaudeCliCredentialsJson(
+      JSON.stringify({ claudeAiOauth: { accessToken: 'sk-ant-oat01-cli', expiresAt: futureExp, subscriptionType: 'pro' } })
+    );
+    assert.equal(cliParsed.token, 'sk-ant-oat01-cli');
+
+    const dbPath = join(tmp, 'Cookies');
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, expires_utc INTEGER);
+    `);
+    db.prepare(`INSERT INTO meta (key, value) VALUES ('version', '24')`).run();
+    const futureChromeUtc = (nowMs + 86400_000 + 11644473600000) * 1000;
+    const hostHash = createHash('sha256').update('.claude.ai').digest();
+    db.prepare(`INSERT INTO cookies VALUES (?, ?, '', ?, ?)`).run(
+      '.claude.ai',
+      'sessionKey',
+      encryptElectronSafeStorage(Buffer.concat([hostHash, Buffer.from('sk-ant-sid01-cookie', 'utf8')]), pw),
+      futureChromeUtc
+    );
+    db.prepare(`INSERT INTO cookies VALUES (?, ?, '', ?, ?)`).run(
+      '.claude.ai',
+      'lastActiveOrg',
+      encryptElectronSafeStorage(Buffer.concat([hostHash, Buffer.from('org-uuid-123', 'utf8')]), pw),
+      futureChromeUtc
+    );
+    db.close();
+
+    const cookiesOk = readClaudeDesktopCookies(dbPath, [pw], nowMs);
+    assert.equal(cookiesOk.hasEncryptedCookies, false);
+    assert.equal(cookiesOk.lastActiveOrg, 'org-uuid-123');
+    assert.ok(cookiesOk.cookieHeader.includes('sessionKey=sk-ant-sid01-cookie'));
+
+    const cookiesLocked = readClaudeDesktopCookies(dbPath, [], nowMs);
+    assert.equal(cookiesLocked.cookieHeader, null);
+    assert.equal(cookiesLocked.hasEncryptedCookies, true);
+
+    const historyPath = join(tmp, 'plan-usage-history.json');
+    writeFileSync(
+      historyPath,
+      JSON.stringify({
+        version: 2,
+        samples: [{ t: nowMs - 600_000, org: 'org-uuid-123', u: { fh: 25, sd: 12 } }],
+      })
+    );
+    const hist = readClaudePlanUsageHistory(historyPath, nowMs);
+    assert.equal(hist.orgUuid, 'org-uuid-123');
+    assert.deepEqual(hist.latestSample.u, { fh: 25, sd: 12 });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('parseClaudeQuotaUsage and assembleAllQuotas normalize 5h/weekly, weekly cap, model limits, and extra_usage', () => {
+  const nowMs = Date.UTC(2026, 10, 25, 12, 0, 0);
+  const in3h = new Date(nowMs + 3 * 3600 * 1000).toISOString();
+  const in4d = new Date(nowMs + 4 * 86400 * 1000).toISOString();
+
+  assert.equal(formatClaudePlan('claude_max', 'default_claude_max_20x'), 'Max 20x');
+  assert.equal(formatClaudePlan('claude_pro', null), 'Pro');
+
+  const parsed = parseClaudeQuotaUsage(
+    {
+      five_hour: { utilization: 32, resets_at: in3h },
+      seven_day: { utilization: 18, resets_at: in4d },
+      seven_day_sonnet: { utilization: 5, resets_at: in4d },
+      limits: [
+        {
+          kind: 'weekly_scoped',
+          group: 'model',
+          percent: 12,
+          resets_at: in4d,
+          scope: { model: { display_name: 'Haiku' } },
+        },
+      ],
+      extra_usage: { is_enabled: true, monthly_limit: 5000, used_credits: 1250, currency: 'USD' },
+    },
+    { nowMs, accountEmail: 'user@claude.ai', planTitle: 'Max 5x' }
+  );
+
+  assert.equal(parsed.accountEmail, 'user@claude.ai');
+  assert.equal(parsed.planTitle, 'Max 5x');
+  assert.equal(parsed.resetCreditsText, '$12.50 / $50.00');
+  assert.equal(parsed.quotaWindows.length, 4);
+  assert.equal(parsed.quotaWindows[0].id, 'claude-5h');
+  assert.equal(parsed.quotaWindows[0].remainingPct, 68);
+  assert.equal(parsed.quotaWindows[0].group, 'Claude');
+  assert.equal(parsed.quotaWindows[0].windowKind, '5h');
+  assert.equal(parsed.quotaWindows[1].id, 'claude-weekly');
+  assert.equal(parsed.quotaWindows[1].remainingPct, 82);
+  assert.equal(parsed.quotaWindows[2].id, 'claude-sonnet-weekly');
+  assert.equal(parsed.quotaWindows[3].id, 'claude-limit-haiku');
+
+  // Weekly 100% exhaustion caps 5h window to 0% remaining
+  const capped = parseClaudeQuotaUsage(
+    {
+      five_hour: { utilization: 20, resets_at: in3h },
+      seven_day: { utilization: 100, resets_at: in4d },
+    },
+    { nowMs }
+  );
+  assert.equal(capped.quotaWindows[0].remainingPct, 0);
+
+  const assembled = assembleAllQuotas({
+    codex: { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null },
+    claude: parsed,
+    antigravity: { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null },
+    cursor: { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null },
+    codebuddy: { accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null },
+  });
+  const ovClaude = assembled.all.quotaWindows.find((w) => w.id === 'overview-claude');
+  assert.ok(ovClaude);
+  assert.equal(ovClaude.title, 'Claude');
+  assert.equal(ovClaude.remainingPct, 68);
+  assert.match(ovClaude.subtitle || '', /每周 82%/);
+  assert.equal(assembled.all.accountEmail, '1 个已登录账号');
+});
+
+test('fetchClaudeQuota handles OAuth priority, Web Cookie fallback, 429 stale grace, and offline history fallback', async () => {
+  resetQuotaCacheForTests();
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-fetch-'));
+  const homeDir = join(tmp, 'home');
+  const supportDir = join(tmp, 'support');
+  mkdirSync(join(homeDir, '.claude'), { recursive: true });
+  mkdirSync(supportDir, { recursive: true });
+
+  const nowMs = Date.UTC(2026, 10, 25, 14, 0, 0);
+  const in2h = new Date(nowMs + 2 * 3600 * 1000).toISOString();
+  const in3d = new Date(nowMs + 3 * 86400 * 1000).toISOString();
+
+  let oauthStatus = 200;
+  let webStatus = 200;
+
+  const mockSrv = await startMockClaudeServer((req, res) => {
+    if (req.url === '/api/oauth/usage') {
+      if (oauthStatus !== 200) {
+        res.writeHead(oauthStatus, { 'Content-Type': 'application/json', 'Retry-After': '120' });
+        res.end(JSON.stringify({ error: 'status' }));
+        return;
+      }
+      assert.equal(req.headers.authorization, 'Bearer sk-ant-oat01-cli');
+      assert.equal(req.headers['anthropic-beta'], 'oauth-2025-04-20');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          five_hour: { utilization: 15, resets_at: in2h },
+          seven_day: { utilization: 25, resets_at: in3d },
+        })
+      );
+      return;
+    }
+    if (req.url === '/api/oauth/profile') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          account: { email: 'oauth@claude.ai' },
+          organization: { organization_type: 'claude_max', rate_limit_tier: 'default_claude_max_5x' },
+        })
+      );
+      return;
+    }
+    if (req.url === '/api/organizations') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([{ uuid: 'org-web-1', name: 'Personal', capabilities: ['chat'], organization_type: 'claude_pro' }]));
+      return;
+    }
+    if (req.url === '/api/organizations/org-web-1/usage') {
+      if (webStatus !== 200) {
+        res.writeHead(webStatus, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'limited' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          five_hour: { utilization: 40, resets_at: in2h },
+          seven_day: { utilization: 50, resets_at: in3d },
+        })
+      );
+      return;
+    }
+    if (req.url === '/api/account') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          email_address: 'web@claude.ai',
+          memberships: [{ organization: { uuid: 'org-web-1', organization_type: 'claude_pro' } }],
+        })
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  try {
+    writeFileSync(
+      join(homeDir, '.claude', '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'sk-ant-oat01-cli', expiresAt: nowMs + 3600_000 } })
+    );
+
+    // 1. OAuth succeeds first
+    const rOAuth = await fetchClaudeQuota(nowMs, {
+      homeDir,
+      claudeAppSupportDir: supportDir,
+      claudeApiBaseUrl: mockSrv.url,
+      claudeWebBaseUrl: mockSrv.url,
+      forceRefresh: true,
+    });
+    assert.equal(rOAuth._ok, true);
+    assert.equal(rOAuth.source, 'oauth');
+    assert.equal(rOAuth.accountEmail, 'oauth@claude.ai');
+    assert.equal(rOAuth.planTitle, 'Max 5x');
+    assert.equal(rOAuth.quotaWindows[0].remainingPct, 85);
+
+    // 2. OAuth 401 -> Web Cookie fallback
+    oauthStatus = 401;
+    const rWeb = await fetchClaudeQuota(nowMs, {
+      homeDir,
+      claudeAppSupportDir: supportDir,
+      claudeApiBaseUrl: mockSrv.url,
+      claudeWebBaseUrl: mockSrv.url,
+      claudeCookie: 'sessionKey=sk-ant-sid01-web',
+      forceRefresh: true,
+    });
+    assert.equal(rWeb._ok, true);
+    assert.equal(rWeb.source, 'web');
+    assert.equal(rWeb.accountEmail, 'web@claude.ai');
+    assert.equal(rWeb.planTitle, 'Pro');
+    assert.equal(rWeb.quotaWindows[0].remainingPct, 60);
+
+    // 3. Stale grace preserves good snapshot via getAllQuotas when rate limited (429)
+    resetQuotaCacheForTests();
+    let claudeFetcherCalls = 0;
+    const qOffDefault = await getAllQuotas(nowMs, {
+      forceRefresh: true,
+      _fetchers: {
+        codex: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        claude: async () => {
+          claudeFetcherCalls += 1;
+          return rWeb;
+        },
+        antigravity: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        cursor: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        codebuddy: () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+      },
+    });
+    assert.equal(claudeFetcherCalls, 0);
+    assert.equal(qOffDefault.claude.quotaWindows.length, 0);
+    assert.equal(qOffDefault.claude.accountEmail, null);
+    assert.equal(qOffDefault.claude.planTitle, null);
+    assert.match(qOffDefault.claude.quotaHint || '', /纯本地离线/);
+
+    const q1 = await getAllQuotas(nowMs, {
+      forceRefresh: true,
+      claudeQuotaEnabled: true,
+      _fetchers: {
+        codex: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        claude: async () => rWeb,
+        antigravity: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        cursor: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        codebuddy: () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+      },
+    });
+    assert.equal(q1.claude.quotaWindows[0].remainingPct, 60);
+
+    const q2 = await getAllQuotas(nowMs + 60_000, {
+      forceRefresh: true,
+      claudeQuotaEnabled: true,
+      _fetchers: {
+        codex: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        claude: async () => ({
+          accountEmail: null,
+          planTitle: null,
+          quotaWindows: [],
+          resetCreditsText: null,
+          _errorKind: 'rate_limit',
+        }),
+        antigravity: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        cursor: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        codebuddy: () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+      },
+    });
+    assert.equal(q2.claude.quotaWindows[0].remainingPct, 60);
+
+    // Turning claudeQuotaEnabled back off immediately clears stale-grace windows
+    const qOffAfterOn = await getAllQuotas(nowMs + 90_000, {
+      forceRefresh: true,
+      claudeQuotaEnabled: false,
+      _fetchers: {
+        codex: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        claude: async () => {
+          claudeFetcherCalls += 1;
+          return rWeb;
+        },
+        antigravity: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        cursor: async () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+        codebuddy: () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null }),
+      },
+    });
+    assert.equal(claudeFetcherCalls, 0);
+    assert.equal(qOffAfterOn.claude.quotaWindows.length, 0);
+    assert.match(qOffAfterOn.claude.quotaHint || '', /纯本地离线/);
+
+    // 4. Offline local plan-usage-history.json weak fallback
+    writeFileSync(
+      join(supportDir, 'plan-usage-history.json'),
+      JSON.stringify({
+        version: 2,
+        samples: [{ t: nowMs - 300_000, org: 'org-web-1', u: { fh: 12, sd: 34 } }],
+      })
+    );
+    const rHist = await fetchClaudeQuota(nowMs, {
+      allowNetwork: false,
+      homeDir: join(tmp, 'empty-home'),
+      claudeAppSupportDir: supportDir,
+      forceRefresh: true,
+    });
+    assert.equal(rHist._ok, true);
+    assert.equal(rHist.source, 'local-history');
+    assert.equal(rHist.quotaWindows[0].remainingPct, 88);
+    assert.equal(rHist.quotaWindows[1].remainingPct, 66);
+  } finally {
+    await mockSrv.close();
+    resetQuotaCacheForTests();
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('createMeterServer exposes hasClaudeCookie config and ingests ~/.claude sessions under tool=claude', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-srv-'));
+  const stateDir = join(tmp, 'state');
+  const claudeRoot = join(tmp, 'dot-claude');
+  const projDir = join(claudeRoot, 'projects', '-Users-dev-proj');
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(projDir, { recursive: true });
+
+  writeFileSync(
+    join(projDir, 's1.jsonl'),
+    [
+      JSON.stringify({
+        type: 'user',
+        sessionId: 's1',
+        cwd: '/Users/dev/proj',
+        timestamp: new Date(Date.now() - 5000).toISOString(),
+        message: { role: 'user', content: 'hi' },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        sessionId: 's1',
+        cwd: '/Users/dev/proj',
+        timestamp: new Date(Date.now() - 1000).toISOString(),
+        message: {
+          id: 'm1',
+          model: 'claude-sonnet-4-5-20250929',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'hello' }],
+          usage: { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 80 },
+        },
+      }),
+    ].join('\n') + '\n'
+  );
+
+  const srv = createMeterServer({
+    port: 0,
+    dbPath: join(stateDir, 'meter.db'),
+    stateDir,
+    claudeRoot,
+    authToken: 'test-token-claude',
+    enableWatchers: true,
+    enableCdp: false,
+    enableAntigravityRpc: false,
+    enableQuotaProbe: false,
+    enableExternalProviders: false,
+  });
+
+  try {
+    const addr = await srv.start();
+    const base = `http://127.0.0.1:${addr.port}`;
+
+    // Default config keeps claudeQuotaEnabled=false and blocks /v1/claude/sync-local
+    const initStateRes = await fetch(`${base}/v1/state`);
+    assert.equal(initStateRes.status, 200);
+    const initStateJson = await initStateRes.json();
+    assert.equal(initStateJson.config.claudeQuotaEnabled, false);
+
+    const syncDisabledRes = await fetch(`${base}/v1/claude/sync-local`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ATM-Token': 'test-token-claude',
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(syncDisabledRes.status, 400);
+    const syncDisabledJson = await syncDisabledRes.json();
+    assert.equal(syncDisabledJson.ok, false);
+
+    // Toggle claudeQuotaEnabled on & off via POST /v1/config
+    const enableQuotaRes = await fetch(`${base}/v1/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ATM-Token': 'test-token-claude',
+      },
+      body: JSON.stringify({ claudeQuotaEnabled: true }),
+    });
+    assert.equal(enableQuotaRes.status, 200);
+    const enableQuotaJson = await enableQuotaRes.json();
+    assert.equal(enableQuotaJson.config.claudeQuotaEnabled, true);
+
+    const disableQuotaRes = await fetch(`${base}/v1/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ATM-Token': 'test-token-claude',
+      },
+      body: JSON.stringify({ claudeQuotaEnabled: false }),
+    });
+    assert.equal(disableQuotaRes.status, 200);
+    const disableQuotaJson = await disableQuotaRes.json();
+    assert.equal(disableQuotaJson.config.claudeQuotaEnabled, false);
+
+    const cfgRes = await fetch(`${base}/v1/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ATM-Token': 'test-token-claude',
+      },
+      body: JSON.stringify({ claudeCookie: 'sessionKey=sk-ant-sid01-xyz' }),
+    });
+    assert.equal(cfgRes.status, 200);
+    const cfgJson = await cfgRes.json();
+    assert.equal(cfgJson.config.hasClaudeCookie, true);
+    assert.equal(cfgJson.config.claudeQuotaEnabled, false);
+    assert.equal(cfgJson.config.tools.claude, true);
+
+    const usageRes = await fetch(`${base}/v1/usage?days=7`);
+    assert.equal(usageRes.status, 200);
+    const usageJson = await usageRes.json();
+    assert.ok(usageJson.cards.claude);
+    assert.equal(usageJson.cards.claude.today.turnCount, 1);
+
+    // Invalid claudeProxyUrl returns HTTP 400 and preserves previous config
+    const badProxyRes = await fetch(`${base}/v1/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ATM-Token': 'test-token-claude',
+      },
+      body: JSON.stringify({ claudeProxyUrl: 'ftp://invalid-proxy:21' }),
+    });
+    assert.equal(badProxyRes.status, 400);
+    const badProxyJson = await badProxyRes.json();
+    assert.equal(badProxyJson.ok, false);
+
+    // Valid claudeProxyUrl persists & reflects effectiveClaudeProxyUrl + source='config'
+    const okProxyRes = await fetch(`${base}/v1/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ATM-Token': 'test-token-claude',
+      },
+      body: JSON.stringify({ claudeProxyUrl: 'http://127.0.0.1:17890/' }),
+    });
+    assert.equal(okProxyRes.status, 200);
+    const okProxyJson = await okProxyRes.json();
+    assert.equal(okProxyJson.config.claudeProxyUrl, 'http://127.0.0.1:17890');
+    assert.equal(okProxyJson.config.effectiveClaudeProxyUrl, 'http://127.0.0.1:17890');
+    assert.equal(okProxyJson.config.claudeProxySource, 'config');
+
+    // Empty string clears manual claudeProxyUrl override
+    const clearProxyRes = await fetch(`${base}/v1/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ATM-Token': 'test-token-claude',
+      },
+      body: JSON.stringify({ claudeProxyUrl: '   ' }),
+    });
+    assert.equal(clearProxyRes.status, 200);
+    const clearProxyJson = await clearProxyRes.json();
+    assert.equal(clearProxyJson.config.claudeProxyUrl, null);
+  } finally {
+    await srv.stop();
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('strict proxy resolution, fail-closed anti-IP-leak guards, and Claude CDP exclusion', async () => {
+  assert.equal(normalizeProxyUrl(' http://127.0.0.1:17890/ '), 'http://127.0.0.1:17890');
+  assert.equal(normalizeProxyUrl('socks5h://127.0.0.1:7891'), 'socks5h://127.0.0.1:7891');
+  assert.equal(normalizeProxyUrl('ftp://127.0.0.1:21'), null);
+  assert.equal(normalizeProxyUrl('http://127.0.0.1:99999'), null);
+  assert.equal(normalizeProxyUrl(''), null);
+
+  assert.equal(isLoopbackUrl('http://127.0.0.1:47831/health'), true);
+  assert.equal(isLoopbackUrl('http://localhost:8080/test'), true);
+  assert.equal(isLoopbackUrl('http://[::1]:8080/test'), true);
+  assert.equal(isLoopbackUrl('https://api.anthropic.com/api/oauth/usage'), false);
+  assert.equal(isLoopbackUrl('https://claude.ai/api/organizations'), false);
+
+  // Precedence: config > claude_settings > env > system > none
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-proxy-'));
+  const homeDir = join(tmp, 'home');
+  const supportDir = join(tmp, 'support');
+  mkdirSync(join(homeDir, '.claude'), { recursive: true });
+  mkdirSync(supportDir, { recursive: true });
+
+  const envKeys = ['HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'HTTP_PROXY', 'http_proxy'];
+  const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
+
+  try {
+    assert.equal(readClaudeSettingsProxyUrl(homeDir), null);
+    assert.deepEqual(resolveClaudeProxyConfig({ homeDir, env: {}, systemProxyState: null }), {
+      proxyUrl: null,
+      source: 'none',
+    });
+
+    writeFileSync(
+      join(homeDir, '.claude', 'settings.json'),
+      JSON.stringify({ env: { HTTPS_PROXY: 'http://127.0.0.1:17890/' } })
+    );
+    assert.equal(readClaudeSettingsProxyUrl(homeDir), 'http://127.0.0.1:17890');
+
+    assert.deepEqual(
+      resolveClaudeProxyConfig({
+        claudeProxyUrl: 'socks5://127.0.0.1:10808',
+        homeDir,
+        env: { HTTPS_PROXY: 'http://127.0.0.1:8888' },
+        systemProxyState: { hasSystemProxy: true, fallbackProxyUrl: 'http://127.0.0.1:7890' },
+      }),
+      { proxyUrl: 'socks5://127.0.0.1:10808', source: 'config' }
+    );
+    assert.deepEqual(
+      resolveClaudeProxyConfig({
+        homeDir,
+        env: { HTTPS_PROXY: 'http://127.0.0.1:8888' },
+        systemProxyState: { hasSystemProxy: true, fallbackProxyUrl: 'http://127.0.0.1:7890' },
+      }),
+      { proxyUrl: 'http://127.0.0.1:17890', source: 'claude_settings' }
+    );
+    assert.deepEqual(
+      resolveClaudeProxyConfig({
+        homeDir: join(tmp, 'no-settings'),
+        env: { HTTPS_PROXY: 'http://127.0.0.1:8888' },
+        systemProxyState: { hasSystemProxy: true, fallbackProxyUrl: 'http://127.0.0.1:7890' },
+      }),
+      { proxyUrl: 'http://127.0.0.1:8888', source: 'env' }
+    );
+    assert.deepEqual(
+      resolveClaudeProxyConfig({
+        homeDir: join(tmp, 'no-settings'),
+        env: {},
+        systemProxyState: { hasSystemProxy: true, fallbackProxyUrl: 'http://127.0.0.1:7890' },
+      }),
+      { proxyUrl: 'http://127.0.0.1:7890', source: 'system' }
+    );
+
+    // httpRequestRaw strictProxy fail-closed: missing proxy never calls _directFetch
+    let directCalls = 0;
+    const directSpy = async () => {
+      directCalls += 1;
+      throw new Error('direct fetch must not be called');
+    };
+    const noProxyRes = await httpRequestRaw('https://api.anthropic.com/api/oauth/usage', {
+      strictProxy: true,
+      _proxyState: { hasSystemProxy: false, fallbackProxyUrl: null },
+      _nativeHelperBin: null,
+      _directFetch: directSpy,
+    });
+    assert.equal(noProxyRes.ok, false);
+    assert.equal(noProxyRes.errorKind, 'proxy_required');
+    assert.equal(directCalls, 0);
+
+    // httpRequestRaw strictProxy fail-closed: unreachable explicit proxy never falls back to direct
+    const badProxyRes = await httpRequestRaw('https://api.anthropic.com/api/oauth/usage', {
+      proxyUrl: 'http://127.0.0.1:1',
+      strictProxy: true,
+      timeoutMs: 1000,
+      _proxyState: { hasSystemProxy: false, fallbackProxyUrl: null },
+      _nativeHelperBin: null,
+      _directFetch: directSpy,
+    });
+    assert.equal(badProxyRes.ok, false);
+    assert.equal(badProxyRes.errorKind, 'network');
+    assert.equal(directCalls, 0);
+
+    // fetchClaudeQuota strictProxy fail-closed with zero proxy available never invokes network
+    for (const k of envKeys) delete process.env[k];
+    resetQuotaCacheForTests();
+    const emptyHome = join(tmp, 'empty-home');
+    mkdirSync(join(emptyHome, '.claude'), { recursive: true });
+    writeFileSync(
+      join(emptyHome, '.claude', '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'sk-ant-oat01-failclosed', expiresAt: Date.now() + 3600_000 } })
+    );
+    let spyFetchCalls = 0;
+    const failClosedQuota = await fetchClaudeQuota(Date.now(), {
+      homeDir: emptyHome,
+      claudeAppSupportDir: supportDir,
+      claudeApiBaseUrl: 'https://api.anthropic.com',
+      claudeWebBaseUrl: 'https://claude.ai',
+      claudeCookie: 'sessionKey=sk-ant-sid01-failclosed',
+      requireProxy: true,
+      _proxyState: { hasSystemProxy: false, fallbackProxyUrl: null },
+      _nativeHelperBin: null,
+      _directFetch: directSpy,
+      fetchImpl: async () => {
+        spyFetchCalls += 1;
+        throw new Error('fetchImpl must not be called when proxy is missing');
+      },
+      forceRefresh: true,
+    });
+    assert.equal(failClosedQuota._ok, false);
+    assert.equal(failClosedQuota._errorKind, 'proxy_required');
+    assert.match(failClosedQuota.quotaHint || '', /阻止直连/);
+    assert.equal(spyFetchCalls, 0);
+    assert.equal(directCalls, 0);
+
+    // Claude CDP exclusion: packaged Claude.app must not receive --remote-debugging-port
+    assert.equal(APP_SPECS.claude.supportsCdp, false);
+    assert.equal(getDefaultCdpSpecs().some((s) => s.tool === 'claude'), false);
+    const execCalls = [];
+    const opened = await openSingleApp('claude', {
+      exitOnError: false,
+      resolveAppPathsFn: (spec) => ({
+        ...spec,
+        installed: true,
+        appPath: '/Applications/Claude.app',
+      }),
+      execFileSyncFn: (cmd, args) => {
+        execCalls.push({ cmd, args });
+      },
+    });
+    assert.equal(opened, true);
+    assert.equal(execCalls.length, 1);
+    assert.deepEqual(execCalls[0], { cmd: 'open', args: ['-a', '/Applications/Claude.app'] });
+  } finally {
+    for (const k of envKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    resetQuotaCacheForTests();
+    rmSync(tmp, { recursive: true, force: true });
   }
 });

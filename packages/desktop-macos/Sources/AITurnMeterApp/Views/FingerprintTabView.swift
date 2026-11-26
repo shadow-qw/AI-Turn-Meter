@@ -159,7 +159,7 @@ struct FingerprintTabView: View {
             if let ov = vm.fingerprintOverview {
               Divider()
 
-              ForEach(Array(["codex", "antigravity", "cursor", "codebuddy"].enumerated()), id: \.element) { idx, key in
+              ForEach(Array(["codex", "claude", "antigravity", "cursor", "codebuddy"].enumerated()), id: \.element) { idx, key in
                 if idx > 0 { Divider().padding(.leading, 40) }
                 let info = ov.passive.byTool[key]
                 let modelText: String = {

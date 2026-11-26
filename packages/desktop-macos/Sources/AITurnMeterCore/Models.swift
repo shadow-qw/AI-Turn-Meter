@@ -419,7 +419,7 @@ public struct CardSessionSummary: Decodable, Identifiable, Equatable {
 }
 
 public enum ProviderOrder {
-  public static let defaultBuiltIn: [String] = ["codex", "cursor", "antigravity", "codebuddy"]
+  public static let defaultBuiltIn: [String] = ["codex", "claude", "cursor", "antigravity", "codebuddy"]
 
   public static func resolve(saved: [String], available: [String]) -> [String] {
     let availSet = Set(available)
@@ -684,6 +684,11 @@ public struct MeterConfigPayload: Decodable {
   public let inlineEnabled: Bool?
   public let inlineTools: [String: Bool]?
   public let hasCursorCookie: Bool?
+  public let hasClaudeCookie: Bool?
+  public let claudeProxyUrl: String?
+  public let effectiveClaudeProxyUrl: String?
+  public let claudeProxySource: String?
+  public let claudeQuotaEnabled: Bool?
 }
 
 public struct StatusAppEntry: Decodable {

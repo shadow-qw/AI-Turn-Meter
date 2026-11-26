@@ -31,6 +31,7 @@ import {
 } from '../src/apps.mjs';
 import { formatTokens, formatTps } from '../src/format.mjs';
 import { AUTH_TOKEN_HEADER, defaultTokenPath, readDaemonToken } from '../src/auth.mjs';
+import { normalizeProxyUrl, resolveClaudeProxyConfig } from '../src/net.mjs';
 import {
   applyLocalSshConfig,
   applyRemoteCursorHooks,
@@ -59,13 +60,19 @@ function getPkgVersion() {
 }
 
 function readLocalPublicConfig() {
-  const toolKeys = ['antigravity', 'codex', 'cursor', 'codebuddy'];
+  const toolKeys = ['antigravity', 'codex', 'claude', 'cursor', 'codebuddy'];
+  const defaultProxy = resolveClaudeProxyConfig({});
   const defaults = {
     enabled: true,
-    tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    tools: { antigravity: true, codex: true, claude: true, cursor: true, codebuddy: true },
     inlineEnabled: true,
-    inlineTools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    inlineTools: { antigravity: true, codex: true, claude: true, cursor: true, codebuddy: true },
     hasCursorCookie: false,
+    hasClaudeCookie: false,
+    claudeProxyUrl: null,
+    effectiveClaudeProxyUrl: defaultProxy.proxyUrl || null,
+    claudeProxySource: defaultProxy.source,
+    claudeQuotaEnabled: false,
   };
   try {
     const cfgPath = join(dirname(defaultTokenPath()), 'config.json');
@@ -85,12 +92,20 @@ function readLocalPublicConfig() {
       }
     }
     const cookie = typeof raw?.cursorCookie === 'string' ? raw.cursorCookie.trim() : '';
+    const claudeCookie = typeof raw?.claudeCookie === 'string' ? raw.claudeCookie.trim() : '';
+    const claudeProxyUrl = normalizeProxyUrl(raw?.claudeProxyUrl);
+    const claudeProxy = resolveClaudeProxyConfig({ claudeProxyUrl });
     return {
       enabled: typeof raw?.enabled === 'boolean' ? raw.enabled : true,
       tools,
       inlineEnabled: typeof raw?.inlineEnabled === 'boolean' ? raw.inlineEnabled : true,
       inlineTools,
       hasCursorCookie: Boolean(cookie),
+      hasClaudeCookie: Boolean(claudeCookie),
+      claudeProxyUrl: claudeProxyUrl || null,
+      effectiveClaudeProxyUrl: claudeProxy.proxyUrl || null,
+      claudeProxySource: claudeProxy.source,
+      claudeQuotaEnabled: raw?.claudeQuotaEnabled === true,
     };
   } catch {
     return defaults;
@@ -179,11 +194,13 @@ async function cmdStatus(jsonMode = false) {
   for (const [key, app] of Object.entries(apps)) {
     const cdpLabel = !app.installed
       ? '未安装'
-      : app.cdpPort
-        ? `CDP:${app.cdpPort}`
-        : key === 'antigravity'
-          ? 'CDP未检测到'
-          : 'CDP未启用';
+      : APP_SPECS[key]?.supportsCdp === false
+        ? '免CDP'
+        : app.cdpPort
+          ? `CDP:${app.cdpPort}`
+          : key === 'antigravity'
+            ? 'CDP未检测到'
+            : 'CDP未启用';
     const t = app.latestTurn;
     console.log(`- ${key.padEnd(11)} [${cdpLabel}]  ${t ? `${t.model} | ${t.inlineText}` : '暂无记录'}`);
   }
@@ -231,7 +248,13 @@ export function formatDoctorReport(report, cliVersion = getPkgVersion()) {
     const parts = [app.installed ? app.appPath : '未安装'];
     let appMark = app.installed ? 'INFO' : 'SKIP';
     if (app.installed) {
-      parts.push(app.cdpPort ? `CDP:${app.cdpPort}` : 'CDP未启用');
+      parts.push(
+        APP_SPECS[key]?.supportsCdp === false
+          ? '免CDP'
+          : app.cdpPort
+            ? `CDP:${app.cdpPort}`
+            : 'CDP未启用'
+      );
       if (key === 'cursor' || key === 'codebuddy') {
         const vsixMismatch = Boolean(
           app.vsixVersionMismatch ?? (app.vsixVersion && app.vsixVersion !== resolvedCliVersion)
@@ -294,13 +317,20 @@ export async function openSingleApp(
 
   const baseSpec = APP_SPECS[target];
   if (!baseSpec) {
-    return fail(`Unknown app "${target}". Choose: codex | cursor | codebuddy | antigravity | all`);
+    return fail(`Unknown app "${target}". Choose: codex | claude | cursor | codebuddy | antigravity | all`);
   }
   const spec = resolveAppPathsFn(baseSpec);
   if (!spec.installed || !spec.appPath) {
     return fail(`Not installed: ${spec.bundleName}`);
   }
   const launchEnv = buildCleanLaunchEnv(baseEnv);
+  if (spec.supportsCdp === false) {
+    execFileSyncFn('open', ['-a', spec.appPath], { env: launchEnv });
+    console.log(
+      `Opened ${spec.name} (official ${spec.bundleName} disables --remote-debugging-port; quota syncs without CDP)`
+    );
+    return true;
+  }
   const activePort = readActivePortFn(spec);
   if (activePort && (await isCdpHttpReadyFn(activePort))) {
     execFileSyncFn('open', ['-a', spec.appPath], { env: launchEnv });
@@ -383,6 +413,7 @@ async function cmdOpen(target) {
     let allOk = true;
     for (const k of ['antigravity', 'codex', 'cursor', 'codebuddy']) {
       if (cfg.tools?.[k] === false) continue;
+      if (APP_SPECS[k]?.supportsCdp === false) continue;
       if (resolveAppPaths(APP_SPECS[k]).installed) {
         const ok = await openSingleApp(k, { exitOnError: false });
         if (!ok) allOk = false;
@@ -423,7 +454,11 @@ async function cmdCost(flags, jsonMode = false) {
     const { getAllQuotas } = await import('../src/quota.mjs');
     const store = new TurnStore();
     try {
-      const quotasByTool = await getAllQuotas().catch(() => null);
+      const localCfg = readLocalPublicConfig();
+      const quotasByTool = await getAllQuotas(Date.now(), {
+        claudeProxyUrl: localCfg.claudeProxyUrl,
+        claudeQuotaEnabled: localCfg.claudeQuotaEnabled === true,
+      }).catch(() => null);
       usage = store.getUsageSummary({ days, tool, quotasByTool });
     } finally {
       store.close();

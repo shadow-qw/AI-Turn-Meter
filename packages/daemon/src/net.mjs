@@ -16,6 +16,99 @@ export function resetNetProxyCacheForTests() {
   inflightProxyPromise = null;
 }
 
+export function normalizeProxyUrl(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const scheme = parsed.protocol.toLowerCase();
+    if (
+      scheme !== 'http:' &&
+      scheme !== 'https:' &&
+      scheme !== 'socks5:' &&
+      scheme !== 'socks5h:'
+    ) {
+      return null;
+    }
+    if (!parsed.hostname) return null;
+    const defaultPort = scheme === 'https:' ? '443' : scheme === 'http:' ? '80' : '1080';
+    const portNum = Number(parsed.port || defaultPort);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return null;
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return null;
+  }
+}
+
+export function isLoopbackUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return false;
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
+export const PROXY_ENV_KEYS = [
+  'HTTPS_PROXY',
+  'https_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+];
+
+export function readClaudeSettingsProxyUrl(homeDir = homedir()) {
+  try {
+    const settingsPath = join(homeDir, '.claude', 'settings.json');
+    if (!existsSync(settingsPath)) return null;
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    const envObj = parsed?.env;
+    if (!envObj || typeof envObj !== 'object') return null;
+    for (const k of PROXY_ENV_KEYS) {
+      const normalized = normalizeProxyUrl(envObj[k]);
+      if (normalized) return normalized;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveClaudeProxyConfig({
+  claudeProxyUrl = null,
+  homeDir = homedir(),
+  env = process.env,
+  systemProxyState = null,
+} = {}) {
+  const fromConfig = normalizeProxyUrl(claudeProxyUrl);
+  if (fromConfig) {
+    return { proxyUrl: fromConfig, source: 'config' };
+  }
+  const fromSettings = readClaudeSettingsProxyUrl(homeDir);
+  if (fromSettings) {
+    return { proxyUrl: fromSettings, source: 'claude_settings' };
+  }
+  if (env && typeof env === 'object') {
+    for (const k of PROXY_ENV_KEYS) {
+      const fromEnv = normalizeProxyUrl(env[k]);
+      if (fromEnv) {
+        return { proxyUrl: fromEnv, source: 'env' };
+      }
+    }
+  }
+  const fromSystem = normalizeProxyUrl(systemProxyState?.fallbackProxyUrl);
+  if (fromSystem) {
+    return { proxyUrl: fromSystem, source: 'system' };
+  }
+  if (systemProxyState?.hasSystemProxy) {
+    return { proxyUrl: null, source: 'system' };
+  }
+  return { proxyUrl: null, source: 'none' };
+}
+
 export function parseSystemProxyInfo(scutilOutput = '', env = process.env) {
   const envProxy =
     env.HTTPS_PROXY ||
@@ -217,7 +310,15 @@ function classifyHttpResult(status, text, headers, latencyMs) {
 async function nativeUrlSessionFetchRaw(
   helperBin,
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, redirect = 'follow' }
+  {
+    method = 'GET',
+    headers = {},
+    body = null,
+    timeoutMs = 8000,
+    redirect = 'follow',
+    proxyUrl = null,
+    strictProxy = false,
+  }
 ) {
   const startedAt = Date.now();
   const payload = JSON.stringify({
@@ -227,6 +328,8 @@ async function nativeUrlSessionFetchRaw(
     body: body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
     timeoutMs,
     redirect,
+    proxyUrl: proxyUrl || null,
+    strictProxy: Boolean(strictProxy),
   });
   const res = await runProcessWithStdin(helperBin, ['--net-fetch-json'], payload, timeoutMs + 3000);
   const latencyMs = Date.now() - startedAt;
@@ -309,7 +412,7 @@ export async function curlFetchRaw(
       '\n__ATM_HTTP:%{http_code}\n__ATM_URL:%{url_effective}',
     ];
     if (proxyUrl) {
-      args.push('--proxy', proxyUrl);
+      args.push('--proxy', proxyUrl, '--noproxy', '');
     }
     const escapeCurlCfgVal = (s) =>
       String(s).replace(/[\r\n\0]+/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -403,6 +506,9 @@ export async function httpRequestRaw(
     body = null,
     timeoutMs = 8000,
     redirect = 'follow',
+    preferNative = false,
+    proxyUrl = null,
+    strictProxy = false,
     fetchImpl = null,
     _nativeHelperBin = undefined,
     _proxyState = undefined,
@@ -412,6 +518,26 @@ export async function httpRequestRaw(
   const startedAt = Date.now();
   const bodyStr =
     body !== null && body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined;
+
+  const helperBin = _nativeHelperBin !== undefined ? _nativeHelperBin : resolveAppHelperBin();
+  const proxyState = _proxyState !== undefined ? _proxyState : await getProxyState();
+  const explicitProxy = normalizeProxyUrl(proxyUrl);
+  const effectiveProxyUrl = explicitProxy || proxyState.fallbackProxyUrl || null;
+  const hasUsableProxy = Boolean(effectiveProxyUrl || proxyState.hasSystemProxy);
+  const targetIsLoopback = isLoopbackUrl(url);
+
+  if (strictProxy && !targetIsLoopback && !hasUsableProxy) {
+    return {
+      ok: false,
+      status: null,
+      text: '',
+      headers: {},
+      finalUrl: null,
+      latencyMs: 0,
+      errorKind: 'proxy_required',
+      errorMessage: '未检测到可用代理，已阻止直连',
+    };
+  }
 
   if (typeof fetchImpl === 'function') {
     try {
@@ -443,49 +569,68 @@ export async function httpRequestRaw(
     }
   }
 
-  const helperBin = _nativeHelperBin !== undefined ? _nativeHelperBin : resolveAppHelperBin();
-  const proxyState = _proxyState !== undefined ? _proxyState : await getProxyState();
   const directFetch = typeof _directFetch === 'function' ? _directFetch : fetch;
+  const enforceNoDirect = Boolean(!targetIsLoopback && (strictProxy || explicitProxy || proxyState.hasSystemProxy));
 
-  if (helperBin && proxyState.hasSystemProxy) {
+  if (helperBin && (preferNative || hasUsableProxy)) {
     const nativeRes = await nativeUrlSessionFetchRaw(helperBin, url, {
       method,
       headers,
       body: bodyStr ?? null,
       timeoutMs,
       redirect,
+      proxyUrl: effectiveProxyUrl,
+      strictProxy: Boolean(strictProxy && !targetIsLoopback),
     });
     if (nativeRes.status !== null) {
       return nativeRes;
     }
-    if (proxyState.fallbackProxyUrl) {
+    if (effectiveProxyUrl) {
       const curlRes = await curlFetchRaw(url, {
         method,
         headers,
         body: bodyStr ?? null,
         timeoutMs,
-        proxyUrl: proxyState.fallbackProxyUrl,
+        proxyUrl: effectiveProxyUrl,
         redirect,
       });
       if (curlRes.status !== null) {
         return curlRes;
       }
+      if (enforceNoDirect) {
+        return curlRes;
+      }
     }
-    return nativeRes;
+    if (!preferNative || enforceNoDirect) {
+      return nativeRes;
+    }
   }
 
-  if (!helperBin && proxyState.hasSystemProxy && proxyState.fallbackProxyUrl) {
+  if (effectiveProxyUrl && (explicitProxy || (!helperBin && proxyState.hasSystemProxy) || strictProxy)) {
     const curlRes = await curlFetchRaw(url, {
       method,
       headers,
       body: bodyStr ?? null,
       timeoutMs,
-      proxyUrl: proxyState.fallbackProxyUrl,
+      proxyUrl: effectiveProxyUrl,
       redirect,
     });
-    if (curlRes.status !== null) {
+    if (curlRes.status !== null || enforceNoDirect) {
       return curlRes;
     }
+  }
+
+  if (enforceNoDirect) {
+    return {
+      ok: false,
+      status: null,
+      text: '',
+      headers: {},
+      finalUrl: null,
+      latencyMs: Date.now() - startedAt,
+      errorKind: 'network',
+      errorMessage: '代理连接失败，已阻止直连',
+    };
   }
 
   try {
@@ -512,19 +657,21 @@ export async function httpRequestRaw(
         body: bodyStr ?? null,
         timeoutMs,
         redirect,
+        proxyUrl: effectiveProxyUrl,
+        strictProxy: Boolean(strictProxy && !targetIsLoopback),
       });
       if (nativeRes.status !== null) {
         return nativeRes;
       }
       nativeErrRes = nativeRes;
     }
-    if (proxyState.fallbackProxyUrl) {
+    if (effectiveProxyUrl) {
       const curlRes = await curlFetchRaw(url, {
         method,
         headers,
         body: bodyStr ?? null,
         timeoutMs,
-        proxyUrl: proxyState.fallbackProxyUrl,
+        proxyUrl: effectiveProxyUrl,
         redirect,
       });
       if (curlRes.status !== null || !nativeErrRes) {
@@ -549,9 +696,35 @@ export async function httpRequestRaw(
 
 export async function httpRequestJson(
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, redirect = 'follow', fetchImpl = null } = {}
+  {
+    method = 'GET',
+    headers = {},
+    body = null,
+    timeoutMs = 8000,
+    redirect = 'follow',
+    preferNative = false,
+    proxyUrl = null,
+    strictProxy = false,
+    fetchImpl = null,
+    _nativeHelperBin = undefined,
+    _proxyState = undefined,
+    _directFetch = null,
+  } = {}
 ) {
-  const raw = await httpRequestRaw(url, { method, headers, body, timeoutMs, redirect, fetchImpl });
+  const raw = await httpRequestRaw(url, {
+    method,
+    headers,
+    body,
+    timeoutMs,
+    redirect,
+    preferNative,
+    proxyUrl,
+    strictProxy,
+    fetchImpl,
+    _nativeHelperBin,
+    _proxyState,
+    _directFetch,
+  });
   if (!raw.ok) {
     return {
       ok: false,

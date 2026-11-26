@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { URL } from 'node:url';
 import { CodexAdapter } from './adapters/codex.mjs';
 import { AntigravityAdapter, loadAntigravitySessionTitles } from './adapters/antigravity.mjs';
+import { ClaudeCodeAdapter } from './adapters/claude-code.mjs';
 import { CodeBuddyAdapter } from './adapters/codebuddy.mjs';
 import { drainCursorSpool, processCursorHookPayload, syncCursorHistoryEvents } from './adapters/cursor.mjs';
 import { inspectAppsStatusAsync } from './apps.mjs';
@@ -30,15 +31,17 @@ import {
   scoreManualProbeResponse,
 } from './fingerprint.mjs';
 import { CURSOR_EVENTS, getPackageMeta } from './installer.mjs';
-import { fetchCursorQuota, getAllQuotas } from './quota.mjs';
+import { normalizeProxyUrl } from './net.mjs';
+import { fetchClaudeQuota, fetchCursorQuota, getAllQuotas, resolveClaudeProxyConfig } from './quota.mjs';
 import { renderReceiptAscii, renderReceiptSvg } from './receipt.mjs';
 import { TurnStore } from './store.mjs';
 
-const TOOL_KEYS = ['antigravity', 'codex', 'cursor', 'codebuddy'];
+const TOOL_KEYS = ['antigravity', 'codex', 'claude', 'cursor', 'codebuddy'];
 const CURSOR_EVENT_SET = new Set(CURSOR_EVENTS);
 const PROTECTED_ROUTES = new Set([
   'POST /v1/config',
   'POST /v1/cursor/sync-local',
+  'POST /v1/claude/sync-local',
   'POST /v1/providers/reload',
   'POST /v1/providers/import',
   'DELETE /v1/providers',
@@ -55,10 +58,13 @@ const PROTECTED_ROUTES = new Set([
 function loadMeterConfig(configPath) {
   const defaults = {
     enabled: true,
-    tools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    tools: { antigravity: true, codex: true, claude: true, cursor: true, codebuddy: true },
     inlineEnabled: true,
-    inlineTools: { antigravity: true, codex: true, cursor: true, codebuddy: true },
+    inlineTools: { antigravity: true, codex: true, claude: true, cursor: true, codebuddy: true },
     cursorCookie: null,
+    claudeCookie: null,
+    claudeProxyUrl: null,
+    claudeQuotaEnabled: false,
     fingerprintEndpoints: [],
   };
   if (!configPath || !existsSync(configPath)) return defaults;
@@ -84,6 +90,11 @@ function loadMeterConfig(configPath) {
       typeof raw?.cursorCookie === 'string' && raw.cursorCookie.trim()
         ? raw.cursorCookie.trim()
         : null;
+    const claudeCookie =
+      typeof raw?.claudeCookie === 'string' && raw.claudeCookie.trim()
+        ? raw.claudeCookie.trim()
+        : null;
+    const claudeProxyUrl = normalizeProxyUrl(raw?.claudeProxyUrl);
     const fingerprintEndpoints = Array.isArray(raw?.fingerprintEndpoints)
       ? raw.fingerprintEndpoints
           .filter((ep) => ep && typeof ep === 'object' && typeof ep.baseUrl === 'string' && ep.baseUrl.trim())
@@ -103,6 +114,9 @@ function loadMeterConfig(configPath) {
       inlineEnabled: typeof raw?.inlineEnabled === 'boolean' ? raw.inlineEnabled : true,
       inlineTools,
       cursorCookie,
+      claudeCookie,
+      claudeProxyUrl,
+      claudeQuotaEnabled: typeof raw?.claudeQuotaEnabled === 'boolean' ? raw.claudeQuotaEnabled : false,
       fingerprintEndpoints,
     };
   } catch {
@@ -111,12 +125,18 @@ function loadMeterConfig(configPath) {
 }
 
 function publicConfig(cfg) {
+  const claudeProxy = resolveClaudeProxyConfig({ claudeProxyUrl: cfg.claudeProxyUrl });
   return {
     enabled: cfg.enabled,
     tools: cfg.tools,
     inlineEnabled: cfg.inlineEnabled !== false,
     inlineTools: cfg.inlineTools,
     hasCursorCookie: Boolean(cfg.cursorCookie && cfg.cursorCookie.trim()),
+    hasClaudeCookie: Boolean(cfg.claudeCookie && cfg.claudeCookie.trim()),
+    claudeProxyUrl: cfg.claudeProxyUrl || null,
+    effectiveClaudeProxyUrl: claudeProxy.proxyUrl || null,
+    claudeProxySource: claudeProxy.source,
+    claudeQuotaEnabled: cfg.claudeQuotaEnabled === true,
   };
 }
 
@@ -133,6 +153,7 @@ export function createMeterServer({
   stateDir,
   providersDir = null,
   geminiRoot = undefined,
+  claudeRoot = undefined,
   authToken = null,
   requireAuthToken = true,
   enableWatchers = true,
@@ -270,6 +291,12 @@ export function createMeterServer({
     store,
     onTurns: onTurnsChanged,
     isEnabled: () => isToolEnabled('codebuddy'),
+  });
+  const claudeCodeAdapter = new ClaudeCodeAdapter({
+    store,
+    onTurns: onTurnsChanged,
+    ...(claudeRoot !== undefined ? { claudeRoot } : {}),
+    isEnabled: () => isToolEnabled('claude'),
   });
 
   if (enableCdp) {
@@ -535,6 +562,9 @@ export function createMeterServer({
             ? getAllQuotas(nowMs, {
                 forceRefresh,
                 cursorCookie: config.cursorCookie,
+                claudeCookie: config.claudeCookie,
+                claudeProxyUrl: config.claudeProxyUrl,
+                claudeQuotaEnabled: config.claudeQuotaEnabled === true,
                 enabledTools: config.tools,
               }).catch(() => null)
             : Promise.resolve(null),
@@ -754,6 +784,7 @@ export function createMeterServer({
         url.pathname === '/v1/ingest/cursor-hook' ||
         url.pathname === '/v1/config' ||
         url.pathname === '/v1/cursor/sync-local' ||
+        url.pathname === '/v1/claude/sync-local' ||
         url.pathname === '/v1/providers/reload' ||
         url.pathname === '/v1/providers/import' ||
         url.pathname === '/v1/providers/auth' ||
@@ -1055,6 +1086,9 @@ export function createMeterServer({
                     await getAllQuotas(Date.now(), {
                       forceRefresh: true,
                       cursorCookie: config.cursorCookie,
+                      claudeCookie: config.claudeCookie,
+                      claudeProxyUrl: config.claudeProxyUrl,
+                      claudeQuotaEnabled: config.claudeQuotaEnabled === true,
                       enabledTools: config.tools,
                     }).catch(() => {});
                   }
@@ -1082,6 +1116,78 @@ export function createMeterServer({
                 if (!res.headersSent) {
                   res.writeHead(500, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ ok: false, error: '同步 Cursor 本地登录态失败' }));
+                }
+              });
+            return;
+          }
+          if (url.pathname === '/v1/claude/sync-local') {
+            if (!config.claudeQuotaEnabled) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: '已关闭 Claude 联网配额同步，请先在设置中开启后再同步',
+                })
+              );
+              return;
+            }
+            const safeStoragePasswords = Array.isArray(payload?.passwords)
+              ? payload.passwords.filter((p) => typeof p === 'string' && p.length > 0)
+              : [];
+            const cliCredentialsList = Array.isArray(payload?.cliCredentials)
+              ? payload.cliCredentials.filter((p) => typeof p === 'string' && p.length > 0)
+              : [];
+            fetchClaudeQuota(Date.now(), {
+              allowNetwork: true,
+              forceRefresh: true,
+              claudeCookie: null,
+              claudeProxyUrl: config.claudeProxyUrl,
+              safeStoragePasswords,
+              cliCredentialsList,
+            })
+              .then(async (q) => {
+                if (q?.resolvedCookieHeader) {
+                  config.claudeCookie = q.resolvedCookieHeader;
+                  persistConfig();
+                  const pubCfg = publicConfig(config);
+                  broadcast('state', { ...store.getState(20, config.tools), config: pubCfg });
+                }
+                if (q?._ok) {
+                  if (enableQuotaProbe) {
+                    await getAllQuotas(Date.now(), {
+                      forceRefresh: true,
+                      cursorCookie: config.cursorCookie,
+                      claudeCookie: config.claudeCookie,
+                      claudeProxyUrl: config.claudeProxyUrl,
+                      claudeQuotaEnabled: config.claudeQuotaEnabled === true,
+                      enabledTools: config.tools,
+                    }).catch(() => {});
+                  }
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(
+                    JSON.stringify({
+                      ok: true,
+                      email: q.accountEmail || null,
+                      planTitle: q.planTitle || null,
+                      quotaWindows: q.quotaWindows || [],
+                      source: q.source || null,
+                    })
+                  );
+                  return;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    ok: false,
+                    hasEncryptedTokenWithoutKey: Boolean(q?.hasEncryptedTokenWithoutKey),
+                    error: q?.quotaHint || '未读取到有效的 Claude 登录会话',
+                  })
+                );
+              })
+              .catch(() => {
+                if (!res.headersSent) {
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: false, error: '同步 Claude 本地登录态失败' }));
                 }
               });
             return;
@@ -1194,6 +1300,39 @@ export function createMeterServer({
             return;
           }
           if (url.pathname === '/v1/config') {
+            let nextClaudeProxyUrl = undefined;
+            if (payload?.claudeProxyUrl !== undefined) {
+              if (payload.claudeProxyUrl === null) {
+                nextClaudeProxyUrl = null;
+              } else if (typeof payload.claudeProxyUrl === 'string') {
+                const trimmedProxy = payload.claudeProxyUrl.trim();
+                if (!trimmedProxy) {
+                  nextClaudeProxyUrl = null;
+                } else {
+                  const normalizedProxy = normalizeProxyUrl(trimmedProxy);
+                  if (!normalizedProxy) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(
+                      JSON.stringify({
+                        ok: false,
+                        error: '代理地址格式无效，请使用 http://、https:// 或 socks5://host:port',
+                      })
+                    );
+                    return;
+                  }
+                  nextClaudeProxyUrl = normalizedProxy;
+                }
+              } else {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    ok: false,
+                    error: '代理地址格式无效，请使用 http://、https:// 或 socks5://host:port',
+                  })
+                );
+                return;
+              }
+            }
             const prevInline = Object.fromEntries(TOOL_KEYS.map((k) => [k, isInlineEnabled(k)]));
             const prevTools = { ...config.tools };
             const prevEnabled = config.enabled;
@@ -1222,6 +1361,23 @@ export function createMeterServer({
                   : null;
               refreshQuota = true;
             }
+            if (payload?.claudeCookie !== undefined) {
+              config.claudeCookie =
+                typeof payload.claudeCookie === 'string' && payload.claudeCookie.trim()
+                  ? payload.claudeCookie.trim()
+                  : null;
+              refreshQuota = true;
+            }
+            if (nextClaudeProxyUrl !== undefined) {
+              config.claudeProxyUrl = nextClaudeProxyUrl;
+              refreshQuota = true;
+            }
+            if (typeof payload?.claudeQuotaEnabled === 'boolean') {
+              if (config.claudeQuotaEnabled !== payload.claudeQuotaEnabled) {
+                config.claudeQuotaEnabled = payload.claudeQuotaEnabled;
+                refreshQuota = true;
+              }
+            }
             persistConfig();
             const pubCfg = publicConfig(config);
             broadcast('state', { ...store.getState(20, config.tools), config: pubCfg });
@@ -1239,6 +1395,9 @@ export function createMeterServer({
                 if (becameEnabled('codex')) {
                   try { codexAdapter.scan({ maxRecentFiles: 12 }); } catch {}
                 }
+                if (becameEnabled('claude')) {
+                  try { claudeCodeAdapter.scan({ maxRecentFiles: 12 }); } catch {}
+                }
                 if (becameEnabled('antigravity')) {
                   antigravityAdapter.scan({ maxRecentFiles: 8 }).catch(() => {});
                 }
@@ -1255,6 +1414,9 @@ export function createMeterServer({
               getAllQuotas(nowFn(), {
                 forceRefresh: true,
                 cursorCookie: config.cursorCookie,
+                claudeCookie: config.claudeCookie,
+                claudeProxyUrl: config.claudeProxyUrl,
+                claudeQuotaEnabled: config.claudeQuotaEnabled === true,
                 enabledTools: config.tools,
               }).catch(() => {});
               triggerCursorHistorySync({ force: true });
@@ -1331,6 +1493,7 @@ export function createMeterServer({
 
     if (enableWatchers) {
       codexAdapter.start();
+      claudeCodeAdapter.start();
       await antigravityAdapter.start();
       codeBuddyAdapter.start();
       spoolTimer = setInterval(() => {
@@ -1348,6 +1511,9 @@ export function createMeterServer({
     if (enableQuotaProbe) {
       getAllQuotas(Date.now(), {
         cursorCookie: config.cursorCookie,
+        claudeCookie: config.claudeCookie,
+        claudeProxyUrl: config.claudeProxyUrl,
+        claudeQuotaEnabled: config.claudeQuotaEnabled === true,
         enabledTools: config.tools,
       }).catch(() => {});
       cursorInitialSyncTimer = setTimeout(() => {
@@ -1366,6 +1532,7 @@ export function createMeterServer({
 
   async function stop() {
     codexAdapter.stop();
+    claudeCodeAdapter.stop();
     antigravityAdapter.stop();
     codeBuddyAdapter.stop();
     cdpInjector?.stop();
@@ -1392,6 +1559,7 @@ export function createMeterServer({
     start,
     stop,
     codexAdapter,
+    claudeCodeAdapter,
     antigravityAdapter,
     codeBuddyAdapter,
     triggerCursorHistorySync,

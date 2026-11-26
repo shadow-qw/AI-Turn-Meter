@@ -8,6 +8,9 @@ enum ActiveMainSheet: Identifiable, Equatable {
   case ssh
   case cursorLogin
   case cursorCookie
+  case claudeLogin
+  case claudeCookie
+  case claudeProxy
   case pluginLogin(String)
   case pluginCode
   case update
@@ -17,6 +20,9 @@ enum ActiveMainSheet: Identifiable, Equatable {
     case .ssh: return "ssh"
     case .cursorLogin: return "cursorLogin"
     case .cursorCookie: return "cursorCookie"
+    case .claudeLogin: return "claudeLogin"
+    case .claudeCookie: return "claudeCookie"
+    case .claudeProxy: return "claudeProxy"
     case .pluginLogin(let key): return "pluginLogin:\(key)"
     case .pluginCode: return "pluginCode"
     case .update: return "update"
@@ -34,6 +40,9 @@ final class MeterViewModel: ObservableObject {
     "__Secure-wos-session",
     "authjs.session-token",
     "__Secure-authjs.session-token",
+  ]
+  nonisolated static let claudeSessionCookieNames: Set<String> = [
+    "sessionKey",
   ]
 
   let runtime = MeterRuntime()
@@ -87,6 +96,7 @@ final class MeterViewModel: ObservableObject {
   @Published var toolToggles: [String: Bool] = [
     "antigravity": true,
     "codex": true,
+    "claude": true,
     "cursor": true,
     "codebuddy": true,
   ]
@@ -94,12 +104,20 @@ final class MeterViewModel: ObservableObject {
   @Published var inlineToolToggles: [String: Bool] = [
     "antigravity": true,
     "codex": true,
+    "claude": true,
     "cursor": true,
     "codebuddy": true,
   ]
   @Published var hasCursorCookie: Bool = false
+  @Published var hasClaudeCookie: Bool = false
+  @Published var claudeQuotaEnabled: Bool = false
+  @Published var claudeProxyUrl: String = ""
+  @Published var effectiveClaudeProxyUrl: String? = nil
+  @Published var claudeProxySource: String = "none"
   @Published var activeSheet: ActiveMainSheet? = nil
   @Published var cursorCookieDraft: String = ""
+  @Published var claudeCookieDraft: String = ""
+  @Published var claudeProxyDraft: String = ""
 
   var showCursorCookieSheet: Bool {
     get { activeSheet == .cursorCookie }
@@ -108,6 +126,18 @@ final class MeterViewModel: ObservableObject {
   var showCursorLoginSheet: Bool {
     get { activeSheet == .cursorLogin }
     set { setSheet(.cursorLogin, presented: newValue) }
+  }
+  var showClaudeCookieSheet: Bool {
+    get { activeSheet == .claudeCookie }
+    set { setSheet(.claudeCookie, presented: newValue) }
+  }
+  var showClaudeLoginSheet: Bool {
+    get { activeSheet == .claudeLogin }
+    set { setSheet(.claudeLogin, presented: newValue) }
+  }
+  var showClaudeProxySheet: Bool {
+    get { activeSheet == .claudeProxy }
+    set { setSheet(.claudeProxy, presented: newValue) }
   }
   var showPluginCodeSheet: Bool {
     get { activeSheet == .pluginCode }
@@ -187,7 +217,7 @@ final class MeterViewModel: ObservableObject {
   }()
   @Published var menuBarProvider: String = {
     let raw = UserDefaults.standard.string(forKey: PrefKey.menuBarProvider) ?? "auto"
-    let allowed: Set<String> = ["auto", "codex", "cursor", "antigravity", "codebuddy"]
+    let allowed: Set<String> = ["auto", "codex", "claude", "cursor", "antigravity", "codebuddy"]
     if allowed.contains(raw) || raw.hasPrefix("ext:") {
       return raw
     }
@@ -304,6 +334,7 @@ final class MeterViewModel: ObservableObject {
   private var didBootstrap = false
   private var doctorBootstrapInFlight = false
   private var didTryRestoreWebCookie = false
+  private var didTryRestoreClaudeWebCookie = false
   private var hasStarted = false
   private var lastUsageRefreshAt: Date = .distantPast
   private var isReceiptDateAutoToday: Bool = true
@@ -873,6 +904,29 @@ export default {
     }
   }
 
+  var hasUsableClaudeProxy: Bool {
+    if let eff = effectiveClaudeProxyUrl, !eff.isEmpty { return true }
+    return HeadlessCliHelper.hasActiveSystemProxy()
+  }
+
+  var claudeActiveProxySummary: String {
+    if let eff = effectiveClaudeProxyUrl, !eff.isEmpty {
+      let srcLabel: String
+      switch claudeProxySource {
+      case "config": srcLabel = "手动配置"
+      case "claude_settings": srcLabel = "继承 ~/.claude/settings.json"
+      case "env": srcLabel = "环境变量"
+      case "system": srcLabel = "系统代理"
+      default: srcLabel = "已配置"
+      }
+      return "\(eff)（\(srcLabel)）"
+    }
+    if HeadlessCliHelper.hasActiveSystemProxy() {
+      return "跟随 macOS 系统代理"
+    }
+    return "未检测到可用代理（已阻止直连）"
+  }
+
   func isToolEnabled(_ key: String) -> Bool {
     toolToggles[key] ?? true
   }
@@ -1294,6 +1348,7 @@ export default {
     switch key {
     case "antigravity": return Color(red: 0.15, green: 0.45, blue: 0.96)
     case "codex": return Color(red: 0.06, green: 0.72, blue: 0.50)
+    case "claude": return Color(red: 0.85, green: 0.47, blue: 0.34)
     case "cursor": return Color(red: 0.96, green: 0.52, blue: 0.14)
     case "codebuddy": return Color(red: 0.56, green: 0.36, blue: 0.96)
     default: return Color(red: 0.05, green: 0.38, blue: 0.92)
@@ -1307,6 +1362,7 @@ export default {
     case "all": return "概览"
     case "antigravity": return "Antigravity"
     case "codex": return "Codex"
+    case "claude": return "Claude"
     case "cursor": return "Cursor"
     case "codebuddy": return "CodeBuddy"
     default: return key.hasPrefix("ext:") ? String(key.dropFirst(4)) : key
@@ -1327,6 +1383,7 @@ export default {
     switch key {
     case "antigravity": return "Antigravity"
     case "codex": return "Codex Desktop"
+    case "claude": return "Claude Desktop"
     case "cursor": return "Cursor"
     case "codebuddy": return "CodeBuddy CN"
     default: return key.hasPrefix("ext:") ? String(key.dropFirst(4)) : key
@@ -1350,6 +1407,12 @@ export default {
     }
     if key == "codex" && entry.cdpPort == nil {
       return (entry.running ?? false) ? "正在运行（需点右侧按钮重启一次以显示胶囊）" : "未启动（点右侧按钮即可带统计启动）"
+    }
+    if key == "claude" {
+      if !claudeQuotaEnabled {
+        return (entry.running ?? false) ? "正在运行（纯本地离线 · 仅统计本地日志）" : "已安装（纯本地离线 · 仅统计本地日志）"
+      }
+      return (entry.running ?? false) ? "正在运行（官方客户端禁用 CDP，直接同步额度与本地日志）" : "已安装（无需开启调试口）"
     }
     return "等待新对话记录"
   }
@@ -1442,6 +1505,17 @@ export default {
         restoreCursorWebCookieIfPresent()
       }
     }
+    self.claudeQuotaEnabled = cfg.claudeQuotaEnabled ?? false
+    if let hasClaude = cfg.hasClaudeCookie {
+      self.hasClaudeCookie = hasClaude
+      if self.claudeQuotaEnabled && !hasClaude && !didTryRestoreClaudeWebCookie && !busy && !runtime.runningFromDmg {
+        didTryRestoreClaudeWebCookie = true
+        restoreClaudeWebCookieIfPresent()
+      }
+    }
+    self.claudeProxyUrl = cfg.claudeProxyUrl ?? ""
+    self.effectiveClaudeProxyUrl = cfg.effectiveClaudeProxyUrl
+    self.claudeProxySource = cfg.claudeProxySource ?? "none"
   }
 
   private func applyDaemonState(_ parsed: DaemonStateResponse) {
@@ -1886,6 +1960,167 @@ export default {
         self.hasCursorCookie = true
         self.postConfig(["cursorCookie": header], quietBanner: true) { [weak self] in
           self?.fetchUsageSummary(silent: true, forceRefresh: true)
+        }
+      }
+    }
+  }
+
+  func setClaudeQuotaEnabled(_ enabled: Bool) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let previous = claudeQuotaEnabled
+    claudeQuotaEnabled = enabled
+    if !enabled && (activeSheet == .claudeLogin || activeSheet == .claudeCookie || activeSheet == .claudeProxy) {
+      activeSheet = nil
+    }
+    postConfig(
+      ["claudeQuotaEnabled": enabled],
+      quietBanner: false,
+      bannerText: enabled
+        ? "已开启 Claude 联网配额同步，正在刷新…"
+        : "已关闭 Claude 联网配额同步（纯本地统计 Token 与费用）"
+    ) { [weak self] in
+      guard let self = self else { return }
+      if enabled != previous {
+        self.fetchDaemonStateLight()
+        self.fetchUsageSummary(silent: false, forceRefresh: true)
+      }
+    }
+  }
+
+  func saveClaudeProxyUrl(_ raw: String?) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    postConfig(
+      ["claudeProxyUrl": trimmed],
+      quietBanner: false,
+      bannerText: trimmed.isEmpty ? "已恢复自动检测 Claude 代理，正在同步额度…" : "已保存 Claude 代理，正在同步额度…"
+    ) { [weak self] in
+      self?.fetchDaemonStateLight()
+      self?.fetchUsageSummary(silent: false, forceRefresh: true)
+    }
+  }
+
+  func saveClaudeCookie(_ raw: String?) {
+    guard !busy, !runtime.runningFromDmg else { return }
+    let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    didTryRestoreClaudeWebCookie = true
+    hasClaudeCookie = !trimmed.isEmpty
+    if trimmed.isEmpty {
+      let dedicatedStore = ClaudeWebProxyHelper.claudeWebsiteDataStore()
+      let stores: [WKWebsiteDataStore] = dedicatedStore === WKWebsiteDataStore.default()
+        ? [dedicatedStore]
+        : [dedicatedStore, .default()]
+      for store in stores {
+        let cookieStore = store.httpCookieStore
+        cookieStore.getAllCookies { cookies in
+          for c in cookies {
+            let dom = c.domain.lowercased()
+            if dom.contains("claude.ai") && Self.claudeSessionCookieNames.contains(c.name) {
+              cookieStore.delete(c, completionHandler: nil)
+            }
+          }
+        }
+      }
+    }
+    postConfig(
+      ["claudeCookie": trimmed],
+      quietBanner: false,
+      bannerText: trimmed.isEmpty ? "已清除 Claude 会话 Cookie" : "已保存 Claude 会话 Cookie，正在同步额度…"
+    ) { [weak self] in
+      self?.fetchUsageSummary(silent: false, forceRefresh: true)
+    }
+  }
+
+  func syncClaudeFromLocalApp() {
+    guard !busy, !runtime.runningFromDmg else { return }
+    busy = true
+    bannerIsError = false
+    statusBanner = "正在读取本机 Claude 登录凭证…"
+    let port = daemonPort
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let creds = HeadlessCliHelper.readClaudeCredentials(allowPrompt: true)
+      let box = CursorSyncBox()
+
+      if let url = URL(string: "http://127.0.0.1:\(port)/v1/claude/sync-local"),
+         let jsonData = try? JSONSerialization.data(withJSONObject: [
+          "passwords": creds.passwords,
+          "cliCredentials": creds.cliCredentials,
+         ]) {
+        var req = DaemonAuth.authorizedRequest(url: url, method: "POST", timeout: 15)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = jsonData
+        let sem = DispatchSemaphore(value: 0)
+        let task = DaemonAuth.localSession.dataTask(with: req) { data, _, err in
+          box.finishWithResponse(data, error: err)
+          sem.signal()
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + 16) == .timedOut {
+          box.markTimedOut()
+          task.cancel()
+        }
+      } else {
+        box.markTimedOut()
+      }
+
+      let result = box.snapshot()
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.busy = false
+        if result.syncOk {
+          self.bannerIsError = false
+          self.statusBanner = result.email != nil
+            ? "已从本机 Claude 同步账号（\(result.email!)）"
+            : "已从本机 Claude 同步套餐额度"
+          self.fetchAppsStatusHttp()
+          self.fetchUsageSummary(silent: false, forceRefresh: true)
+        } else {
+          self.bannerIsError = true
+          self.statusBanner = result.errorMsg ?? "未检测到本机 Claude 登录态，请使用「网页登录同步…」"
+        }
+      }
+    }
+  }
+
+  private func restoreClaudeWebCookieIfPresent() {
+    let now = Date()
+    let extractHeader: ([HTTPCookie]) -> String? = { cookies in
+      let validCookies = cookies.filter { c in
+        let dom = c.domain.lowercased()
+        let notExpired = c.expiresDate.map { $0 > now } ?? true
+        return dom.contains("claude.ai") && notExpired && !c.value.isEmpty
+      }
+      var deduped: [String: HTTPCookie] = [:]
+      for c in validCookies.sorted(by: { $0.domain.count < $1.domain.count || $0.path.count < $1.path.count }) {
+        deduped[c.name] = c
+      }
+      let finalCookies = Array(deduped.values).sorted { $0.name < $1.name }
+      guard finalCookies.contains(where: { Self.claudeSessionCookieNames.contains($0.name) }) else { return nil }
+      return finalCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    }
+
+    let dedicatedStore = ClaudeWebProxyHelper.claudeWebsiteDataStore()
+    dedicatedStore.httpCookieStore.getAllCookies { [weak self] cookies in
+      if let header = extractHeader(cookies) {
+        DispatchQueue.main.async {
+          guard let self = self, self.claudeQuotaEnabled, !self.hasClaudeCookie else { return }
+          self.hasClaudeCookie = true
+          self.postConfig(["claudeCookie": header], quietBanner: true) { [weak self] in
+            self?.fetchUsageSummary(silent: true, forceRefresh: true)
+          }
+        }
+        return
+      }
+      guard dedicatedStore !== WKWebsiteDataStore.default() else { return }
+      WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] legacyCookies in
+        guard let header = extractHeader(legacyCookies) else { return }
+        DispatchQueue.main.async {
+          guard let self = self, self.claudeQuotaEnabled, !self.hasClaudeCookie else { return }
+          self.hasClaudeCookie = true
+          self.postConfig(["claudeCookie": header], quietBanner: true) { [weak self] in
+            self?.fetchUsageSummary(silent: true, forceRefresh: true)
+          }
         }
       }
     }
