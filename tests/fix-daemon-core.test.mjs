@@ -796,10 +796,10 @@ test('net: getProxyState deduplicates concurrent scutil calls, curlFetchRaw hono
 
     const now = Date.now();
     const batch = [
-      getProxyState(now, { runScutil }),
-      getProxyState(now, { runScutil }),
-      getProxyState(now, { runScutil }),
-      getProxyState(now, { runScutil }),
+      getProxyState(now, { runScutil, env: {} }),
+      getProxyState(now, { runScutil, env: {} }),
+      getProxyState(now, { runScutil, env: {} }),
+      getProxyState(now, { runScutil, env: {} }),
     ];
     assert.equal(scutilCalls, 1, 'concurrent getProxyState calls must share a single scutil invocation');
     releaseScutil();

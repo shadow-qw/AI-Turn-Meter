@@ -284,7 +284,8 @@ enum HeadlessCliHelper {
 
     var dict: [AnyHashable: Any] = [
       "ExcludeSimpleHostnames": 0,
-      "ExceptionsList": [] as [String],
+      // Loopback stays direct; remote hosts never bypass the explicit proxy.
+      "ExceptionsList": ["localhost", "127.0.0.1", "::1"] as [String],
     ]
     if scheme == "socks5" || scheme == "socks5h" {
       dict["SOCKSEnable"] = 1

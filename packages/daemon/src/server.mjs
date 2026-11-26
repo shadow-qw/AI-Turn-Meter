@@ -173,8 +173,24 @@ export function createMeterServer({
   const resolvedProvidersDir = providersDir || defaultExternalProvidersDir(hookStateDir);
   const externalProviders = new ExternalProviderRegistry({ providersDir: resolvedProvidersDir });
   let config = loadMeterConfig(configPath);
+  // Keychain material handed over by「读取本机」. Kept in memory only (never persisted), so a
+  // one-time keychain approval keeps quota sync working until the daemon restarts.
+  let claudeLocalCreds = { passwords: [], cliCredentials: [] };
   /** @type {Set<http.ServerResponse>} */
   const sseClients = new Set();
+
+  function quotaOptions(extra = {}) {
+    return {
+      cursorCookie: config.cursorCookie,
+      claudeCookie: config.claudeCookie,
+      claudeProxyUrl: config.claudeProxyUrl,
+      claudeQuotaEnabled: config.claudeQuotaEnabled === true,
+      claudeSafeStoragePasswords: claudeLocalCreds.passwords,
+      claudeCliCredentials: claudeLocalCreds.cliCredentials,
+      enabledTools: config.tools,
+      ...extra,
+    };
+  }
 
   function isToolEnabled(tool) {
     if (!config.enabled) return false;
@@ -559,14 +575,7 @@ export function createMeterServer({
         const sessionTitles = getSessionTitles(forceRefresh);
         const [quotasByTool, externalData] = await Promise.all([
           enableQuotaProbe
-            ? getAllQuotas(nowMs, {
-                forceRefresh,
-                cursorCookie: config.cursorCookie,
-                claudeCookie: config.claudeCookie,
-                claudeProxyUrl: config.claudeProxyUrl,
-                claudeQuotaEnabled: config.claudeQuotaEnabled === true,
-                enabledTools: config.tools,
-              }).catch(() => null)
+            ? getAllQuotas(nowMs, quotaOptions({ forceRefresh })).catch(() => null)
             : Promise.resolve(null),
           enableExternalProviders
             ? externalProviders
@@ -1083,14 +1092,7 @@ export function createMeterServer({
                   const pubCfg = publicConfig(config);
                   broadcast('state', { ...store.getState(20, config.tools), config: pubCfg });
                   if (enableQuotaProbe) {
-                    await getAllQuotas(Date.now(), {
-                      forceRefresh: true,
-                      cursorCookie: config.cursorCookie,
-                      claudeCookie: config.claudeCookie,
-                      claudeProxyUrl: config.claudeProxyUrl,
-                      claudeQuotaEnabled: config.claudeQuotaEnabled === true,
-                      enabledTools: config.tools,
-                    }).catch(() => {});
+                    await getAllQuotas(Date.now(), quotaOptions({ forceRefresh: true })).catch(() => {});
                   }
                   triggerCursorHistorySync({ force: true });
                   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1153,15 +1155,13 @@ export function createMeterServer({
                   broadcast('state', { ...store.getState(20, config.tools), config: pubCfg });
                 }
                 if (q?._ok) {
+                  if (safeStoragePasswords.length > 0 || cliCredentialsList.length > 0) {
+                    // Without this, an OAuth success (which yields no cookie to persist) would be
+                    // lost on the very next refresh unless the keychain item was set to "Always Allow".
+                    claudeLocalCreds = { passwords: safeStoragePasswords, cliCredentials: cliCredentialsList };
+                  }
                   if (enableQuotaProbe) {
-                    await getAllQuotas(Date.now(), {
-                      forceRefresh: true,
-                      cursorCookie: config.cursorCookie,
-                      claudeCookie: config.claudeCookie,
-                      claudeProxyUrl: config.claudeProxyUrl,
-                      claudeQuotaEnabled: config.claudeQuotaEnabled === true,
-                      enabledTools: config.tools,
-                    }).catch(() => {});
+                    await getAllQuotas(Date.now(), quotaOptions({ forceRefresh: true })).catch(() => {});
                   }
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(
@@ -1375,6 +1375,9 @@ export function createMeterServer({
             if (typeof payload?.claudeQuotaEnabled === 'boolean') {
               if (config.claudeQuotaEnabled !== payload.claudeQuotaEnabled) {
                 config.claudeQuotaEnabled = payload.claudeQuotaEnabled;
+                if (!payload.claudeQuotaEnabled) {
+                  claudeLocalCreds = { passwords: [], cliCredentials: [] };
+                }
                 refreshQuota = true;
               }
             }
@@ -1411,14 +1414,7 @@ export function createMeterServer({
               }
             }
             if (refreshQuota && enableQuotaProbe) {
-              getAllQuotas(nowFn(), {
-                forceRefresh: true,
-                cursorCookie: config.cursorCookie,
-                claudeCookie: config.claudeCookie,
-                claudeProxyUrl: config.claudeProxyUrl,
-                claudeQuotaEnabled: config.claudeQuotaEnabled === true,
-                enabledTools: config.tools,
-              }).catch(() => {});
+              getAllQuotas(nowFn(), quotaOptions({ forceRefresh: true })).catch(() => {});
               triggerCursorHistorySync({ force: true });
             } else if (
               isToolEnabled('cursor') &&
@@ -1509,13 +1505,7 @@ export function createMeterServer({
         .catch(() => {});
     }
     if (enableQuotaProbe) {
-      getAllQuotas(Date.now(), {
-        cursorCookie: config.cursorCookie,
-        claudeCookie: config.claudeCookie,
-        claudeProxyUrl: config.claudeProxyUrl,
-        claudeQuotaEnabled: config.claudeQuotaEnabled === true,
-        enabledTools: config.tools,
-      }).catch(() => {});
+      getAllQuotas(Date.now(), quotaOptions()).catch(() => {});
       cursorInitialSyncTimer = setTimeout(() => {
         cursorInitialSyncTimer = null;
         triggerCursorHistorySync({ force: true });

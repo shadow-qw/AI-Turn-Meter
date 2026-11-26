@@ -51,6 +51,25 @@ export function isLoopbackUrl(rawUrl) {
   }
 }
 
+const LOOPBACK_NO_PROXY_HOSTS = ['localhost', '127.0.0.1', '::1'];
+
+/**
+ * Host list for curl --noproxy when an explicit proxy is used. Loopback is always exempt;
+ * NO_PROXY entries are honored only outside strict mode, so a stray NO_PROXY can never
+ * let a strict (anti-IP-leak) request go direct.
+ */
+export function buildCurlNoProxyList({ strict = false, env = process.env } = {}) {
+  const hosts = new Set(LOOPBACK_NO_PROXY_HOSTS);
+  if (!strict) {
+    const raw = env?.NO_PROXY || env?.no_proxy || '';
+    for (const part of String(raw).split(',')) {
+      const h = part.trim();
+      if (h) hosts.add(h);
+    }
+  }
+  return Array.from(hosts).join(',');
+}
+
 export const PROXY_ENV_KEYS = [
   'HTTPS_PROXY',
   'https_proxy',
@@ -177,9 +196,9 @@ export function resolveAppHelperBin() {
   return null;
 }
 
-export async function getProxyState(nowMs = Date.now(), { runScutil = null } = {}) {
+export async function getProxyState(nowMs = Date.now(), { runScutil = null, env = process.env } = {}) {
   if (!runScutil && (process.env.AI_TURN_METER_DISABLE_NATIVE_NET === '1' || process.env.NODE_TEST_CONTEXT)) {
-    return parseSystemProxyInfo('', process.env);
+    return parseSystemProxyInfo('', env);
   }
   if (nowMs - cachedProxyState.checkedAt < PROXY_CACHE_TTL_MS) {
     return cachedProxyState;
@@ -200,7 +219,7 @@ export async function getProxyState(nowMs = Date.now(), { runScutil = null } = {
         scutilOut = stdout || '';
       } catch {}
     }
-    const parsed = parseSystemProxyInfo(scutilOut, process.env);
+    const parsed = parseSystemProxyInfo(scutilOut, env);
     const nextState = { checkedAt: nowMs, ...parsed };
     if (inflightProxyPromise === p) {
       cachedProxyState = nextState;
@@ -380,7 +399,15 @@ async function nativeUrlSessionFetchRaw(
 
 export async function curlFetchRaw(
   url,
-  { method = 'GET', headers = {}, body = null, timeoutMs = 8000, proxyUrl = null, redirect = 'follow' } = {}
+  {
+    method = 'GET',
+    headers = {},
+    body = null,
+    timeoutMs = 8000,
+    proxyUrl = null,
+    noProxy = null,
+    redirect = 'follow',
+  } = {}
 ) {
   const startedAt = Date.now();
   if (!existsSync('/usr/bin/curl')) {
@@ -412,7 +439,9 @@ export async function curlFetchRaw(
       '\n__ATM_HTTP:%{http_code}\n__ATM_URL:%{url_effective}',
     ];
     if (proxyUrl) {
-      args.push('--proxy', proxyUrl, '--noproxy', '');
+      // An explicit --noproxy overrides NO_PROXY from the environment: strict callers pass a
+      // loopback-only list so NO_PROXY can never open a direct route to a remote host.
+      args.push('--proxy', proxyUrl, '--noproxy', noProxy ?? LOOPBACK_NO_PROXY_HOSTS.join(','));
     }
     const escapeCurlCfgVal = (s) =>
       String(s).replace(/[\r\n\0]+/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -525,6 +554,11 @@ export async function httpRequestRaw(
   const effectiveProxyUrl = explicitProxy || proxyState.fallbackProxyUrl || null;
   const hasUsableProxy = Boolean(effectiveProxyUrl || proxyState.hasSystemProxy);
   const targetIsLoopback = isLoopbackUrl(url);
+  // Loopback targets (local gateways, bridges, mock servers) never go through a proxy: a proxy
+  // resolves 127.0.0.1 on its own side, and NO_PROXY conventionally exempts these hosts.
+  const routeProxyUrl = targetIsLoopback ? null : effectiveProxyUrl;
+  const routeHasProxy = !targetIsLoopback && hasUsableProxy;
+  const curlNoProxy = buildCurlNoProxyList({ strict: strictProxy });
 
   if (strictProxy && !targetIsLoopback && !hasUsableProxy) {
     return {
@@ -572,26 +606,27 @@ export async function httpRequestRaw(
   const directFetch = typeof _directFetch === 'function' ? _directFetch : fetch;
   const enforceNoDirect = Boolean(!targetIsLoopback && (strictProxy || explicitProxy || proxyState.hasSystemProxy));
 
-  if (helperBin && (preferNative || hasUsableProxy)) {
+  if (helperBin && (preferNative || routeHasProxy)) {
     const nativeRes = await nativeUrlSessionFetchRaw(helperBin, url, {
       method,
       headers,
       body: bodyStr ?? null,
       timeoutMs,
       redirect,
-      proxyUrl: effectiveProxyUrl,
+      proxyUrl: routeProxyUrl,
       strictProxy: Boolean(strictProxy && !targetIsLoopback),
     });
     if (nativeRes.status !== null) {
       return nativeRes;
     }
-    if (effectiveProxyUrl) {
+    if (routeProxyUrl) {
       const curlRes = await curlFetchRaw(url, {
         method,
         headers,
         body: bodyStr ?? null,
         timeoutMs,
-        proxyUrl: effectiveProxyUrl,
+        proxyUrl: routeProxyUrl,
+        noProxy: curlNoProxy,
         redirect,
       });
       if (curlRes.status !== null) {
@@ -606,13 +641,14 @@ export async function httpRequestRaw(
     }
   }
 
-  if (effectiveProxyUrl && (explicitProxy || (!helperBin && proxyState.hasSystemProxy) || strictProxy)) {
+  if (routeProxyUrl && (explicitProxy || (!helperBin && proxyState.hasSystemProxy) || strictProxy)) {
     const curlRes = await curlFetchRaw(url, {
       method,
       headers,
       body: bodyStr ?? null,
       timeoutMs,
-      proxyUrl: effectiveProxyUrl,
+      proxyUrl: routeProxyUrl,
+      noProxy: curlNoProxy,
       redirect,
     });
     if (curlRes.status !== null || enforceNoDirect) {
@@ -657,7 +693,7 @@ export async function httpRequestRaw(
         body: bodyStr ?? null,
         timeoutMs,
         redirect,
-        proxyUrl: effectiveProxyUrl,
+        proxyUrl: routeProxyUrl,
         strictProxy: Boolean(strictProxy && !targetIsLoopback),
       });
       if (nativeRes.status !== null) {
@@ -665,13 +701,14 @@ export async function httpRequestRaw(
       }
       nativeErrRes = nativeRes;
     }
-    if (effectiveProxyUrl) {
+    if (routeProxyUrl) {
       const curlRes = await curlFetchRaw(url, {
         method,
         headers,
         body: bodyStr ?? null,
         timeoutMs,
-        proxyUrl: effectiveProxyUrl,
+        proxyUrl: routeProxyUrl,
+        noProxy: curlNoProxy,
         redirect,
       });
       if (curlRes.status !== null || !nativeErrRes) {

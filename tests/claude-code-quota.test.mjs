@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import { createCipheriv, createHash, pbkdf2Sync } from 'node:crypto';
-import { appendFileSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -14,7 +24,13 @@ import {
 } from '../packages/daemon/src/adapters/claude-code.mjs';
 import { APP_SPECS } from '../packages/daemon/src/apps.mjs';
 import { getDefaultCdpSpecs } from '../packages/daemon/src/cdp-injector.mjs';
-import { httpRequestRaw, isLoopbackUrl, normalizeProxyUrl } from '../packages/daemon/src/net.mjs';
+import {
+  buildCurlNoProxyList,
+  curlFetchRaw,
+  httpRequestRaw,
+  isLoopbackUrl,
+  normalizeProxyUrl,
+} from '../packages/daemon/src/net.mjs';
 import { estimateTurnCost } from '../packages/daemon/src/pricing.mjs';
 import {
   assembleAllQuotas,
@@ -1327,6 +1343,144 @@ test('strict proxy resolution, fail-closed anti-IP-leak guards, and Claude CDP e
       else process.env[k] = savedEnv[k];
     }
     resetQuotaCacheForTests();
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('loopback targets bypass proxies: no proxy handed to the native helper, direct fallback allowed, curl --noproxy exempts loopback', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-loopback-'));
+  const markerPath = join(tmp, 'helper-stdin.json');
+  const fakeHelper = join(tmp, 'fake-helper.sh');
+  writeFileSync(fakeHelper, `#!/bin/sh\ncat > "${markerPath}"\necho '{"ok":false,"error":"proxy connect failed"}'\n`);
+  chmodSync(fakeHelper, 0o755);
+  const srv = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"local":true}');
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const deadProxyState = { hasSystemProxy: true, fallbackProxyUrl: 'http://127.0.0.1:9' };
+  try {
+    const url = `http://127.0.0.1:${srv.address().port}/v1/models`;
+
+    // System proxy on + helper present: loopback must not be routed through the helper/proxy.
+    const plain = await httpRequestRaw(url, { timeoutMs: 3000, _nativeHelperBin: fakeHelper, _proxyState: deadProxyState });
+    assert.equal(plain.status, 200);
+    assert.deepEqual(JSON.parse(plain.text), { local: true });
+    assert.equal(existsSync(markerPath), false, 'helper must not run for a loopback target without preferNative');
+
+    // preferNative: helper runs without a proxy and a helper failure may fall back to direct.
+    const native = await httpRequestRaw(url, {
+      timeoutMs: 3000,
+      preferNative: true,
+      _nativeHelperBin: fakeHelper,
+      _proxyState: deadProxyState,
+    });
+    assert.equal(native.status, 200);
+    assert.equal(JSON.parse(readFileSync(markerPath, 'utf8')).proxyUrl, null);
+
+    // curl with a dead proxy still reaches loopback thanks to the --noproxy list.
+    const viaCurl = await curlFetchRaw(url, { timeoutMs: 3000, proxyUrl: 'http://127.0.0.1:9' });
+    assert.equal(viaCurl.status, 200);
+
+    // Strict mode ignores NO_PROXY (only loopback is exempt); non-strict honors it.
+    const env = { NO_PROXY: ' .corp.example , intranet ' };
+    assert.equal(buildCurlNoProxyList({ strict: true, env }), 'localhost,127.0.0.1,::1');
+    assert.equal(buildCurlNoProxyList({ strict: false, env }), 'localhost,127.0.0.1,::1,.corp.example,intranet');
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((resolve) => srv.close(resolve));
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('fetchClaudeQuota 429 backoff never serves another identity snapshot, and getAllQuotas forwards in-memory keychain creds', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-ratelimit-'));
+  const homeDir = join(tmp, 'home');
+  const supportDir = join(tmp, 'support');
+  mkdirSync(join(homeDir, '.claude'), { recursive: true });
+  mkdirSync(supportDir, { recursive: true });
+  const rateLimited = new Set();
+  const srv = http.createServer((req, res) => {
+    const cookie = String(req.headers.cookie || '');
+    const who = cookie.includes('sessionKey=A') ? 'a' : 'b';
+    if (rateLimited.has(who)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+      res.end('{"error":"rate_limited"}');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (req.url.startsWith('/api/account')) {
+      res.end(JSON.stringify({ email_address: `${who}@example.com`, memberships: [] }));
+      return;
+    }
+    res.end(JSON.stringify({ five_hour: { utilization: who === 'a' ? 40 : 70, resets_at: '2099-01-01T00:00:00Z' } }));
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  resetQuotaCacheForTests();
+  try {
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    const opts = (cookie, extra = {}) => ({
+      homeDir,
+      claudeAppSupportDir: supportDir,
+      claudeApiBaseUrl: base,
+      claudeWebBaseUrl: base,
+      claudeCookie: cookie,
+      ...extra,
+    });
+    const cookieA = 'sessionKey=A; lastActiveOrg=org-a';
+    const cookieB = 'sessionKey=B; lastActiveOrg=org-b';
+    const t0 = Date.now();
+
+    const a = await fetchClaudeQuota(t0, opts(cookieA));
+    assert.equal(a._ok, true);
+    assert.equal(a.accountEmail, 'a@example.com');
+
+    // Switching identity and immediately hitting 429 must not rebind account A's snapshot to B.
+    rateLimited.add('b');
+    const b1 = await fetchClaudeQuota(t0 + 1000, opts(cookieB));
+    assert.equal(b1._errorKind, 'rate_limit');
+    const b2 = await fetchClaudeQuota(t0 + 2000, opts(cookieB));
+    assert.equal(b2._errorKind, 'rate_limit');
+    assert.equal(b2.accountEmail, null);
+    assert.equal(b2.quotaWindows.length, 0);
+
+    // Same identity hitting 429 keeps its own last good snapshot during the backoff.
+    resetQuotaCacheForTests();
+    const a1 = await fetchClaudeQuota(t0, opts(cookieA));
+    assert.equal(a1._ok, true);
+    rateLimited.add('a');
+    await fetchClaudeQuota(t0 + 1000, opts(cookieA, { forceRefresh: true }));
+    const a2 = await fetchClaudeQuota(t0 + 2000, opts(cookieA));
+    assert.equal(a2._errorKind, 'rate_limit');
+    assert.equal(a2.accountEmail, 'a@example.com');
+    assert.equal(a2.quotaWindows.length, 1);
+
+    // getAllQuotas threads the daemon's in-memory keychain material into the Claude fetcher.
+    resetQuotaCacheForTests();
+    const empty = () => ({ accountEmail: null, planTitle: null, quotaWindows: [], resetCreditsText: null });
+    let seen = null;
+    await getAllQuotas(t0, {
+      forceRefresh: true,
+      claudeQuotaEnabled: true,
+      claudeSafeStoragePasswords: ['pw-1'],
+      claudeCliCredentials: ['{"claudeAiOauth":{"accessToken":"tok"}}'],
+      _fetchers: {
+        codex: async () => empty(),
+        claude: async (_now, o) => {
+          seen = o;
+          return empty();
+        },
+        antigravity: async () => empty(),
+        cursor: async () => empty(),
+        codebuddy: () => empty(),
+      },
+    });
+    assert.deepEqual(seen.safeStoragePasswords, ['pw-1']);
+    assert.deepEqual(seen.cliCredentialsList, ['{"claudeAiOauth":{"accessToken":"tok"}}']);
+  } finally {
+    resetQuotaCacheForTests();
+    srv.closeAllConnections?.();
+    await new Promise((resolve) => srv.close(resolve));
     rmSync(tmp, { recursive: true, force: true });
   }
 });

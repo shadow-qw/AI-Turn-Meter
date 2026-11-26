@@ -48,6 +48,7 @@ let claudeFetchCache = {
   atMs: 0,
   cookieKey: '',
   proxyKey: '',
+  credKey: '',
   rateLimitUntilMs: 0,
   snapshot: null,
 };
@@ -61,7 +62,7 @@ export function resetQuotaCacheForTests() {
   inflightCacheKey = '';
   quotaRequestSeq += 1;
   lastGoodByTool = { codex: null, claude: null, cursor: null, antigravity: null };
-  claudeFetchCache = { atMs: 0, cookieKey: '', proxyKey: '', rateLimitUntilMs: 0, snapshot: null };
+  claudeFetchCache = { atMs: 0, cookieKey: '', proxyKey: '', credKey: '', rateLimitUntilMs: 0, snapshot: null };
   resetNetProxyCacheForTests();
 }
 
@@ -1986,20 +1987,35 @@ export async function fetchClaudeQuota(
     systemProxyState: proxyState,
   });
   const proxyKey = `${resolvedProxy.source}:${resolvedProxy.proxyUrl || ''}:${requireProxy ? '1' : '0'}`;
-  const canUseCache =
-    !fetchImpl &&
-    _proxyState === undefined &&
-    !_directFetch &&
-    _nativeHelperBin === undefined &&
-    safeStoragePasswords.length === 0 &&
-    cliCredentialsList.length === 0;
+  const credKey =
+    safeStoragePasswords.length > 0 || cliCredentialsList.length > 0
+      ? createHash('sha256')
+          .update(JSON.stringify([safeStoragePasswords, cliCredentialsList]))
+          .digest('hex')
+          .slice(0, 16)
+      : '';
+  const canUseCache = !fetchImpl && _proxyState === undefined && !_directFetch && _nativeHelperBin === undefined;
+  const sameCacheIdentity = () =>
+    claudeFetchCache.cookieKey === cookieKey &&
+    claudeFetchCache.proxyKey === proxyKey &&
+    claudeFetchCache.credKey === credKey;
+  // A 429 keeps the previous snapshot only when it belongs to the same identity; otherwise
+  // the backoff window would keep serving another account's quota.
+  const markRateLimited = (headers) => {
+    if (!canUseCache) return;
+    const keepSnapshot = sameCacheIdentity();
+    claudeFetchCache = {
+      atMs: keepSnapshot ? claudeFetchCache.atMs : 0,
+      snapshot: keepSnapshot ? claudeFetchCache.snapshot : null,
+      cookieKey,
+      proxyKey,
+      credKey,
+      rateLimitUntilMs: nowMs + parseRetryAfterMs(headers),
+    };
+  };
 
   if (!forceRefresh && allowNetwork && canUseCache) {
-    if (
-      claudeFetchCache.rateLimitUntilMs > nowMs &&
-      claudeFetchCache.cookieKey === cookieKey &&
-      claudeFetchCache.proxyKey === proxyKey
-    ) {
+    if (claudeFetchCache.rateLimitUntilMs > nowMs && sameCacheIdentity()) {
       if (claudeFetchCache.snapshot) {
         return { ...claudeFetchCache.snapshot, _errorKind: 'rate_limit' };
       }
@@ -2014,12 +2030,7 @@ export async function fetchClaudeQuota(
         _errorKind: 'rate_limit',
       };
     }
-    if (
-      claudeFetchCache.snapshot &&
-      claudeFetchCache.cookieKey === cookieKey &&
-      claudeFetchCache.proxyKey === proxyKey &&
-      nowMs - claudeFetchCache.atMs < CLAUDE_CACHE_TTL_MS
-    ) {
+    if (claudeFetchCache.snapshot && sameCacheIdentity() && nowMs - claudeFetchCache.atMs < CLAUDE_CACHE_TTL_MS) {
       return claudeFetchCache.snapshot;
     }
   }
@@ -2175,7 +2186,7 @@ export async function fetchClaudeQuota(
             _errorKind: null,
           };
           if (canUseCache) {
-            claudeFetchCache = { atMs: nowMs, cookieKey, proxyKey, rateLimitUntilMs: 0, snapshot: result };
+            claudeFetchCache = { atMs: nowMs, cookieKey, proxyKey, credKey, rateLimitUntilMs: 0, snapshot: result };
           }
           return result;
         }
@@ -2183,14 +2194,7 @@ export async function fetchClaudeQuota(
         if (usageRes.status === 429) {
           rateLimited = true;
           lastErrorKind = 'rate_limit';
-          if (!fetchImpl && _proxyState === undefined && !_directFetch && _nativeHelperBin === undefined) {
-            claudeFetchCache = {
-              ...claudeFetchCache,
-              cookieKey,
-              proxyKey,
-              rateLimitUntilMs: nowMs + parseRetryAfterMs(usageRes.headers),
-            };
-          }
+          markRateLimited(usageRes.headers);
           break;
         }
         lastErrorKind = usageRes.errorKind;
@@ -2237,14 +2241,7 @@ export async function fetchClaudeQuota(
             if (orgRes.status === 429) {
               rateLimited = true;
               lastErrorKind = 'rate_limit';
-              if (!fetchImpl && _proxyState === undefined && !_directFetch && _nativeHelperBin === undefined) {
-                claudeFetchCache = {
-                  ...claudeFetchCache,
-                  cookieKey,
-                  proxyKey,
-                  rateLimitUntilMs: nowMs + parseRetryAfterMs(orgRes.headers),
-                };
-              }
+              markRateLimited(orgRes.headers);
               break;
             }
             if (orgRes.ok && Array.isArray(orgRes.data) && orgRes.data.length > 0) {
@@ -2310,7 +2307,7 @@ export async function fetchClaudeQuota(
               _errorKind: null,
             };
             if (canUseCache) {
-              claudeFetchCache = { atMs: nowMs, cookieKey, proxyKey, rateLimitUntilMs: 0, snapshot: result };
+              claudeFetchCache = { atMs: nowMs, cookieKey, proxyKey, credKey, rateLimitUntilMs: 0, snapshot: result };
             }
             return result;
           }
@@ -2318,14 +2315,7 @@ export async function fetchClaudeQuota(
           if (usageRes.status === 429) {
             rateLimited = true;
             lastErrorKind = 'rate_limit';
-            if (!fetchImpl && _proxyState === undefined && !_directFetch && _nativeHelperBin === undefined) {
-              claudeFetchCache = {
-                ...claudeFetchCache,
-                cookieKey,
-                proxyKey,
-                rateLimitUntilMs: nowMs + parseRetryAfterMs(usageRes.headers),
-              };
-            }
+            markRateLimited(usageRes.headers);
             break;
           }
           lastErrorKind = usageRes.errorKind;
@@ -2567,6 +2557,8 @@ export async function getAllQuotas(
     claudeCookie = null,
     claudeProxyUrl = null,
     claudeQuotaEnabled = false,
+    claudeSafeStoragePasswords = [],
+    claudeCliCredentials = [],
     enabledTools = null,
     _fetchers = null,
   } = {}
@@ -2579,7 +2571,14 @@ export async function getAllQuotas(
   const claudeCookieKey = claudeCookie ? String(claudeCookie).trim() : '';
   const claudeProxyKey = claudeProxyUrl ? String(claudeProxyUrl).trim() : '';
   const claudeQuotaKey = claudeQuotaEnabled ? '1' : '0';
-  const cacheKey = `${cookieKey}|${claudeCookieKey}|${claudeProxyKey}|${claudeQuotaKey}|${enabledKey}`;
+  const claudeCredsKey =
+    claudeSafeStoragePasswords.length > 0 || claudeCliCredentials.length > 0
+      ? createHash('sha256')
+          .update(JSON.stringify([claudeSafeStoragePasswords, claudeCliCredentials]))
+          .digest('hex')
+          .slice(0, 16)
+      : '';
+  const cacheKey = `${cookieKey}|${claudeCookieKey}|${claudeProxyKey}|${claudeQuotaKey}|${claudeCredsKey}|${enabledKey}`;
 
   if (!forceRefresh && cachedResult && cachedCacheKey === cacheKey && nowMs - cachedAtMs < cachedTtlMs) {
     return assembleAllQuotas(cachedResult, enabledTools);
@@ -2615,7 +2614,14 @@ export async function getAllQuotas(
     const [codexRaw, claudeRaw, antigravityRaw, cursorRaw] = await Promise.all([
       isEnabled('codex') ? runCodex(nowMs, { allowNetwork }) : Promise.resolve(emptySnap()),
       shouldProbeClaudeQuota
-        ? runClaude(nowMs, { allowNetwork, forceRefresh, claudeCookie, claudeProxyUrl })
+        ? runClaude(nowMs, {
+            allowNetwork,
+            forceRefresh,
+            claudeCookie,
+            claudeProxyUrl,
+            safeStoragePasswords: claudeSafeStoragePasswords,
+            cliCredentialsList: claudeCliCredentials,
+          })
         : Promise.resolve(isEnabled('claude') ? claudeOfflineSnap() : emptySnap()),
       isEnabled('antigravity') ? runAntigravity(nowMs) : Promise.resolve(emptySnap()),
       isEnabled('cursor') ? runCursor(nowMs, { allowNetwork, cursorCookie }) : Promise.resolve(emptySnap()),
