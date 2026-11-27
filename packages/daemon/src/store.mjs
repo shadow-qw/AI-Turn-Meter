@@ -57,7 +57,7 @@ const RECENT_SESSIONS_CACHE_TTL_MS = 15_000;
  * producing data that historical files must be re-parsed for (e.g. usage buckets); every file
  * ingested under an older revision is then re-parsed once on the next scan.
  */
-export const INGEST_PARSER_REV = 1;
+export const INGEST_PARSER_REV = 2;
 
 function normalizeWorkspacePath(raw) {
   if (typeof raw !== 'string') return '';
@@ -281,6 +281,14 @@ export class TurnStore {
         call_key TEXT PRIMARY KEY,
         file_path TEXT NOT NULL
       );
+
+      -- Which session file produced each turn, so re-parsing a file replaces exactly the turns it
+      -- produced before (including ones a newer parser no longer emits) and nothing else.
+      CREATE TABLE IF NOT EXISTS turn_source (
+        turn_uid TEXT PRIMARY KEY,
+        file_path TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_turn_source_file ON turn_source(file_path);
 
       CREATE TABLE IF NOT EXISTS sync_meta (
         key TEXT PRIMARY KEY,
@@ -510,12 +518,27 @@ export class TurnStore {
       `INSERT INTO call_owner (call_key, file_path) VALUES (?, ?) ON CONFLICT(call_key) DO NOTHING`
     );
     this.deleteTurnStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
+    this.listFileTurnsStmt = this.db.prepare(`SELECT turn_uid FROM turn_source WHERE file_path = ?`);
+    this.setTurnSourceStmt = this.db.prepare(`
+      INSERT INTO turn_source (turn_uid, file_path) VALUES (?, ?)
+      ON CONFLICT(turn_uid) DO UPDATE SET file_path = excluded.file_path
+    `);
+    this.deleteTurnSourceStmt = this.db.prepare(`DELETE FROM turn_source WHERE turn_uid = ?`);
     this.getMetaStmt = this.db.prepare(`SELECT value FROM sync_meta WHERE key = ?`);
     this.setMetaStmt = this.db.prepare(`
       INSERT INTO sync_meta (key, value)
       VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `);
+
+    // A parser revision bump re-parses every session file; call ownership is rebuilt alongside it so
+    // it follows the current rules (oldest-created file first). Adapters do a full scan first while
+    // this is set, so an original session is not out-raced by a recent fork of it.
+    this.ingestResetPending = this.getMeta('ingest_parser_rev') !== String(INGEST_PARSER_REV);
+    if (this.ingestResetPending) {
+      this.db.exec('DELETE FROM call_owner; DELETE FROM ingest_state;');
+      this.setMeta('ingest_parser_rev', INGEST_PARSER_REV);
+    }
 
     this.sessionAggStmt = this.db.prepare(`
       SELECT
@@ -846,7 +869,40 @@ export class TurnStore {
   deleteTurns(turnUids) {
     if (!Array.isArray(turnUids) || turnUids.length === 0) return 0;
     let removed = 0;
-    for (const uid of turnUids) removed += Number(this.deleteTurnStmt.run(uid).changes) || 0;
+    for (const uid of turnUids) {
+      removed += Number(this.deleteTurnStmt.run(uid).changes) || 0;
+      this.deleteTurnSourceStmt.run(uid);
+    }
+    if (removed > 0) {
+      this.writeGeneration += 1;
+      this._recentSessionsCache.clear();
+    }
+    return removed;
+  }
+
+  /**
+   * Record that filePath now produces exactly turnUids: turns it produced on an earlier parse but no
+   * longer does are deleted, and each uid's source is (re)pointed at filePath.
+   */
+  syncFileTurns(filePath, turnUids) {
+    const keep = new Set(turnUids || []);
+    const stale = this.listFileTurnsStmt
+      .all(filePath)
+      .map((r) => r.turn_uid)
+      .filter((uid) => !keep.has(uid));
+    let removed = 0;
+    this.db.exec('BEGIN');
+    try {
+      for (const uid of stale) {
+        removed += Number(this.deleteTurnStmt.run(uid).changes) || 0;
+        this.deleteTurnSourceStmt.run(uid);
+      }
+      for (const uid of keep) this.setTurnSourceStmt.run(uid, filePath);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
     if (removed > 0) {
       this.writeGeneration += 1;
       this._recentSessionsCache.clear();

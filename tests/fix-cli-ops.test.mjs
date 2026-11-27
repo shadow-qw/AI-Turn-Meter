@@ -497,8 +497,12 @@ test('daemon.mjs handles EADDRINUSE cleanly with ISO timestamp and guards duplic
   try {
     const busyPort = await listenServer(blocker);
     const busyRes = await runSubprocessAsync(process.execPath, [DAEMON_BIN, `--port=${busyPort}`], {
+      // The daemon must never open the real ~/.local/share/ai-turn-meter/meter.db or scan real
+      // session logs: the DB path and every adapter root derive from HOME / AI_TURN_METER_DB.
       env: {
         ...process.env,
+        HOME: tmpState,
+        AI_TURN_METER_DB: join(tmpState, 'meter.db'),
         AI_TURN_METER_STATE_DIR: tmpState,
         AI_TURN_METER_DISABLE_CDP: '1',
       },
@@ -514,6 +518,8 @@ test('daemon.mjs handles EADDRINUSE cleanly with ISO timestamp and guards duplic
     const child = spawn(process.execPath, [DAEMON_BIN, `--port=${busyPort}`], {
       env: {
         ...process.env,
+        HOME: join(tmpState, 'run2'),
+        AI_TURN_METER_DB: join(tmpState, 'run2', 'meter.db'),
         AI_TURN_METER_STATE_DIR: join(tmpState, 'run2'),
         AI_TURN_METER_DISABLE_CDP: '1',
       },

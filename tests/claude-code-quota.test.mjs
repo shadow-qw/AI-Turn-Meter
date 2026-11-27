@@ -1570,6 +1570,108 @@ test('ClaudeCodeAdapter counts each API call once across resumed/forked session 
   }
 });
 
+test('ClaudeCodeAdapter keeps every call when a forked file still carries the source session id, in either processing order and after a rev-1 ownership mix-up', () => {
+  const ORIG = '11111111-1111-4111-8111-111111111111';
+  const FORK = '22222222-2222-4222-8222-222222222222';
+  const user = (sid, ts, text) =>
+    JSON.stringify({ type: 'user', sessionId: sid, cwd: '/Users/dev/repo', timestamp: ts, message: { role: 'user', content: text } });
+  const call = (sid, ts, id, cacheRead, out) =>
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: sid,
+      requestId: `req_${id}`,
+      cwd: '/Users/dev/repo',
+      timestamp: ts,
+      message: {
+        id,
+        model: 'claude-opus-5-5',
+        role: 'assistant',
+        content: [{ type: 'text', text: `reply ${id}` }],
+        usage: { input_tokens: 10, cache_read_input_tokens: cacheRead, output_tokens: out },
+      },
+    });
+  const origLines = [
+    user(ORIG, '2026-11-20T10:00:00.000Z', 'q1'),
+    call(ORIG, '2026-11-20T10:00:05.000Z', 'msg_1', 1_000_000, 1_000),
+    user(ORIG, '2026-11-20T10:01:00.000Z', 'q2'),
+    call(ORIG, '2026-11-20T10:01:05.000Z', 'msg_2', 2_000_000, 2_000),
+    user(ORIG, '2026-11-21T09:00:00.000Z', 'q3'),
+    call(ORIG, '2026-11-21T09:00:05.000Z', 'msg_3', 3_000_000, 3_000),
+  ];
+  // A fork copies the first two turns verbatim (lines keep the ORIG session id) and adds no call.
+  const forkLines = [...origLines.slice(0, 4), user(FORK, '2026-11-20T10:02:00.000Z', 'forked')];
+  const expected = { n: 3, cr: 6_000_000, o: 6_000 };
+  const sumTurns = (s) => {
+    const r = s.db.prepare(`SELECT COUNT(*) n, SUM(cache_read_tokens) cr, SUM(output_tokens) o FROM turns WHERE tool = 'claude'`).get();
+    return { n: r.n, cr: r.cr, o: r.o };
+  };
+
+  for (const forkFirst of [true, false]) {
+    const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-fork-'));
+    const dbPath = join(tmp, 'meter.db');
+    const root = join(tmp, '.claude');
+    const proj = join(root, 'projects', '-Users-dev-repo');
+    mkdirSync(proj, { recursive: true });
+    const origFile = join(proj, `${ORIG}.jsonl`);
+    const forkFile = join(proj, `${FORK}.jsonl`);
+    writeFileSync(origFile, origLines.join('\n') + '\n');
+    writeFileSync(forkFile, forkLines.join('\n') + '\n');
+    const older = new Date('2026-11-20T10:02:00Z');
+    const newer = new Date('2026-11-21T09:01:00Z');
+    utimesSync(forkFile, forkFirst ? older : newer, forkFirst ? older : newer);
+    utimesSync(origFile, forkFirst ? newer : older, forkFirst ? newer : older);
+    try {
+      const store = new TurnStore(dbPath);
+      const adapter = new ClaudeCodeAdapter({ store, claudeRoot: root, onTurns: () => {} });
+      adapter.scan({ maxRecentFiles: Infinity });
+      assert.deepEqual(sumTurns(store), expected, `forkFirst=${forkFirst}`);
+      const sessions = store.db.prepare(`SELECT DISTINCT session_id FROM turns WHERE tool = 'claude'`).all().map((r) => r.session_id);
+      assert.ok(sessions.every((sid) => sid === ORIG || sid === FORK));
+      assert.equal(adapter.scan({ maxRecentFiles: Infinity }).length, 0);
+      assert.deepEqual(sumTurns(store), expected);
+
+      // Reproduce what rev 1 left behind: the fork owned msg_1/msg_2 under the ORIG session id and the
+      // original's copies of those turns were deleted. Reopening under the current revision repairs it.
+      store.db.exec(`DELETE FROM turns; DELETE FROM turn_source; DELETE FROM call_owner; DELETE FROM sync_meta WHERE key = 'ingest_parser_rev';`);
+      const insOwner = store.db.prepare(`INSERT INTO call_owner (call_key, file_path) VALUES (?, ?)`);
+      insOwner.run('msg_1|req_msg_1', forkFile);
+      insOwner.run('msg_2|req_msg_2', forkFile);
+      insOwner.run('msg_3|req_msg_3', origFile);
+      store.db.exec(`UPDATE ingest_state SET parser_rev = 1`);
+      const turn3 = parseClaudeCodeSessionContent(origLines.join('\n'), { filePath: origFile }).find((t) => t.turnId === 'turn-3');
+      store.upsertTurn(turn3);
+      assert.deepEqual(sumTurns(store), { n: 1, cr: 3_000_000, o: 3_000 });
+      store.close();
+
+      const reopened = new TurnStore(dbPath);
+      assert.equal(reopened.ingestResetPending, true);
+      new ClaudeCodeAdapter({ store: reopened, claudeRoot: root, onTurns: () => {} }).scan({ maxRecentFiles: Infinity });
+      assert.deepEqual(sumTurns(reopened), expected, `repair forkFirst=${forkFirst}`);
+      reopened.close();
+      assert.equal(new TurnStore(dbPath).ingestResetPending, false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
+test('TurnStore.syncFileTurns replaces exactly the turns a file produced before', () => {
+  const store = new TurnStore(':memory:');
+  try {
+    const base = { tool: 'claude', host: 'claude-code', sessionId: 's', model: 'claude-opus-5-5', completedAtMs: 1, callCount: 1,
+      totalInputTokens: 1, uncachedInputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1, tpsMethod: 'unavailable' };
+    for (const id of ['a', 'b', 'c']) store.upsertTurn({ ...base, turnUid: `claude:s:${id}`, turnId: id });
+    store.syncFileTurns('/f1.jsonl', ['claude:s:a', 'claude:s:b']);
+    store.syncFileTurns('/f2.jsonl', ['claude:s:c']);
+    // A later parse of f1 no longer yields b: b goes, a stays, and f2's turn is untouched.
+    assert.equal(store.syncFileTurns('/f1.jsonl', ['claude:s:a']), 1);
+    const uids = store.db.prepare(`SELECT turn_uid FROM turns ORDER BY turn_uid`).all().map((r) => r.turn_uid);
+    assert.deepEqual(uids, ['claude:s:a', 'claude:s:c']);
+  } finally {
+    store.close();
+  }
+});
+
 test('ingest_state re-parses files ingested by older daemons or older parser revisions', () => {
   const store = new TurnStore(':memory:');
   try {

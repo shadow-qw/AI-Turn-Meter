@@ -481,6 +481,15 @@ export function parseClaudeCodeSessionContent(
   return completed;
 }
 
+// Claude Code names each main transcript after its session UUID. A forked session's file can still
+// carry the source session's id on the lines it copied, so the file name is the session identity.
+const SESSION_FILE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function fileOrderMs(st) {
+  const born = Number(st.birthtimeMs);
+  return born > 0 ? Math.min(born, st.mtimeMs) : st.mtimeMs;
+}
+
 export class ClaudeCodeAdapter {
   constructor({
     store,
@@ -523,13 +532,18 @@ export class ClaudeCodeAdapter {
       for (const ent of entries) {
         if (ent.isFile() && ent.name.endsWith('.jsonl')) {
           const fp = join(projPath, ent.name);
+          const base = basename(ent.name, '.jsonl');
           try {
             const st = statSync(fp);
             results.push({
               fp,
-              sessionId: basename(ent.name, '.jsonl'),
+              sessionId: base,
+              // Session id the turns are filed under. Legacy top-level agent-*.jsonl files keep the
+              // session id recorded in their lines.
+              ownSessionId: SESSION_FILE_UUID_RE.test(base) ? base : null,
               projectDir: projEnt.name,
               mtimeMs: st.mtimeMs,
+              orderMs: fileOrderMs(st),
               sizeBytes: st.size,
             });
           } catch {
@@ -552,8 +566,10 @@ export class ClaudeCodeAdapter {
               results.push({
                 fp,
                 sessionId: ent.name,
+                ownSessionId: ent.name,
                 projectDir: projEnt.name,
                 mtimeMs: st.mtimeMs,
+                orderMs: fileOrderMs(st),
                 sizeBytes: st.size,
               });
             } catch {
@@ -575,8 +591,12 @@ export class ClaudeCodeAdapter {
       files = files.slice(0, maxRecentFiles);
     }
 
+    // Oldest-created first: the original session file owns the API calls that resumed or forked
+    // copies of it repeat, and each call is counted exactly once.
+    files.sort((a, b) => a.orderMs - b.orderMs || a.mtimeMs - b.mtimeMs || (a.fp < b.fp ? -1 : a.fp > b.fp ? 1 : 0));
+
     const changed = [];
-    for (const { fp, mtimeMs, sizeBytes } of files.reverse()) {
+    for (const { fp, ownSessionId, mtimeMs, sizeBytes } of files) {
       const mem = this.fileMtimes.get(fp);
       if (mem && mem.mtimeMs === mtimeMs && mem.sizeBytes === sizeBytes) continue;
 
@@ -593,12 +613,11 @@ export class ClaudeCodeAdapter {
         continue;
       }
 
-      // Files are processed oldest-first, so an API call copied into a resumed/forked session
-      // stays attributed to the file it first appeared in and is counted exactly once.
       const seenCallKeys = new Set();
       const droppedTurnUids = [];
       const turns = parseClaudeCodeSessionContent(content, {
         filePath: fp,
+        sessionId: ownSessionId,
         isForeignCall: this.store.isCallOwnedByOtherFile
           ? (key) => this.store.isCallOwnedByOtherFile(key, fp)
           : null,
@@ -611,8 +630,10 @@ export class ClaudeCodeAdapter {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
       }
-      // Turns that only repeated calls owned by another file were double counted before.
+      // Rows written before turn provenance existed: turns of this file that only repeated calls
+      // owned by another file were double counted.
       this.store.deleteTurns?.(droppedTurnUids);
+      this.store.syncFileTurns?.(fp, turns.map((t) => t.turnUid));
       this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
     }
 
@@ -623,7 +644,7 @@ export class ClaudeCodeAdapter {
   }
 
   start() {
-    this.scan({ maxRecentFiles: 24 });
+    this.scan({ maxRecentFiles: this.store.ingestResetPending ? Infinity : 24 });
     this.backfillTimer = setTimeout(() => {
       this.backfillTimer = null;
       this.scan({ maxRecentFiles: Infinity });
