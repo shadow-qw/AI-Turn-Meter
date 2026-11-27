@@ -54,11 +54,20 @@ execFileSync('python3', [
   `
 import os, zipfile
 stage, out = ${JSON.stringify(STAGE_DIR)}, ${JSON.stringify(OUT_VSIX)}
+entries = []
+for dp, dns, fns in os.walk(stage):
+    dns.sort()
+    for fn in sorted(fns):
+        fp = os.path.join(dp, fn)
+        entries.append((os.path.relpath(fp, stage).replace(os.sep, '/'), fp))
+entries.sort(key=lambda item: item[0])
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
-    for dp, _, fns in os.walk(stage):
-        for fn in fns:
-            fp = os.path.join(dp, fn)
-            zf.write(fp, os.path.relpath(fp, stage))
+    for rel, fp in entries:
+        zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        zi.external_attr = 0o644 << 16
+        with open(fp, 'rb') as f:
+            zf.writestr(zi, f.read())
 `,
 ]);
 

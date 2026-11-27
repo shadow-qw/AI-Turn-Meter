@@ -33,7 +33,7 @@ jobs:
 
       - name: Build release tarball & DMG
         run: |
-          npm run release:tarball
+          node scripts/build-release.mjs --verify-formula
           npm run release:dmg
 
       - name: Generate SHA256SUMS.txt
@@ -51,3 +51,14 @@ jobs:
             dist/*.tar.gz.sha256
             dist/*.vsix
             dist/SHA256SUMS.txt
+
+      - name: Verify published release tarball matches Homebrew formula
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if node scripts/build-release.mjs --sync-release --verify-only; then
+              exit 0
+            fi
+            echo "Retry $attempt/5 waiting for GitHub Release asset..."
+            sleep 3
+          done
+          exit 1

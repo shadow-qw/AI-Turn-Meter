@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import Module from 'node:module';
 import { tmpdir } from 'node:os';
@@ -31,7 +32,11 @@ import {
   sortSemverDesc,
 } from '../scripts/build-dmg.mjs';
 import { decompressZstdSync } from '../packages/daemon/src/zstd.mjs';
-import { assertVersionParity as assertReleaseVersionParity } from '../scripts/build-release.mjs';
+import {
+  assertVersionParity as assertReleaseVersionParity,
+  createDeterministicTarGz,
+  verifyFormulaSha256,
+} from '../scripts/build-release.mjs';
 
 const REPO_ROOT = process.cwd();
 const CLI_BIN = join(REPO_ROOT, 'packages', 'daemon', 'bin', 'cli.mjs');
@@ -871,4 +876,37 @@ Load command 9
       }),
     /LSMinimumSystemVersion \(13\.0\) is lower than runtime\/node Mach-O minos \(13\.5\)/
   );
+});
+
+test('createDeterministicTarGz produces identical SHA-256 across builds and verifyFormulaSha256 detects drift', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-det-tar-'));
+  try {
+    const s1 = join(tmpDir, 's1');
+    const s2 = join(tmpDir, 's2');
+    const longSub = join('ai-turn-meter-0.2.38', 'packages', 'desktop-macos', 'Sources', 'AITurnMeterApp', 'VeryLongNestedDirectoryNameForPaxTest');
+    for (const root of [s1, s2]) {
+      mkdirSync(join(root, longSub), { recursive: true });
+      writeFileSync(join(root, 'ai-turn-meter-0.2.38', 'package.json'), '{"name":"ai-turn-meter"}\n');
+      writeFileSync(join(root, longSub, 'hello-world-deterministic-test.txt'), 'deterministic content\n');
+    }
+    utimesSync(join(s1, 'ai-turn-meter-0.2.38', 'package.json'), new Date('2026-01-01T00:00:00Z'), new Date('2026-01-01T00:00:00Z'));
+    utimesSync(join(s2, 'ai-turn-meter-0.2.38', 'package.json'), new Date('2026-11-27T12:34:56Z'), new Date('2026-11-27T12:34:56Z'));
+
+    const t1 = join(tmpDir, 'a.tar.gz');
+    const t2 = join(tmpDir, 'b.tar.gz');
+    const sha1 = createDeterministicTarGz(s1, 'ai-turn-meter-0.2.38', t1);
+    const sha2 = createDeterministicTarGz(s2, 'ai-turn-meter-0.2.38', t2);
+    assert.equal(sha1, sha2);
+    assert.equal(createHash('sha256').update(readFileSync(t1)).digest('hex'), sha1);
+
+    const listed = execFileSync('tar', ['-tzf', t1], { encoding: 'utf8' });
+    assert.match(listed, /hello-world-deterministic-test\.txt/);
+
+    const rbPath = join(tmpDir, 'formula.rb');
+    writeFileSync(rbPath, `class Foo < Formula\n  sha256 "${sha1}"\nend\n`);
+    assert.equal(verifyFormulaSha256(rbPath, sha1).actual, sha1);
+    assert.throws(() => verifyFormulaSha256(rbPath, '0'.repeat(64)), /sha256 mismatch/);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
