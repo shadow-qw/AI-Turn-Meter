@@ -52,6 +52,6 @@ jobs:
             node packages/daemon/bin/daemon.mjs --port=47987 --once
           AI_TURN_METER_DB="$TMP_STATE/meter.db" AI_TURN_METER_STATE_DIR="$TMP_STATE" \
             node packages/daemon/bin/cli.mjs receipt --json >/dev/null
-          node -e 'Promise.all([import("./packages/daemon/src/adapters/codex.mjs"), import("./packages/daemon/src/quota.mjs")]).then(() => console.log("zstd-safe imports ok"))'
+          node -e 'import("./packages/daemon/src/adapters/codex.mjs").then(() => console.log("codex zstd-safe import ok"))'
           SQLITE_FLAG=$(node -p 'Number(process.versions.node.split(".")[1]) < 13 ? "--experimental-sqlite" : ""')
-          node $SQLITE_FLAG -e 'import("./packages/daemon/src/server.mjs").then(() => console.log("server import ok"))'
+          node $SQLITE_FLAG -e 'Promise.all([import("./packages/daemon/src/quota.mjs"), import("./packages/daemon/src/server.mjs")]).then(() => console.log("sqlite-backed imports ok"))'
