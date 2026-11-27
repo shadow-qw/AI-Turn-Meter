@@ -166,9 +166,7 @@ const MODEL_PRICING_PER_M = {
 
   // Google / Antigravity
   'gemini-4-neon': { input: 3.0, cacheRead: 0.15, output: 15.0 },
-  'gemini-pro-orchestrator-neon': { input: 3.0, cacheRead: 0.15, output: 15.0 },
   'gemini-4-hydrogen': { input: 1.5, cacheRead: 0.075, output: 7.5 },
-  'gemini-pro-orchestrator-g1-pro': { input: 1.5, cacheRead: 0.075, output: 7.5 },
   'gemini-4-carbon': {
     input: 2.0,
     cacheRead: 0.1,
@@ -208,16 +206,10 @@ const MODEL_PRICING_PER_M = {
     output: 3.75,
     effectiveChanges: [{ fromMs: Date.UTC(2027, 0, 1), input: 1.5, cacheRead: 0.15, output: 7.5 }],
   },
-  // Antigravity's flash sub-agent worker (shown under "Gemini 4 Hydrogen (Orchestrator)"). Google
-  // publishes no rate for it; priced as the current Flash generation (3.8 Flash).
-  'gemini-flash-worker-agy': {
-    input: 0.75,
-    cacheRead: 0.075,
-    output: 3.75,
-    effectiveChanges: [{ fromMs: Date.UTC(2027, 0, 1), input: 1.5, cacheRead: 0.15, output: 7.5 }],
-  },
   // Gemini 3 Flash (gemini-3-flash-preview): $0.50 / $0.05 / $3.00.
   'gemini-3-flash-preview': { input: 0.5, cacheRead: 0.05, output: 3.0 },
+  // Gemini 3.5 Flash is retired from the pricing page; rate from models.dev / LiteLLM.
+  'gemini-3.5-flash': { input: 1.5, cacheRead: 0.15, output: 9.0 },
   'gemini-3.1-pro': {
     input: 2.0,
     cacheRead: 0.2,
@@ -464,13 +456,29 @@ const MODEL_ALIASES = {
   'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
   'gemini-pro-default': 'gemini-3.1-pro',
   'gemini-pro-agent': 'gemini-3.1-pro',
-  // Gemini 3.7 Flash has no public rate; the 3.6 and 3.8 Flash generations around it share one price.
+  // Gemini 3.7 Flash is not on Google's pricing page; models.dev and LiteLLM list the same
+  // $0.75 / $0.075 / $3.75 as 3.6 and 3.8 Flash, so it follows their schedule.
   'gemini-3.7-flash-safety-le': 'gemini-3.6-flash',
   'gemini-3.7-flash-exp-b': 'gemini-3.6-flash',
   'gemini-3.7-flash': 'gemini-3.6-flash',
-  // Antigravity's Gemini 3 Flash codename.
-  'gemini-3-flash-a': 'gemini-3-flash-preview',
+  // Antigravity response-model codenames, mapped the same way as ccusage and tokscale: the
+  // gemini-3-flash-a/-b/-agent family is the legacy responseModel of Gemini 3.5 Flash.
+  'gemini-3-flash-a': 'gemini-3.5-flash',
+  'gemini-3-flash-b': 'gemini-3.5-flash',
+  'gemini-3-flash-agent': 'gemini-3.5-flash',
+  'gemini-3-flash-agent-a': 'gemini-3.5-flash',
+  'gemini-3-flash-agent-b': 'gemini-3.5-flash',
+  'gemini-3-flash-c': 'gemini-3-flash-preview',
   'gemini-3-flash': 'gemini-3-flash-preview',
+  // Orchestrator mode (antigravity.google/docs/models#orchestrator): planner steps report the
+  // orchestrator id, executor steps report gemini-flash-worker-agy, which is Gemini 4 Hydrogen
+  // (google-antigravity/antigravity-cli#1710). g1-pro is "Orchestrator (Argon)"; the plain id is the
+  // Enterprise pairing with a Gemini 4 Carbon planner.
+  'gemini-pro-orchestrator': 'gemini-4-carbon',
+  'gemini-pro-orchestrator-argon': 'gemini-4-argon',
+  'gemini-pro-orchestrator-g1-pro': 'gemini-4-argon',
+  'gemini-pro-orchestrator-neon': 'gemini-4-neon',
+  'gemini-flash-worker-agy': 'gemini-4-hydrogen',
   'claude-sonnet-3.7': 'claude-3.7-sonnet',
   'claude-sonnet-3.5': 'claude-3.5-sonnet',
   'claude-haiku-3.5': 'claude-3.5-haiku',

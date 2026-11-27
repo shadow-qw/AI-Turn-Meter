@@ -236,12 +236,30 @@ test('Forked rollout with an unknown parent skips only the file-level baseline, 
 
 test('Gemini Flash rates follow the published schedule and Antigravity codenames resolve', () => {
   const rate = (m) => resolveModelPricing(m);
-  for (const m of ['gemini-3.8-flash', 'gemini-3.8-flash-n', 'gemini-3.8-flash-tiered', 'gemini-3.6-flash', 'Gemini 3.6 Flash (High)', 'gemini-3.7-flash', 'gemini-3.7-flash-exp-b', 'gemini-flash-worker-agy']) {
+  for (const m of ['gemini-3.8-flash', 'gemini-3.8-flash-n', 'gemini-3.8-flash-tiered', 'gemini-3.6-flash', 'Gemini 3.6 Flash (High)', 'gemini-3.7-flash', 'gemini-3.7-flash-exp-b']) {
     assert.equal(rate(m)?.input, 0.75, m);
     assert.equal(rate(m)?.output, 3.75, m);
   }
-  assert.equal(rate('gemini-3-flash-a')?.input, 0.5);
-  assert.equal(rate('gemini-3-flash-a')?.output, 3.0);
+  // Legacy Gemini 3.5 Flash responseModel ids (as ccusage / tokscale map them).
+  for (const m of ['gemini-3-flash-a', 'gemini-3-flash-b', 'gemini-3-flash-agent']) {
+    assert.deepEqual([rate(m)?.input, rate(m)?.cacheRead, rate(m)?.output], [1.5, 0.15, 9.0], m);
+  }
+  assert.equal(rate('gemini-3-flash')?.input, 0.5);
+
+  // Orchestrator: executor steps are Gemini 4 Hydrogen, g1-pro / argon planners are Gemini 4 Argon,
+  // the Enterprise default planner is Gemini 4 Carbon.
+  assert.equal(rate('gemini-flash-worker-agy'), rate('gemini-4-hydrogen'));
+  assert.equal(rate('gemini-pro-orchestrator-g1-pro'), rate('gemini-4-argon'));
+  assert.equal(rate('gemini-pro-orchestrator-argon'), rate('gemini-4-argon'));
+  assert.equal(rate('gemini-pro-orchestrator-neon'), rate('gemini-4-neon'));
+  assert.equal(rate('gemini-pro-orchestrator'), rate('gemini-4-carbon'));
+  const planner = (completedAtMs) => ({
+    model: 'gemini-pro-orchestrator-g1-pro',
+    completedAtMs,
+    usageBuckets: [{ m: 'gemini-pro-orchestrator-g1-pro', b: 'le_200k', c: 1, in: 1_000_000, u: 1_000_000, cr: 0, cw5: 0, cw1h: 0, out: 1_000_000 }],
+  });
+  assert.equal(estimateTurnCost(planner(Date.UTC(2026, 10, 20))).costUsd, 12.0);
+  assert.equal(estimateTurnCost(planner(Date.UTC(2026, 11, 2))).costUsd, 24.0);
 
   const turn = (completedAtMs) => ({
     model: 'gemini-3.8-flash-n',
