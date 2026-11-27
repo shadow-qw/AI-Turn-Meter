@@ -60,22 +60,6 @@ if (
 
   meter.server.on('error', handleServerError);
 
-  try {
-    await meter.start();
-  } catch (err) {
-    handleServerError(err);
-  }
-
-  console.log(`[${ts()}] [ai-turn-meter] daemon listening on http://127.0.0.1:${port} (pid ${process.pid})`);
-
-  if (args.has('--once')) {
-    const state = meter.store.getState(5);
-    console.log(JSON.stringify(state, null, 2));
-    await meter.stop();
-    console.log(`[${ts()}] [ai-turn-meter] daemon --once complete, stopped cleanly.`);
-    process.exit(0);
-  }
-
   let shuttingDown = false;
   async function shutdown(sig) {
     if (shuttingDown) return;
@@ -95,5 +79,21 @@ if (
     process.on(sig, () => {
       shutdown(sig);
     });
+  }
+
+  try {
+    await meter.start();
+  } catch (err) {
+    handleServerError(err);
+  }
+
+  console.log(`[${ts()}] [ai-turn-meter] daemon listening on http://127.0.0.1:${port} (pid ${process.pid})`);
+
+  if (args.has('--once')) {
+    const state = meter.store.getState(5);
+    console.log(JSON.stringify(state, null, 2));
+    await meter.stop();
+    console.log(`[${ts()}] [ai-turn-meter] daemon --once complete, stopped cleanly.`);
+    process.exit(0);
   }
 }

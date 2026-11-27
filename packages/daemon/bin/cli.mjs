@@ -1038,13 +1038,6 @@ async function cmdDaemon(flags) {
   };
 
   meter.server.on('error', handleServerError);
-  try {
-    await meter.start();
-  } catch (err) {
-    handleServerError(err);
-    return;
-  }
-  console.log(`[${ts()}] [ai-turn-meter] daemon listening on http://127.0.0.1:${port} (pid ${process.pid})`);
 
   let shuttingDown = false;
   const shutdown = async (sig) => {
@@ -1066,6 +1059,14 @@ async function cmdDaemon(flags) {
       shutdown(sig);
     });
   }
+
+  try {
+    await meter.start();
+  } catch (err) {
+    handleServerError(err);
+    return;
+  }
+  console.log(`[${ts()}] [ai-turn-meter] daemon listening on http://127.0.0.1:${port} (pid ${process.pid})`);
 }
 
 function isDirectExecution() {
