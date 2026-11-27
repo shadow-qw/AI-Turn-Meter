@@ -209,6 +209,23 @@ export async function syncOrVerifyReleaseSha256({
   return { url, remoteSha256, bytes: buf.length };
 }
 
+/**
+ * Gzip output depends on the zlib bundled with Node, so a tarball whose sha256 goes into the Homebrew
+ * formula must be built with the exact Node version CI uses (pinned in .nvmrc).
+ */
+export function assertReleaseNodeVersion(rootDir = ROOT, nodeVersion = process.versions.node) {
+  const nvmrcPath = join(rootDir, '.nvmrc');
+  if (!existsSync(nvmrcPath)) return null;
+  const want = readFileSync(nvmrcPath, 'utf8').trim().replace(/^v/, '');
+  if (want && nodeVersion !== want) {
+    throw new Error(
+      `Release tarballs must be built with Node ${want} (.nvmrc) so the Homebrew sha256 matches CI's build; ` +
+        `this is Node ${nodeVersion}. Run \`nvm use\` and retry.`
+    );
+  }
+  return want || null;
+}
+
 export function assertVersionParity(rootDir = ROOT, { warn = (msg) => console.warn(msg) } = {}) {
   const rootPkg = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
   const extPkg = JSON.parse(readFileSync(join(rootDir, 'packages', 'vscode-extension', 'package.json'), 'utf8'));
@@ -255,6 +272,7 @@ async function main() {
     return;
   }
 
+  assertReleaseNodeVersion(ROOT);
   const { rootVersion: version } = assertVersionParity(ROOT);
   const repoArg = args.find((a) => a.startsWith('--repo='));
   const repo = repoArg ? repoArg.split('=')[1].trim() : null;

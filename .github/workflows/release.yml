@@ -15,7 +15,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          # The tarball's gzip bytes depend on Node's bundled zlib, so CI must build with the same
+          # Node as the local `npm run release:tarball` that wrote the formula's sha256.
+          node-version-file: '.nvmrc'
 
       - name: Verify tag matches package.json version
         run: |

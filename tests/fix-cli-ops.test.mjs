@@ -33,6 +33,7 @@ import {
 } from '../scripts/build-dmg.mjs';
 import { decompressZstdSync } from '../packages/daemon/src/zstd.mjs';
 import {
+  assertReleaseNodeVersion,
   assertVersionParity as assertReleaseVersionParity,
   createDeterministicTarGz,
   verifyFormulaSha256,
@@ -906,6 +907,18 @@ test('createDeterministicTarGz produces identical SHA-256 across builds and veri
     writeFileSync(rbPath, `class Foo < Formula\n  sha256 "${sha1}"\nend\n`);
     assert.equal(verifyFormulaSha256(rbPath, sha1).actual, sha1);
     assert.throws(() => verifyFormulaSha256(rbPath, '0'.repeat(64)), /sha256 mismatch/);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('assertReleaseNodeVersion requires the .nvmrc Node so local and CI gzip bytes match', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-nvmrc-'));
+  try {
+    assert.equal(assertReleaseNodeVersion(tmpDir, '24.22.3'), null);
+    writeFileSync(join(tmpDir, '.nvmrc'), 'v24.12.0\n');
+    assert.equal(assertReleaseNodeVersion(tmpDir, '24.12.0'), '24.12.0');
+    assert.throws(() => assertReleaseNodeVersion(tmpDir, '24.22.3'), /must be built with Node 24\.12\.0/);
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
