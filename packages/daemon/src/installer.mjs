@@ -87,6 +87,27 @@ export function buildHookCommand({ nodeBin = resolveNodeBin(), root = resolvePac
 }
 
 /**
+ * Node 22.5–22.12 ships `node:sqlite` behind `--experimental-sqlite` (unflagged in 22.13+).
+ */
+export function needsExperimentalSqliteFlag(version = process.versions.node) {
+  const clean = String(version || '').replace(/^v/i, '');
+  const [major = 0, minor = 0] = clean.split('.').map(Number);
+  return major === 22 && minor >= 5 && minor < 13;
+}
+
+function detectNodeVersion(nodeBin) {
+  if (!nodeBin || nodeBin === process.execPath) return process.versions.node || '0.0.0';
+  try {
+    return execFileSync(nodeBin, ['-p', 'process.versions.node'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    }).trim();
+  } catch {
+    return process.versions.node || '0.0.0';
+  }
+}
+
+/**
  * Verify Node version (>= 22.5, required for built-in `node:sqlite`).
  */
 export async function checkNodeRuntime() {
@@ -269,10 +290,13 @@ export function installCliLink({
     if (!dryRun) {
       mkdirSync(dirname(cliDst), { recursive: true });
       rmSync(cliDst, { force: true });
+      const sqliteFlag = needsExperimentalSqliteFlag(detectNodeVersion(nodeBin))
+        ? ' --experimental-sqlite'
+        : '';
       const wrapper = `#!/bin/sh
 export AI_TURN_METER_NODE_BIN=${quoteShellArg(nodeBin)}
 export AI_TURN_METER_STABLE_ROOT=${quoteShellArg(root)}
-exec ${quoteShellArg(nodeBin)} ${quoteShellArg(cliSrc)} "$@"
+exec ${quoteShellArg(nodeBin)}${sqliteFlag} ${quoteShellArg(cliSrc)} "$@"
 `;
       writeFileSync(cliDst, wrapper, { mode: 0o755 });
     }
@@ -303,10 +327,14 @@ export function buildLaunchAgentPlist({
   nodeBin = resolveNodeBin(),
   root = resolvePackageRoot(),
   homeDir = homedir(),
+  nodeVersion = null,
 } = {}) {
   const logDir = join(homeDir, '.local', 'share', 'ai-turn-meter', 'logs');
   const daemonBin = join(root, 'packages', 'daemon', 'bin', 'daemon.mjs');
   const runtimePath = `${dirname(nodeBin)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
+  const sqliteArg = needsExperimentalSqliteFlag(nodeVersion || detectNodeVersion(nodeBin))
+    ? `\n    <string>--experimental-sqlite</string>`
+    : '';
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -316,7 +344,7 @@ export function buildLaunchAgentPlist({
   <string>${LAUNCH_AGENT_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xmlEscape(nodeBin)}</string>
+    <string>${xmlEscape(nodeBin)}</string>${sqliteArg}
     <string>${xmlEscape(daemonBin)}</string>
   </array>
   <key>EnvironmentVariables</key>

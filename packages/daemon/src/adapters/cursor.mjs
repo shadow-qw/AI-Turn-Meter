@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { cursorApiJson, resolveCursorCookieCandidates, resolveCursorCookieHeader } from '../quota.mjs';
@@ -189,33 +189,103 @@ export function processCursorHookPayload(payload, { stateDir = defaultStateDir()
   return null;
 }
 
+const DRAINING_SPOOL_PREFIX = 'cursor-spool.jsonl.draining-';
+
 export function drainCursorSpool(store, stateDir = defaultStateDir()) {
-  const spoolFile = join(stateDir, 'cursor-spool.jsonl');
-  if (!existsSync(spoolFile)) return [];
-  const tmpFile = `${spoolFile}.draining-${process.pid}-${Date.now()}`;
-  let lines;
+  if (!stateDir || !existsSync(stateDir)) return [];
+
+  let batchFiles = [];
   try {
-    renameSync(spoolFile, tmpFile);
-    lines = readFileSync(tmpFile, 'utf8').split(/\r?\n/).filter(Boolean);
+    batchFiles = readdirSync(stateDir)
+      .filter((name) => name.startsWith(DRAINING_SPOOL_PREFIX))
+      .sort()
+      .map((name) => join(stateDir, name));
   } catch {
     return [];
-  } finally {
+  }
+
+  const spoolFile = join(stateDir, 'cursor-spool.jsonl');
+  if (existsSync(spoolFile)) {
+    const tmpFile = `${spoolFile}.draining-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     try {
-      if (existsSync(tmpFile)) rmSync(tmpFile, { force: true });
-    } catch {
-      // ignore cleanup error
+      renameSync(spoolFile, tmpFile);
+      batchFiles.push(tmpFile);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        // Leave spoolFile intact for the next drain attempt.
+      }
     }
   }
+
+  if (batchFiles.length === 0) return [];
+
   const records = [];
-  for (const l of lines) {
+  for (const batchFile of batchFiles) {
+    let raw;
     try {
-      const turn = JSON.parse(l);
-      const res = store.upsertTurn(turn);
-      if (res.changed) records.push(res.record);
+      raw = readFileSync(batchFile, 'utf8');
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      // Preserve unreadable batch file for later recovery and stop to keep chronological order.
+      break;
+    }
+
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const validTurns = [];
+    for (const l of lines) {
+      try {
+        const parsed = JSON.parse(l);
+        if (parsed && typeof parsed === 'object') {
+          validTurns.push(parsed);
+        }
+      } catch {
+        // Skip malformed JSON line so it cannot poison valid records in the batch.
+      }
+    }
+
+    if (validTurns.length === 0) {
+      try {
+        rmSync(batchFile, { force: true });
+      } catch {}
+      continue;
+    }
+
+    const batchRecords = [];
+    const hasTx = Boolean(store?.db && typeof store.db.exec === 'function');
+    let txStarted = false;
+    try {
+      if (hasTx) {
+        store.db.exec('BEGIN');
+        txStarted = true;
+      }
+      for (const turn of validTurns) {
+        const res = store.upsertTurn(turn);
+        if (res?.changed && res.record) {
+          batchRecords.push(res.record);
+        }
+      }
+      if (txStarted) {
+        store.db.exec('COMMIT');
+        txStarted = false;
+      }
     } catch {
-      // ignore malformed spool line
+      if (txStarted) {
+        try {
+          store.db.exec('ROLLBACK');
+        } catch {}
+      }
+      // Keep the draining batch file intact on SQLite/write failure so the next drain retries.
+      break;
+    }
+
+    records.push(...batchRecords);
+    try {
+      rmSync(batchFile, { force: true });
+    } catch {
+      // Ignore cleanup error; upsertTurn is idempotent by turn_uid on retry.
     }
   }
+
   return records;
 }
 

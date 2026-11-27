@@ -8,9 +8,11 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   APP_LAUNCH_AGENT_LABEL,
+  buildLaunchAgentPlist,
   installAll,
   installVsix,
   LAUNCH_AGENT_LABEL,
+  needsExperimentalSqliteFlag,
   runDoctor,
 } from '../packages/daemon/src/installer.mjs';
 import {
@@ -21,10 +23,14 @@ import {
   parseAppAutostartAction,
 } from '../packages/daemon/bin/cli.mjs';
 import {
+  assertMinimumSystemVersionCompatible,
   assertVersionParity as assertDmgVersionParity,
+  parseMachOMinOs,
+  resolveMinimumSystemVersion,
   shouldCopyBundlePath,
   sortSemverDesc,
 } from '../scripts/build-dmg.mjs';
+import { decompressZstdSync } from '../packages/daemon/src/zstd.mjs';
 import { assertVersionParity as assertReleaseVersionParity } from '../scripts/build-release.mjs';
 
 const REPO_ROOT = process.cwd();
@@ -803,4 +809,66 @@ test('build-dmg semver sorting, .DS_Store filter, version parity check, and Home
   const formula = readFileSync(join(REPO_ROOT, 'packaging', 'homebrew', 'ai-turn-meter.rb'), 'utf8');
   assert.match(formula, /brew upgrade/);
   assert.match(formula, /ai-turn-meter install/);
+});
+
+test('Node 22.5-22.14 compatibility: dynamic zstd fallback, sqlite flag detection, and no static zstd imports', () => {
+  const sampleBuf = Buffer.from('28b52ffd', 'hex');
+  assert.equal(decompressZstdSync(sampleBuf, { nativeImpl: null, cliFallback: null }), null);
+  assert.equal(
+    decompressZstdSync(sampleBuf, {
+      nativeImpl: null,
+      cliFallback: () => Buffer.from('ok'),
+    }).toString('utf8'),
+    'ok'
+  );
+
+  const codexSrc = readFileSync(join(REPO_ROOT, 'packages', 'daemon', 'src', 'adapters', 'codex.mjs'), 'utf8');
+  const quotaSrc = readFileSync(join(REPO_ROOT, 'packages', 'daemon', 'src', 'quota.mjs'), 'utf8');
+  assert.doesNotMatch(codexSrc, /import\s*\{[^}]*zstdDecompressSync[^}]*\}\s*from\s*['"]node:zlib['"]/);
+  assert.doesNotMatch(quotaSrc, /import\s*\{[^}]*zstdDecompressSync[^}]*\}\s*from\s*['"]node:zlib['"]/);
+
+  assert.equal(needsExperimentalSqliteFlag('22.5.0'), true);
+  assert.equal(needsExperimentalSqliteFlag('22.12.9'), true);
+  assert.equal(needsExperimentalSqliteFlag('22.13.0'), false);
+  assert.equal(needsExperimentalSqliteFlag('24.12.0'), false);
+
+  const plist225 = buildLaunchAgentPlist({ nodeBin: '/usr/local/bin/node', nodeVersion: '22.5.0' });
+  const plist24 = buildLaunchAgentPlist({ nodeBin: '/usr/local/bin/node', nodeVersion: '24.12.0' });
+  assert.match(plist225, /<string>--experimental-sqlite<\/string>/);
+  assert.doesNotMatch(plist24, /--experimental-sqlite/);
+});
+
+test('build-dmg Mach-O minos parsing and LSMinimumSystemVersion compatibility enforcement', () => {
+  const sampleOtool = `
+Load command 9
+      cmd LC_BUILD_VERSION
+  cmdsize 32
+ platform 1
+    minos 13.5
+      sdk 15.0
+`;
+  assert.equal(parseMachOMinOs(sampleOtool), '13.5');
+  assert.equal(parseMachOMinOs('cmd LC_VERSION_MIN_MACOSX\n version 13.0\n'), '13.0');
+  assert.equal(
+    resolveMinimumSystemVersion({ declaredMinOs: '13.0', binaryMinVersions: ['13.0', '13.5'] }),
+    '13.5'
+  );
+  assert.equal(
+    assertMinimumSystemVersionCompatible({
+      plistMinOs: '13.5',
+      binaries: [
+        { name: 'AITurnMeter', minOs: '13.0' },
+        { name: 'runtime/node', minOs: '13.5' },
+      ],
+    }),
+    '13.5'
+  );
+  assert.throws(
+    () =>
+      assertMinimumSystemVersionCompatible({
+        plistMinOs: '13.0',
+        binaries: [{ name: 'runtime/node', minOs: '13.5' }],
+      }),
+    /LSMinimumSystemVersion \(13\.0\) is lower than runtime\/node Mach-O minos \(13\.5\)/
+  );
 });

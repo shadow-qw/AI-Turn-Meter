@@ -314,16 +314,23 @@ struct ClaudeWebLoginSheetView: View {
   @State private var reloadToken: Int = 0
   @State private var proxyCheckTick: Int = 0
   @State private var clearOnOpen: Bool
+  @State private var proxyOutcome: ClaudeWebProxyHelper.ProxyBindOutcome
 
   @MainActor
   init(vm: MeterViewModel) {
     self.vm = vm
     self._clearOnOpen = State(initialValue: vm.hasClaudeCookie)
+    self._proxyOutcome = State(
+      initialValue: ClaudeWebProxyHelper.prepareWebsiteDataStore(proxyUrl: vm.effectiveClaudeProxyUrl)
+    )
+  }
+
+  private func refreshProxyOutcome() {
+    vm.refreshSystemProxyStatus()
+    proxyOutcome = ClaudeWebProxyHelper.prepareWebsiteDataStore(proxyUrl: vm.effectiveClaudeProxyUrl)
   }
 
   var body: some View {
-    let _ = proxyCheckTick
-    let proxyOutcome = ClaudeWebProxyHelper.prepareWebsiteDataStore(proxyUrl: vm.effectiveClaudeProxyUrl)
     let badgeText: String = {
       switch proxyOutcome {
       case .boundCustom(_, let p): return "代理：\(p)"
@@ -445,5 +452,11 @@ struct ClaudeWebLoginSheetView: View {
       }
     }
     .frame(width: 720, height: 560)
+    .onChange(of: vm.effectiveClaudeProxyUrl) { _ in
+      refreshProxyOutcome()
+    }
+    .onChange(of: proxyCheckTick) { _ in
+      refreshProxyOutcome()
+    }
   }
 }

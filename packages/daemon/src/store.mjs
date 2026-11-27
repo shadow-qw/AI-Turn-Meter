@@ -210,9 +210,9 @@ export function defaultDbPath() {
 export class TurnStore {
   /**
    * @param {string} [dbPath]
-   * @param {{ customPricingPath?: string | null }} [opts]
+   * @param {{ customPricingPath?: string | null, allowIngestReset?: boolean }} [opts]
    */
-  constructor(dbPath = defaultDbPath(), { customPricingPath } = {}) {
+  constructor(dbPath = defaultDbPath(), { customPricingPath, allowIngestReset = true } = {}) {
     this.dbPath = dbPath;
     if (dbPath !== ':memory:') {
       mkdirSync(dirname(dbPath), { recursive: true });
@@ -437,6 +437,7 @@ export class TurnStore {
 
     this.writeGeneration = 0;
     this._usageBaseCache = new Map();
+    this._cardsCache = new Map();
     this._receiptCache = new Map();
     this._recentSessionsCache = new Map();
 
@@ -533,11 +534,21 @@ export class TurnStore {
 
     // A parser revision bump re-parses every session file; call ownership is rebuilt alongside it so
     // it follows the current rules (oldest-created file first). Adapters do a full scan first while
-    // this is set, so an original session is not out-raced by a recent fork of it.
+    // this is set, so an original session is not out-raced by a recent fork of it. Offline read-only
+    // CLI tools pass allowIngestReset=false so they neither clear tables nor consume the migration flag.
     this.ingestResetPending = this.getMeta('ingest_parser_rev') !== String(INGEST_PARSER_REV);
-    if (this.ingestResetPending) {
-      this.db.exec('DELETE FROM call_owner; DELETE FROM ingest_state;');
-      this.setMeta('ingest_parser_rev', INGEST_PARSER_REV);
+    if (this.ingestResetPending && allowIngestReset) {
+      if (this.getMeta('ingest_reset_cleared_rev') !== String(INGEST_PARSER_REV)) {
+        this.db.exec('BEGIN');
+        try {
+          this.db.exec('DELETE FROM call_owner; DELETE FROM ingest_state;');
+          this.setMeta('ingest_reset_cleared_rev', INGEST_PARSER_REV);
+          this.db.exec('COMMIT');
+        } catch (err) {
+          this.db.exec('ROLLBACK');
+          throw err;
+        }
+      }
     }
 
     this.sessionAggStmt = this.db.prepare(`
@@ -917,6 +928,12 @@ export class TurnStore {
 
   setMeta(key, value) {
     this.setMetaStmt.run(String(key), String(value));
+  }
+
+  completeIngestReset() {
+    if (!this.ingestResetPending) return;
+    this.setMeta('ingest_parser_rev', INGEST_PARSER_REV);
+    this.ingestResetPending = false;
   }
 
   getCursorLocalHookRows() {
@@ -1337,11 +1354,27 @@ export class TurnStore {
       .map((k) => (!enabledTools || enabledTools[k] !== false ? '1' : '0'))
       .join('');
     const pricingVer = this.getPricingVersionTag();
-    const cacheKey = `${this.writeGeneration}|${pricingVer}|${toLocalDateKey(nowMs)}|${Math.floor(nowMs / 60_000)}|${resolvedDays}|${tool || ''}|${enabledKey}`;
+    const localDayKey = toLocalDateKey(nowMs);
+    const minuteBucket = Math.floor(nowMs / 60_000);
+    // Base historical aggregates (today/totals/byTool/byModel/byProject/byWorkspace/daily) only
+    // change when DB rows change, pricing changes, or the local calendar day rolls over — keep
+    // them out of the per-minute cache bucket so all-history scans are not repeated every minute.
+    const baseCacheKey = `${this.writeGeneration}|${pricingVer}|${localDayKey}|${resolvedDays}|${tool || ''}|${enabledKey}`;
+    const cardsCacheKey = `${this.writeGeneration}|${pricingVer}|${localDayKey}|${minuteBucket}|${enabledKey}`;
 
-    const overlayQuotas = (base) => {
+    let customRatesLoaded = false;
+    let customRatesCache = null;
+    const getCustomRates = () => {
+      if (!customRatesLoaded) {
+        customRatesCache = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+        customRatesLoaded = true;
+      }
+      return customRatesCache;
+    };
+
+    const overlayQuotas = (base, cards) => {
       const overlaidCards = {};
-      for (const [k, card] of Object.entries(base.cards)) {
+      for (const [k, card] of Object.entries(cards)) {
         const q = quotasByTool?.[k] || null;
         const recentSessions =
           k === 'all'
@@ -1414,9 +1447,18 @@ export class TurnStore {
       };
     };
 
-    const cached = this._usageBaseCache.get(cacheKey);
+    const getCards = () => {
+      let cards = this._cardsCache.get(cardsCacheKey);
+      if (!cards) {
+        cards = this.buildCardsByTool(nowMs, getCustomRates(), null, enabledTools);
+        setBoundedCache(this._cardsCache, cardsCacheKey, cards, 8);
+      }
+      return cards;
+    };
+
+    const cached = this._usageBaseCache.get(baseCacheKey);
     if (cached) {
-      return overlayQuotas(cached);
+      return overlayQuotas(cached, getCards());
     }
 
     let sinceMs = 0;
@@ -1429,7 +1471,7 @@ export class TurnStore {
       ).getTime();
     }
 
-    const customRates = this.customPricingPath ? loadCustomPricing(this.customPricingPath) : null;
+    const customRates = getCustomRates();
     const rawRows = tool
       ? this.db
           .prepare(`SELECT * FROM turns WHERE tool = ? AND completed_at_ms >= ? ORDER BY completed_at_ms ASC`)
@@ -1603,13 +1645,10 @@ export class TurnStore {
         ...finalizeAccumulator(acc),
       }));
 
-    const cards = this.buildCardsByTool(nowMs, customRates, null, enabledTools);
-
     const baseResult = {
       days: resolvedDays,
       tool: tool || null,
       sinceMs,
-      generatedAtMs: nowMs,
       today,
       totals,
       byTool,
@@ -1617,10 +1656,9 @@ export class TurnStore {
       byProject,
       byWorkspace,
       daily,
-      cards,
     };
-    setBoundedCache(this._usageBaseCache, cacheKey, baseResult);
-    return overlayQuotas(baseResult);
+    setBoundedCache(this._usageBaseCache, baseCacheKey, baseResult);
+    return overlayQuotas(baseResult, getCards());
   }
 
   buildLatestTurnMetrics(rows, todayFin) {

@@ -23,12 +23,14 @@ struct UsageSummaryTabView: View {
     ("daily", "每日账单"),
   ]
 
-  private var selectedPeriodTitle: String {
-    dayOptions.first(where: { $0.0 == vm.usageDays })?.1 ?? "\(vm.usageDays) 天"
+  private func periodTitle(for days: Int) -> String {
+    dayOptions.first(where: { $0.0 == days })?.1 ?? "\(days) 天"
   }
 
-  private var selectedToolLabel: String {
-    vm.usageToolFilter == "all" ? "全部提供商" : vm.displayTitle(for: vm.usageToolFilter)
+  private func toolLabel(for tool: String?) -> String {
+    let resolved = (tool ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if resolved.isEmpty || resolved == "all" { return "全部提供商" }
+    return vm.displayTitle(for: resolved)
   }
 
   private func dayMetricValue(_ pt: UsageDailyPoint) -> Double {
@@ -97,7 +99,7 @@ struct UsageSummaryTabView: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.mini)
-        .disabled(vm.usageData == nil)
+        .disabled(!vm.canExportUsageCsv)
       }
 
       if let data = vm.usageData {
@@ -108,7 +110,7 @@ struct UsageSummaryTabView: View {
               VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .firstTextBaseline) {
                   VStack(alignment: .leading, spacing: 2) {
-                    Text("\(selectedToolLabel) · \(selectedPeriodTitle)")
+                    Text("\(toolLabel(for: data.tool)) · \(periodTitle(for: data.days))")
                       .font(.system(size: 12.5, weight: .medium))
                       .foregroundColor(.secondary)
                     Text(MeterFormat.usd(data.totals.estimatedCostUsd))
@@ -464,6 +466,7 @@ struct UsageSummaryTabView: View {
             }
           }
           .padding(.bottom, 8)
+          .opacity(vm.canExportUsageCsv ? 1.0 : 0.65)
         }
       } else {
         Spacer()

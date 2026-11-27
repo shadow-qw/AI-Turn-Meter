@@ -12,7 +12,7 @@
  *   ai-turn-meter app-autostart <enable|disable|status>
  *   ai-turn-meter daemon [--port=47831]
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +40,7 @@ import {
   installAll,
   installLaunchAgent,
   isAppAutostartEnabled,
+  needsExperimentalSqliteFlag,
   resolveInstalledAppExe,
   resolvePackageRoot,
   runDoctor,
@@ -49,6 +50,27 @@ import {
 } from '../src/installer.mjs';
 
 const PORT = DEFAULT_DAEMON_PORT;
+
+function ensureSqliteRuntime() {
+  const hasSqliteFlag =
+    process.execArgv.includes('--experimental-sqlite') ||
+    String(process.env.NODE_OPTIONS || '').includes('--experimental-sqlite');
+  if (
+    needsExperimentalSqliteFlag(process.versions.node) &&
+    !hasSqliteFlag &&
+    process.env.AI_TURN_METER_SQLITE_REEXEC !== '1'
+  ) {
+    const res = spawnSync(
+      process.execPath,
+      ['--experimental-sqlite', ...process.execArgv, ...process.argv.slice(1)],
+      {
+        stdio: 'inherit',
+        env: { ...process.env, AI_TURN_METER_SQLITE_REEXEC: '1' },
+      }
+    );
+    process.exit(res.status ?? 1);
+  }
+}
 
 function getPkgVersion() {
   try {
@@ -450,9 +472,10 @@ async function cmdCost(flags, jsonMode = false) {
   } catch {}
 
   if (!usage) {
+    ensureSqliteRuntime();
     const { TurnStore } = await import('../src/store.mjs');
     const { getAllQuotas } = await import('../src/quota.mjs');
-    const store = new TurnStore();
+    const store = new TurnStore(undefined, { allowIngestReset: false });
     try {
       const localCfg = readLocalPublicConfig();
       const quotasByTool = await getAllQuotas(Date.now(), {
@@ -533,8 +556,9 @@ async function cmdReceipt(flags, jsonMode = false) {
   } catch {}
 
   if (!receipt) {
+    ensureSqliteRuntime();
     const { TurnStore } = await import('../src/store.mjs');
-    const store = new TurnStore();
+    const store = new TurnStore(undefined, { allowIngestReset: false });
     try {
       receipt = store.getReceiptData({ date, scope, tool, groupBy });
     } finally {
@@ -678,6 +702,7 @@ async function cmdFingerprint(flags, jsonMode = false) {
   }
 
   if (!out) {
+    ensureSqliteRuntime();
     const { TurnStore } = await import('../src/store.mjs');
     const {
       analyzePassiveTelemetry,
@@ -685,7 +710,7 @@ async function cmdFingerprint(flags, jsonMode = false) {
       runQuickCapabilityProbes,
       runTokenDistributionFingerprint,
     } = await import('../src/fingerprint.mjs');
-    const store = new TurnStore();
+    const store = new TurnStore(undefined, { allowIngestReset: false });
     try {
       if (mode === 'passive') {
         const passive = analyzePassiveTelemetry(store, { days });
@@ -988,6 +1013,7 @@ async function cmdProviders(args = [], flags = [], jsonMode = false) {
 }
 
 async function cmdDaemon(flags) {
+  ensureSqliteRuntime();
   const portFlag = flags.find((a) => a.startsWith('--port='));
   const port = portFlag ? Number(portFlag.split('=')[1]) : PORT;
   const ts = () => new Date().toISOString();

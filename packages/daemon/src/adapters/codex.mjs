@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync, watch } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { zstdDecompressSync } from 'node:zlib';
+import { decompressZstdSync } from '../zstd.mjs';
 import { accumulateUsageBucket, finalizeUsageBuckets, normalizeServiceTier } from '../pricing.mjs';
 
 const CODEX_OPENAI_MODEL_RE = /^(?:openai\/)?(?:gpt-|o1|o3|o4|codex-|chatgpt-)/i;
@@ -710,7 +710,9 @@ export class CodexAdapter {
       let content;
       try {
         if (fp.endsWith('.jsonl.zst')) {
-          content = zstdDecompressSync(readFileSync(fp)).toString('utf8');
+          const decompressed = decompressZstdSync(readFileSync(fp));
+          if (!decompressed) continue;
+          content = decompressed.toString('utf8');
         } else {
           content = readFileSync(fp, 'utf8');
         }

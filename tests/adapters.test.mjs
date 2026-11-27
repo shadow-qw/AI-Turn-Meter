@@ -5,7 +5,9 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { zstdCompressSync } from 'node:zlib';
+import * as zlib from 'node:zlib';
+
+const zstdCompressSync = typeof zlib.zstdCompressSync === 'function' ? zlib.zstdCompressSync : null;
 
 import {
   formatCacheRate,
@@ -2157,49 +2159,51 @@ test('parseCursorQuotaSummary splits Cursor dual-pool model quotas cleanly and s
 test('CodexAdapter decompresses historical .jsonl.zst archives and syncCursorHistoryEvents deduplicates against local hooks', async () => {
   const codexRoot = mkdtempSync(join(tmpdir(), 'atm-zst-'));
   try {
-    const sessDir = join(codexRoot, 'sessions', '2026', '08');
-    const archDir = join(codexRoot, 'archived_sessions');
-    mkdirSync(sessDir, { recursive: true });
-    mkdirSync(archDir, { recursive: true });
+    if (zstdCompressSync) {
+      const sessDir = join(codexRoot, 'sessions', '2026', '08');
+      const archDir = join(codexRoot, 'archived_sessions');
+      mkdirSync(sessDir, { recursive: true });
+      mkdirSync(archDir, { recursive: true });
 
-    const sampleJsonl = [
-      JSON.stringify({ timestamp: '2026-08-15T10:00:00.000Z', type: 'session_meta', payload: { id: 'sess-zst-1', cwd: '/tmp/app' } }),
-      JSON.stringify({ timestamp: '2026-08-15T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't-z1', model: 'gpt-6-astra' } }),
-      JSON.stringify({
-        timestamp: '2026-08-15T10:00:10.000Z',
-        type: 'token_usage_record',
-        payload: {
-          turn_id: 't-z1',
-          response_id: 'r-z1',
-          usage: { input_tokens: 200_000, cached_input_tokens: 150_000, output_tokens: 1200 },
-        },
-      }),
-      JSON.stringify({ timestamp: '2026-08-15T10:00:12.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't-z1', duration_ms: 8000 } }),
-    ].join('\n');
+      const sampleJsonl = [
+        JSON.stringify({ timestamp: '2026-08-15T10:00:00.000Z', type: 'session_meta', payload: { id: 'sess-zst-1', cwd: '/tmp/app' } }),
+        JSON.stringify({ timestamp: '2026-08-15T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't-z1', model: 'gpt-6-astra' } }),
+        JSON.stringify({
+          timestamp: '2026-08-15T10:00:10.000Z',
+          type: 'token_usage_record',
+          payload: {
+            turn_id: 't-z1',
+            response_id: 'r-z1',
+            usage: { input_tokens: 200_000, cached_input_tokens: 150_000, output_tokens: 1200 },
+          },
+        }),
+        JSON.stringify({ timestamp: '2026-08-15T10:00:12.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't-z1', duration_ms: 8000 } }),
+      ].join('\n');
 
-    writeFileSync(join(archDir, 'rollout-2026-08-15-sess-zst-1.jsonl.zst'), zstdCompressSync(Buffer.from(sampleJsonl, 'utf8')));
+      writeFileSync(join(archDir, 'rollout-2026-08-15-sess-zst-1.jsonl.zst'), zstdCompressSync(Buffer.from(sampleJsonl, 'utf8')));
 
-    const store = new TurnStore(':memory:');
-    try {
-      const adapter = new CodexAdapter({
-        store,
-        sessionsDir: join(codexRoot, 'sessions'),
-        archivedDir: archDir,
-      });
-      const first = adapter.scan({ maxRecentFiles: Infinity });
-      assert.equal(first.length, 1);
-      assert.equal(first[0].model, 'gpt-6-astra');
-      assert.equal(first[0].totalInputTokens, 200_000);
+      const store = new TurnStore(':memory:');
+      try {
+        const adapter = new CodexAdapter({
+          store,
+          sessionsDir: join(codexRoot, 'sessions'),
+          archivedDir: archDir,
+        });
+        const first = adapter.scan({ maxRecentFiles: Infinity });
+        assert.equal(first.length, 1);
+        assert.equal(first[0].model, 'gpt-6-astra');
+        assert.equal(first[0].totalInputTokens, 200_000);
 
-      // Second adapter instance skips unchanged cached file via ingested_files
-      const adapter2 = new CodexAdapter({
-        store,
-        sessionsDir: join(codexRoot, 'sessions'),
-        archivedDir: archDir,
-      });
-      assert.equal(adapter2.scan({ maxRecentFiles: Infinity }).length, 0);
-    } finally {
-      store.close();
+        // Second adapter instance skips unchanged cached file via ingested_files
+        const adapter2 = new CodexAdapter({
+          store,
+          sessionsDir: join(codexRoot, 'sessions'),
+          archivedDir: archDir,
+        });
+        assert.equal(adapter2.scan({ maxRecentFiles: Infinity }).length, 0);
+      } finally {
+        store.close();
+      }
     }
   } finally {
     rmSync(codexRoot, { recursive: true, force: true });
@@ -2298,7 +2302,11 @@ test('pricing resolves OpenAI o-series, gpt-4.1, gpt-5.x, and gpt-6.x variants',
   }
 });
 
-test('fetchCodexQuota falls back to compressed .jsonl.zst rate_limits without auth.json', async () => {
+test('fetchCodexQuota falls back to compressed .jsonl.zst rate_limits without auth.json', async (t) => {
+  if (!zstdCompressSync) {
+    t.skip('native zstdCompressSync unavailable on this Node runtime');
+    return;
+  }
   const prevCodexHome = process.env.CODEX_HOME;
   const codexHome = mkdtempSync(join(tmpdir(), 'atm-codex-quota-'));
   try {

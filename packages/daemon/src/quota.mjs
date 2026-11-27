@@ -5,7 +5,7 @@ import https from 'node:https';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { zstdDecompressSync } from 'node:zlib';
+import { decompressZstdSync } from './zstd.mjs';
 import {
   buildLanguageServerEndpoints,
   inspectAntigravityLanguageServers,
@@ -376,9 +376,13 @@ function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
       if (size > MAX_CODEX_RATE_LIMIT_BYTES) continue;
       let raw;
       try {
-        raw = p.endsWith('.jsonl.zst')
-          ? zstdDecompressSync(readFileSync(p)).toString('utf8')
-          : readFileSync(p, 'utf8');
+        if (p.endsWith('.jsonl.zst')) {
+          const decompressed = decompressZstdSync(readFileSync(p));
+          if (!decompressed) continue;
+          raw = decompressed.toString('utf8');
+        } else {
+          raw = readFileSync(p, 'utf8');
+        }
       } catch {
         continue;
       }

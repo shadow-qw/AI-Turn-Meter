@@ -45,6 +45,77 @@ export function sortSemverDesc(versions) {
   });
 }
 
+export function compareOsVersion(a, b) {
+  const ta = parseSemverTuple(a);
+  const tb = parseSemverTuple(b);
+  if (!ta && !tb) return 0;
+  if (!ta) return -1;
+  if (!tb) return 1;
+  for (let i = 0; i < 3; i += 1) {
+    if (ta[i] !== tb[i]) return ta[i] > tb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+export function parseMachOMinOs(otoolOutput) {
+  const lines = String(otoolOutput || '').split(/\r?\n/);
+  let section = null;
+  let found = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (line.startsWith('cmd ')) {
+      section = line.slice(4).trim();
+      continue;
+    }
+    if (section === 'LC_BUILD_VERSION') {
+      const m = line.match(/^minos\s+(\d+(?:\.\d+){1,2})$/);
+      if (m) {
+        if (!found || compareOsVersion(m[1], found) > 0) found = m[1];
+      }
+    } else if (section === 'LC_VERSION_MIN_MACOSX') {
+      const m = line.match(/^version\s+(\d+(?:\.\d+){1,2})$/);
+      if (m) {
+        if (!found || compareOsVersion(m[1], found) > 0) found = m[1];
+      }
+    }
+  }
+  return found;
+}
+
+export function resolveMinimumSystemVersion({ declaredMinOs = '13.5', binaryMinVersions = [] } = {}) {
+  let resolved = declaredMinOs;
+  for (const v of binaryMinVersions) {
+    if (v && compareOsVersion(v, resolved) > 0) {
+      resolved = v;
+    }
+  }
+  return resolved;
+}
+
+export function assertMinimumSystemVersionCompatible({ plistMinOs, binaries = [] } = {}) {
+  if (!plistMinOs || !parseSemverTuple(plistMinOs)) {
+    throw new Error(`Invalid or missing LSMinimumSystemVersion: ${plistMinOs || 'missing'}`);
+  }
+  for (const entry of binaries) {
+    if (!entry?.minOs) continue;
+    if (compareOsVersion(entry.minOs, plistMinOs) > 0) {
+      throw new Error(
+        `LSMinimumSystemVersion (${plistMinOs}) is lower than ${entry.name || 'binary'} Mach-O minos (${entry.minOs}).`
+      );
+    }
+  }
+  return plistMinOs;
+}
+
+function readBinaryMinMacOs(binPath) {
+  try {
+    const out = execFileSync('/usr/bin/otool', ['-l', binPath], { encoding: 'utf8', timeout: 5000 });
+    return parseMachOMinOs(out);
+  } catch {
+    return null;
+  }
+}
+
 export function shouldCopyBundlePath(src) {
   const normalized = String(src || '').replace(/\\/g, '/');
   return basename(normalized) !== '.DS_Store';
@@ -277,6 +348,13 @@ function main() {
   cpSync(builtExe, appExe);
   chmodSync(appExe, 0o755);
 
+  const appMinOs = readBinaryMinMacOs(appExe);
+  const nodeMinOs = readBinaryMinMacOs(nodeBin);
+  const minSystemVersion = resolveMinimumSystemVersion({
+    declaredMinOs: '13.5',
+    binaryMinVersions: [appMinOs, nodeMinOs],
+  });
+
   // 2. Icon + Info.plist
   generateAppIcon(iconsetDir, join(resDir, 'AppIcon.icns'));
   rmSync(iconsetDir, { recursive: true, force: true });
@@ -306,7 +384,7 @@ function main() {
   <key>CFBundleVersion</key>
   <string>${version}</string>
   <key>LSMinimumSystemVersion</key>
-  <string>13.0</string>
+  <string>${minSystemVersion}</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>用于温和退出并带本地调试口重新打开受支持的 AI 客户端，以启用消息旁 TPS 显示。</string>
   <key>NSHighResolutionCapable</key>
@@ -314,12 +392,26 @@ function main() {
 </dict>
 </plist>
 `;
-  writeFileSync(join(contentsDir, 'Info.plist'), infoPlist);
+  const infoPlistPath = join(contentsDir, 'Info.plist');
+  writeFileSync(infoPlistPath, infoPlist);
 
   // 3. Copy standalone Node runtime + JS packages + packaged VSIX
   const bundledNode = join(runtimeDir, 'node');
   cpSync(nodeBin, bundledNode);
   chmodSync(bundledNode, 0o755);
+
+  const writtenPlist = readFileSync(infoPlistPath, 'utf8');
+  const plistMinMatch = writtenPlist.match(
+    /<key>LSMinimumSystemVersion<\/key>\s*<string>([^<]+)<\/string>/
+  );
+  assertMinimumSystemVersionCompatible({
+    plistMinOs: plistMinMatch ? plistMinMatch[1].trim() : null,
+    binaries: [
+      { name: 'AITurnMeter', minOs: readBinaryMinMacOs(appExe) },
+      { name: 'runtime/node', minOs: readBinaryMinMacOs(bundledNode) },
+    ],
+  });
+  console.log(`Min macOS: ${minSystemVersion} (app=${appMinOs || 'unknown'}, node=${nodeMinOs || 'unknown'})`);
 
   const repoArg = process.argv.find((a) => a.startsWith('--repo='));
   const updateUrlArg = process.argv.find((a) => a.startsWith('--update-url='));

@@ -8,6 +8,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  truncateSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -1749,5 +1750,177 @@ test('pricing: official Claude 5.x rates, Haiku 5.5 per-request 100K tier, no bo
     assert.equal(t.unpricedTurnCount, 1, 'the unpriced part shows up in "N 次请求没有价格"');
   } finally {
     store.close();
+  }
+});
+
+test('Claude migration flag survives offline read-only TurnStore and interrupted daemon scans across 26 files', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-26files-'));
+  const dbPath = join(tmp, 'meter.db');
+  const root = join(tmp, '.claude');
+  const proj = join(root, 'projects', '-Users-dev-repo');
+  mkdirSync(proj, { recursive: true });
+
+  const ORIG = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const FORK = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const makeAssistant = (sid, ts, id, cr, out) =>
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: sid,
+      requestId: `req_${id}`,
+      cwd: '/Users/dev/repo',
+      timestamp: ts,
+      message: {
+        id,
+        model: 'claude-opus-5-5',
+        role: 'assistant',
+        content: [{ type: 'text', text: `reply ${id}` }],
+        usage: { input_tokens: 100, cache_read_input_tokens: cr, output_tokens: out },
+      },
+    });
+  const makeUser = (sid, ts, text) =>
+    JSON.stringify({
+      type: 'user',
+      sessionId: sid,
+      cwd: '/Users/dev/repo',
+      timestamp: ts,
+      message: { role: 'user', content: text },
+    });
+
+  try {
+    // Original file is the oldest of 26 files (outside top-24 recent window).
+    const origFile = join(proj, `${ORIG}.jsonl`);
+    writeFileSync(
+      origFile,
+      [
+        makeUser(ORIG, '2026-11-01T10:00:00.000Z', 'orig q1'),
+        makeAssistant(ORIG, '2026-11-01T10:00:05.000Z', 'shared_msg_1', 1_000_000, 1_000),
+      ].join('\n') + '\n'
+    );
+    utimesSync(origFile, new Date('2026-11-01T10:00:05Z'), new Date('2026-11-01T10:00:05Z'));
+
+    // 24 filler recent sessions + 1 newest fork copying ORIG's API call.
+    for (let i = 1; i <= 24; i += 1) {
+      const hex = i.toString(16).padStart(4, '0');
+      const sid = `cccccccc-cccc-4ccc-8ccc-${hex.repeat(3)}`;
+      const fp = join(proj, `${sid}.jsonl`);
+      const ts = new Date(Date.UTC(2026, 10, 2, 10, i, 0)).toISOString();
+      writeFileSync(fp, [makeUser(sid, ts, `q${i}`), makeAssistant(sid, ts, `msg_${i}`, 1000, 50)].join('\n') + '\n');
+      const mtime = new Date(Date.UTC(2026, 10, 2, 10, i, 0));
+      utimesSync(fp, mtime, mtime);
+    }
+
+    const forkFile = join(proj, `${FORK}.jsonl`);
+    writeFileSync(
+      forkFile,
+      [
+        makeUser(ORIG, '2026-11-01T10:00:00.000Z', 'orig q1'),
+        makeAssistant(ORIG, '2026-11-01T10:00:05.000Z', 'shared_msg_1', 1_000_000, 1_000),
+        makeUser(FORK, '2026-11-26T10:00:00.000Z', 'fork q2'),
+        makeAssistant(FORK, '2026-11-26T10:00:05.000Z', 'fork_msg_2', 20_000, 200),
+      ].join('\n') + '\n'
+    );
+    const forkTime = new Date('2026-11-26T10:00:05Z');
+    utimesSync(forkFile, forkTime, forkTime);
+
+    // Simulate pre-upgrade DB (no ingest_parser_rev, no call_owner).
+    const preStore = new TurnStore(dbPath);
+    preStore.db.exec(`DELETE FROM sync_meta WHERE key IN ('ingest_parser_rev', 'ingest_reset_cleared_rev')`);
+    preStore.close();
+
+    // 1. Offline CLI receipt/usage opens with allowIngestReset=false -> must NOT clear or consume flag.
+    const cliStore = new TurnStore(dbPath, { allowIngestReset: false });
+    assert.equal(cliStore.ingestResetPending, true);
+    cliStore.close();
+
+    // 2. Daemon opens TurnStore, then exits before scan finishes -> flag stays pending on reopen.
+    const crashedDaemonStore = new TurnStore(dbPath);
+    assert.equal(crashedDaemonStore.ingestResetPending, true);
+    crashedDaemonStore.close();
+
+    // 3. Restarted Daemon starts adapter with maxRecentFiles=24: must auto-upgrade to full oldest-first
+    // scan so ORIG claims shared_msg_1 before FORK, and mark migration done after completion.
+    const daemonStore = new TurnStore(dbPath);
+    assert.equal(daemonStore.ingestResetPending, true);
+    const adapter = new ClaudeCodeAdapter({ store: daemonStore, claudeRoot: root, onTurns: () => {} });
+    adapter.scan({ maxRecentFiles: 24 });
+    assert.equal(daemonStore.ingestResetPending, false);
+
+    const owner = daemonStore.db.prepare(`SELECT file_path FROM call_owner WHERE call_key = 'shared_msg_1|req_shared_msg_1'`).get();
+    assert.equal(owner?.file_path, origFile);
+    const turns = daemonStore.db.prepare(`SELECT session_id, turn_id, cache_read_tokens FROM turns ORDER BY session_id, turn_id`).all();
+    assert.ok(turns.some((r) => r.session_id === ORIG && r.cache_read_tokens === 1_000_000));
+    assert.ok(!turns.some((r) => r.session_id === FORK && r.cache_read_tokens === 1_000_000));
+    assert.ok(turns.some((r) => r.session_id === FORK && r.cache_read_tokens === 20_000));
+    daemonStore.close();
+
+    const afterStore = new TurnStore(dbPath);
+    assert.equal(afterStore.ingestResetPending, false);
+    afterStore.close();
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeCodeAdapter byte-offset incremental scan handles appends, partial trailing line, and truncation', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-incr-'));
+  const root = join(tmp, '.claude');
+  const proj = join(root, 'projects', '-Users-dev-incr');
+  mkdirSync(proj, { recursive: true });
+  const fp = join(proj, '33333333-3333-4333-8333-333333333333.jsonl');
+
+  const u = (ts, text) =>
+    JSON.stringify({ type: 'user', sessionId: '33333333-3333-4333-8333-333333333333', cwd: '/Users/dev/incr', timestamp: ts, message: { role: 'user', content: text } });
+  const a = (ts, id, out) =>
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: '33333333-3333-4333-8333-333333333333',
+      requestId: `req_${id}`,
+      cwd: '/Users/dev/incr',
+      timestamp: ts,
+      message: {
+        id,
+        model: 'claude-opus-5-5',
+        role: 'assistant',
+        content: [{ type: 'text', text: `ok ${id}` }],
+        usage: { input_tokens: 50, cache_read_input_tokens: 100, output_tokens: out },
+      },
+    });
+
+  const store = new TurnStore(':memory:');
+  try {
+    writeFileSync(fp, [u('2026-11-26T10:00:00.000Z', 'turn 1'), a('2026-11-26T10:00:05.000Z', 'm1', 120)].join('\n') + '\n');
+    const adapter = new ClaudeCodeAdapter({ store, claudeRoot: root, onTurns: () => {} });
+    const first = adapter.scan({ maxRecentFiles: Infinity });
+    assert.equal(first.length, 1);
+    assert.equal(first[0].outputTokens, 120);
+
+    // Append complete line + half-written trailing JSON line (no newline yet).
+    const fullTurn2Line = a('2026-11-26T10:01:05.000Z', 'm2', 240);
+    const splitAt = Math.floor(fullTurn2Line.length / 2);
+    appendFileSync(fp, u('2026-11-26T10:01:00.000Z', 'turn 2') + '\n' + fullTurn2Line.slice(0, splitAt));
+    const mid = adapter.scan({ maxRecentFiles: Infinity });
+    assert.equal(mid.length, 0, 'incomplete trailing line must not emit turn-2 yet');
+
+    // Finish writing the rest of the line + newline.
+    appendFileSync(fp, fullTurn2Line.slice(splitAt) + '\n');
+    const second = adapter.scan({ maxRecentFiles: Infinity });
+    assert.equal(second.length, 1);
+    assert.equal(second[0].outputTokens, 240);
+
+    // Unchanged file skips reading completely on next scan.
+    const readsBeforeIdle = adapter.readFileCallsForTests;
+    assert.equal(adapter.scan({ maxRecentFiles: Infinity }).length, 0);
+    assert.equal(adapter.readFileCallsForTests, readsBeforeIdle);
+
+    // Truncate/rewrite resets parser cleanly without corrupting state.
+    const rewritten = [u('2026-11-26T11:00:00.000Z', 'fresh'), a('2026-11-26T11:00:05.000Z', 'm3', 80)].join('\n') + '\n';
+    writeFileSync(fp, rewritten);
+    truncateSync(fp, Buffer.byteLength(rewritten));
+    adapter.scan({ maxRecentFiles: Infinity });
+    const rows = store.db.prepare(`SELECT turn_id, output_tokens FROM turns ORDER BY turn_id`).all().map((r) => ({ ...r }));
+    assert.deepEqual(rows, [{ turn_id: 'turn-1', output_tokens: 80 }]);
+  } finally {
+    store.close();
+    rmSync(tmp, { recursive: true, force: true });
   }
 });

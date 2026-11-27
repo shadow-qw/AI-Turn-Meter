@@ -4,7 +4,9 @@ import { mkdtempSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { zstdCompressSync } from 'node:zlib';
+import * as zlib from 'node:zlib';
+
+const zstdCompressSync = typeof zlib.zstdCompressSync === 'function' ? zlib.zstdCompressSync : null;
 
 import { TurnStore } from '../packages/daemon/src/store.mjs';
 import { normalizeTurn } from '../packages/daemon/src/format.mjs';
@@ -449,14 +451,16 @@ test('CodexAdapter defers ingested_files caching for open turns so >120s flushOp
     assert.equal(adapter.scan({ nowMs: mtimeMs + 140_000 }).length, 0);
 
     // 5. Archived .jsonl.zst with open turn flushes immediately even at +5s
-    const zstPath = join(archivedDir, 'rollout-zst.jsonl.zst');
-    const zstContent = openTurnJsonl.replace(/codex-open-1/g, 'codex-zst-1');
-    writeFileSync(zstPath, zstdCompressSync(Buffer.from(zstContent, 'utf8')));
-    const zstMtime = statSync(zstPath).mtimeMs;
-    const sZst = adapter.scan({ nowMs: zstMtime + 5_000 });
-    assert.equal(sZst.length, 1);
-    assert.equal(sZst[0].turnUid, 'codex:codex-zst-1:turn-open');
-    assert.ok(store.getIngestedFile(zstPath));
+    if (zstdCompressSync) {
+      const zstPath = join(archivedDir, 'rollout-zst.jsonl.zst');
+      const zstContent = openTurnJsonl.replace(/codex-open-1/g, 'codex-zst-1');
+      writeFileSync(zstPath, zstdCompressSync(Buffer.from(zstContent, 'utf8')));
+      const zstMtime = statSync(zstPath).mtimeMs;
+      const sZst = adapter.scan({ nowMs: zstMtime + 5_000 });
+      assert.equal(sZst.length, 1);
+      assert.equal(sZst[0].turnUid, 'codex:codex-zst-1:turn-open');
+      assert.ok(store.getIngestedFile(zstPath));
+    }
 
     // 6. Normal completion (task_complete appended before 120s) emits immediately and persists ingested_files
     const fpLive = join(sessionsDir, 'rollout-live.jsonl');

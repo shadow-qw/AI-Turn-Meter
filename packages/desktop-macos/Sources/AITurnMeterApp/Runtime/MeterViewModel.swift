@@ -242,6 +242,7 @@ final class MeterViewModel: ObservableObject {
   @Published var menuBarConfig: MenuBarCustomConfig = MeterViewModel.loadMenuBarConfig()
   @Published var alertsEnabled: Bool = UserDefaults.standard.object(forKey: PrefKey.alertsEnabled) as? Bool ?? true
   @Published var alertDeliveryError: String? = nil
+  @Published private(set) var systemProxyActive: Bool = HeadlessCliHelper.hasActiveSystemProxy()
   @Published var launchAtLogin: Bool = MeterViewModel.detectAppAutostartEnabled()
 
   @Published var settingsPane: SettingsPane = .provider("antigravity")
@@ -904,9 +905,16 @@ export default {
     }
   }
 
+  func refreshSystemProxyStatus() {
+    let active = HeadlessCliHelper.hasActiveSystemProxy()
+    if systemProxyActive != active {
+      systemProxyActive = active
+    }
+  }
+
   var hasUsableClaudeProxy: Bool {
     if let eff = effectiveClaudeProxyUrl, !eff.isEmpty { return true }
-    return HeadlessCliHelper.hasActiveSystemProxy()
+    return systemProxyActive
   }
 
   var claudeActiveProxySummary: String {
@@ -921,10 +929,23 @@ export default {
       }
       return "\(eff)（\(srcLabel)）"
     }
-    if HeadlessCliHelper.hasActiveSystemProxy() {
+    if systemProxyActive {
       return "跟随 macOS 系统代理"
     }
     return "未检测到可用代理（已阻止直连）"
+  }
+
+  var currentUsageScope: UsageQueryKey {
+    UsageQueryKey(days: usageDays, toolFilter: usageToolFilter)
+  }
+
+  var matchedUsageData: UsageSummaryResponse? {
+    guard let data = usageData, currentUsageScope.matches(data) else { return nil }
+    return data
+  }
+
+  var canExportUsageCsv: Bool {
+    UsageFetchGate.canExportCsv(data: usageData, activeScope: currentUsageScope)
   }
 
   func isToolEnabled(_ key: String) -> Bool {
@@ -1208,6 +1229,7 @@ export default {
   func start() {
     guard !hasStarted else { return }
     hasStarted = true
+    refreshSystemProxyStatus()
     alertManager.onDeliveryErrorChanged = { [weak self] err in
       self?.alertDeliveryError = err
     }
@@ -1316,6 +1338,7 @@ export default {
 
   func pollTick() {
     guard !busy else { return }
+    refreshSystemProxyStatus()
     let receiptRolledOver = syncReceiptDateForCurrentDayIfNeeded()
     if receiptRolledOver {
       fetchReceipt(silent: true)
@@ -1449,6 +1472,7 @@ export default {
   }
 
   func fetchDaemonStateLight() {
+    refreshSystemProxyStatus()
     guard let url = daemonUrl("/v1/state", query: [("limit", "30")]) else { return }
     stateLightSeq &+= 1
     let seq = stateLightSeq
@@ -1516,6 +1540,7 @@ export default {
     self.claudeProxyUrl = cfg.claudeProxyUrl ?? ""
     self.effectiveClaudeProxyUrl = cfg.effectiveClaudeProxyUrl
     self.claudeProxySource = cfg.claudeProxySource ?? "none"
+    self.refreshSystemProxyStatus()
   }
 
   private func applyDaemonState(_ parsed: DaemonStateResponse) {
@@ -1564,13 +1589,18 @@ export default {
   func fetchUsageSummary(silent: Bool = false, forceRefresh: Bool = false) {
     let toolFilter = usageToolFilter
     let days = usageDays
-    if !forceRefresh {
-      if usageInFlightIsForce {
-        return
-      }
-      if silent && days == usageLastDays && toolFilter == usageLastFilter && Date().timeIntervalSince(usageLastStartedAt) < 0.5 && usageLoading {
-        return
-      }
+    let activeScope = UsageQueryKey(days: days, toolFilter: toolFilter)
+    let lastScope = UsageQueryKey(days: usageLastDays, toolFilter: usageLastFilter)
+    if UsageFetchGate.shouldSkipFetch(
+      silent: silent,
+      forceRefresh: forceRefresh,
+      inFlightIsForce: usageInFlightIsForce,
+      loading: usageLoading,
+      activeScope: activeScope,
+      lastScope: lastScope,
+      elapsedSinceLastStart: Date().timeIntervalSince(usageLastStartedAt)
+    ) {
+      return
     }
     var query: [(String, String?)] = [("days", "\(days)")]
     if toolFilter != "all" { query.append(("tool", toolFilter)) }
@@ -1593,6 +1623,15 @@ export default {
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let data = data,
               let parsed = try? JSONDecoder().decode(UsageSummaryResponse.self, from: data) else {
+          return
+        }
+        guard UsageFetchGate.shouldAcceptResponse(
+          requestSeq: seq,
+          currentSeq: self.usageFetchSeq,
+          response: parsed,
+          activeScope: self.currentUsageScope
+        ) else {
+          self.fetchUsageSummary()
           return
         }
         self.usageData = parsed
@@ -2127,7 +2166,7 @@ export default {
   }
 
   func exportUsageCsv() {
-    guard let data = usageData else { return }
+    guard let data = matchedUsageData else { return }
     var lines = ["date,turns,total_input_tokens,output_tokens,total_tokens,estimated_cost_usd,cache_savings_usd"]
     for pt in data.daily where pt.totalTokens > 0 || pt.turnCount > 0 {
       let usdStr = pt.estimatedCostUsd.map { String(format: "%.6f", $0) } ?? ""
@@ -2136,7 +2175,7 @@ export default {
     }
     let panel = NSSavePanel()
     panel.allowedContentTypes = [.commaSeparatedText]
-    panel.nameFieldStringValue = "ai-turn-meter-usage-\(usageDays == 0 ? "all" : "\(usageDays)d").csv"
+    panel.nameFieldStringValue = UsageQueryKey(response: data).csvFilename
     if panel.runModal() == .OK, let url = panel.url {
       do {
         try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)

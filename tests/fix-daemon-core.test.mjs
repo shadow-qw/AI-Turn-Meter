@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   truncateSync,
   utimesSync,
@@ -17,6 +18,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { parseCodexSessionDetailed } from '../packages/daemon/src/adapters/codex.mjs';
+import { drainCursorSpool } from '../packages/daemon/src/adapters/cursor.mjs';
 import { CdpInlineInjector } from '../packages/daemon/src/cdp-injector.mjs';
 import { ExternalProviderRegistry } from '../packages/daemon/src/external-providers.mjs';
 import {
@@ -1731,4 +1733,114 @@ test('pricing: supports Grok 4.6/4.7, -fast multipliers, Gemini 4 schedule, Clau
   });
   // Short tier: 0.5*3 + 1.0*0.3 + 0.02*15 = 1.5 + 0.3 + 0.3 = 2.1
   assert.equal(cursorHook.costUsd, 2.1);
+});
+
+test('drainCursorSpool preserves batch on SQLite write failure, rolls back atomically, and recovers on retry', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-spool-recover-'));
+  const store = new TurnStore(':memory:');
+  try {
+    const spoolFile = join(tmpDir, 'cursor-spool.jsonl');
+    const makeTurn = (id, out) => ({
+      turnUid: `cursor:conv-spool:${id}`,
+      tool: 'cursor',
+      host: 'cursor-ide',
+      sessionId: 'conv-spool',
+      turnId: id,
+      model: 'claude-sonnet-4-5',
+      completedAtMs: Date.UTC(2026, 10, 26, 10, 0, 0) + (id === 'g1' ? 0 : 1000),
+      callCount: 1,
+      totalInputTokens: 1000,
+      uncachedInputTokens: 1000,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: out,
+      tpsMethod: 'unavailable',
+    });
+    writeFileSync(
+      spoolFile,
+      [JSON.stringify(makeTurn('g1', 100)), '{malformed-json', JSON.stringify(makeTurn('g2', 200))].join('\n') + '\n'
+    );
+
+    // Inject transient write failure on the 2nd turn of the batch.
+    const origUpsert = store.upsertTurn.bind(store);
+    let calls = 0;
+    store.upsertTurn = (turn) => {
+      calls += 1;
+      if (calls === 2) throw new Error('SQLITE_BUSY: database is locked');
+      return origUpsert(turn);
+    };
+
+    const failed = drainCursorSpool(store, tmpDir);
+    assert.equal(failed.length, 0);
+    assert.equal(store.getRecentTurns(10, 'cursor').length, 0, 'transaction must roll back first turn too');
+    const leftover = readdirSync(tmpDir).filter((f) => f.startsWith('cursor-spool.jsonl.draining-'));
+    assert.equal(leftover.length, 1, 'draining batch file must be preserved on write failure');
+
+    // Restore normal write and verify retry recovers all valid turns and removes leftover file.
+    store.upsertTurn = origUpsert;
+    const recovered = drainCursorSpool(store, tmpDir);
+    assert.equal(recovered.length, 2);
+    assert.equal(store.getRecentTurns(10, 'cursor').length, 2);
+    const remaining = readdirSync(tmpDir).filter((f) => f.startsWith('cursor-spool.jsonl.draining-'));
+    assert.equal(remaining.length, 0);
+  } finally {
+    store.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('TurnStore.getUsageSummary reuses base historical aggregation across minutes and invalidates on write', () => {
+  const store = new TurnStore(':memory:');
+  try {
+    const t0 = new Date(2026, 10, 26, 10, 0, 0).getTime();
+    store.upsertTurn({
+      turnUid: 'codex:s-cache:t1',
+      tool: 'codex',
+      host: 'codex-desktop',
+      sessionId: 's-cache',
+      turnId: 't1',
+      model: 'gpt-6.2-sol',
+      completedAtMs: t0 - 86_400_000,
+      callCount: 1,
+      totalInputTokens: 100_000,
+      uncachedInputTokens: 20_000,
+      cacheReadTokens: 80_000,
+      cacheWriteTokens: 0,
+      outputTokens: 1_000,
+      tpsMethod: 'unavailable',
+    });
+
+    const r1 = store.getUsageSummary({ days: 0, nowMs: t0 });
+    assert.equal(store._usageBaseCache.size, 1);
+    assert.equal(store._cardsCache.size, 1);
+
+    // 2 minutes later (same local calendar day): base cache key is reused, cards refresh per minute.
+    const r2 = store.getUsageSummary({ days: 0, nowMs: t0 + 120_000 });
+    assert.equal(store._usageBaseCache.size, 1, 'all-history base aggregate should stay cached across minutes');
+    assert.equal(store._cardsCache.size, 2);
+    assert.equal(r2.generatedAtMs, t0 + 120_000);
+    assert.equal(r2.totals.totalTokens, r1.totals.totalTokens);
+
+    // New write bumps writeGeneration and recomputes base totals cleanly.
+    store.upsertTurn({
+      turnUid: 'codex:s-cache:t2',
+      tool: 'codex',
+      host: 'codex-desktop',
+      sessionId: 's-cache',
+      turnId: 't2',
+      model: 'gpt-6.2-sol',
+      completedAtMs: t0 + 125_000,
+      callCount: 1,
+      totalInputTokens: 50_000,
+      uncachedInputTokens: 50_000,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 500,
+      tpsMethod: 'unavailable',
+    });
+    const r3 = store.getUsageSummary({ days: 0, nowMs: t0 + 125_000 });
+    assert.equal(r3.totals.turnCount, 2);
+  } finally {
+    store.close();
+  }
 });

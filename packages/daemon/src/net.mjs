@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,10 +10,12 @@ const execFileAsync = promisify(execFile);
 const PROXY_CACHE_TTL_MS = 15_000;
 let cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
 let inflightProxyPromise = null;
+const claudeSettingsProxyCache = new Map();
 
 export function resetNetProxyCacheForTests() {
   cachedProxyState = { checkedAt: 0, hasSystemProxy: false, fallbackProxyUrl: null };
   inflightProxyPromise = null;
+  claudeSettingsProxyCache.clear();
 }
 
 export function normalizeProxyUrl(raw) {
@@ -80,18 +82,49 @@ export const PROXY_ENV_KEYS = [
 ];
 
 export function readClaudeSettingsProxyUrl(homeDir = homedir()) {
+  const settingsPath = join(homeDir, '.claude', 'settings.json');
   try {
-    const settingsPath = join(homeDir, '.claude', 'settings.json');
-    if (!existsSync(settingsPath)) return null;
+    const st = statSync(settingsPath);
+    const cached = claudeSettingsProxyCache.get(settingsPath);
+    if (
+      cached &&
+      cached.mtimeMs === st.mtimeMs &&
+      cached.ctimeMs === st.ctimeMs &&
+      cached.size === st.size &&
+      cached.ino === st.ino
+    ) {
+      return cached.value;
+    }
+
     const parsed = JSON.parse(readFileSync(settingsPath, 'utf8'));
     const envObj = parsed?.env;
-    if (!envObj || typeof envObj !== 'object') return null;
-    for (const k of PROXY_ENV_KEYS) {
-      const normalized = normalizeProxyUrl(envObj[k]);
-      if (normalized) return normalized;
+    let value = null;
+    if (envObj && typeof envObj === 'object') {
+      for (const k of PROXY_ENV_KEYS) {
+        const normalized = normalizeProxyUrl(envObj[k]);
+        if (normalized) {
+          value = normalized;
+          break;
+        }
+      }
     }
-    return null;
+
+    if (claudeSettingsProxyCache.has(settingsPath)) {
+      claudeSettingsProxyCache.delete(settingsPath);
+    } else if (claudeSettingsProxyCache.size >= 16) {
+      const oldest = claudeSettingsProxyCache.keys().next().value;
+      claudeSettingsProxyCache.delete(oldest);
+    }
+    claudeSettingsProxyCache.set(settingsPath, {
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+      size: st.size,
+      ino: st.ino,
+      value,
+    });
+    return value;
   } catch {
+    claudeSettingsProxyCache.delete(settingsPath);
     return null;
   }
 }

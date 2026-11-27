@@ -670,6 +670,69 @@ public struct UsageSummaryResponse: Decodable {
   }
 }
 
+public struct UsageQueryKey: Equatable, Sendable {
+  public let days: Int
+  public let toolFilter: String
+
+  public init(days: Int, toolFilter: String) {
+    self.days = days
+    let trimmed = toolFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.toolFilter = trimmed.isEmpty ? "all" : trimmed
+  }
+
+  public init(response: UsageSummaryResponse) {
+    self.init(days: response.days, toolFilter: response.tool ?? "all")
+  }
+
+  public func matches(_ response: UsageSummaryResponse?) -> Bool {
+    guard let response else { return false }
+    return UsageQueryKey(response: response) == self
+  }
+
+  public var csvFilename: String {
+    let period = days == 0 ? "all" : "\(days)d"
+    if toolFilter == "all" {
+      return "ai-turn-meter-usage-\(period).csv"
+    }
+    let safeTool = toolFilter
+      .replacingOccurrences(of: ":", with: "-")
+      .replacingOccurrences(of: "/", with: "-")
+    return "ai-turn-meter-usage-\(safeTool)-\(period).csv"
+  }
+}
+
+public enum UsageFetchGate {
+  public static func shouldSkipFetch(
+    silent: Bool,
+    forceRefresh: Bool,
+    inFlightIsForce: Bool,
+    loading: Bool,
+    activeScope: UsageQueryKey,
+    lastScope: UsageQueryKey,
+    elapsedSinceLastStart: TimeInterval
+  ) -> Bool {
+    if forceRefresh { return false }
+    if activeScope != lastScope { return false }
+    if !silent { return false }
+    if inFlightIsForce { return true }
+    return loading && elapsedSinceLastStart < 0.5
+  }
+
+  public static func shouldAcceptResponse(
+    requestSeq: UInt64,
+    currentSeq: UInt64,
+    response: UsageSummaryResponse,
+    activeScope: UsageQueryKey
+  ) -> Bool {
+    guard requestSeq == currentSeq else { return false }
+    return activeScope.matches(response)
+  }
+
+  public static func canExportCsv(data: UsageSummaryResponse?, activeScope: UsageQueryKey) -> Bool {
+    activeScope.matches(data)
+  }
+}
+
 public struct DaemonStateResponse: Decodable {
   public let config: MeterConfigPayload?
   public let byTool: [String: TurnSummary?]?

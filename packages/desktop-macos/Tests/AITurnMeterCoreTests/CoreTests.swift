@@ -1160,4 +1160,53 @@ struct AITurnMeterCoreTests {
     )
     #expect(alerts.map(\.dedupeKey) == ["quota:claude:claude-5h:critical"])
   }
+
+  @Test("UsageQueryKey and UsageFetchGate prevent filter-mismatch UI and CSV exports during force refresh")
+  func usageFilterScopeAndCsvGating() {
+    let all7 = UsageQueryKey(days: 7, toolFilter: "all")
+    let codex30 = UsageQueryKey(days: 30, toolFilter: "codex")
+    let codex7 = UsageQueryKey(days: 7, toolFilter: "codex")
+
+    #expect(all7.csvFilename == "ai-turn-meter-usage-7d.csv")
+    #expect(codex30.csvFilename == "ai-turn-meter-usage-codex-30d.csv")
+    #expect(UsageQueryKey(days: 0, toolFilter: "ext:my/gw").csvFilename == "ai-turn-meter-usage-ext-my-gw-all.csv")
+
+    // Explicit filter change during an in-flight forceRefresh MUST NOT be skipped.
+    #expect(
+      UsageFetchGate.shouldSkipFetch(
+        silent: false,
+        forceRefresh: false,
+        inFlightIsForce: true,
+        loading: true,
+        activeScope: codex30,
+        lastScope: all7,
+        elapsedSinceLastStart: 0.05
+      ) == false
+    )
+    // Same-scope silent background poll during forceRefresh IS suppressed.
+    #expect(
+      UsageFetchGate.shouldSkipFetch(
+        silent: true,
+        forceRefresh: false,
+        inFlightIsForce: true,
+        loading: true,
+        activeScope: all7,
+        lastScope: all7,
+        elapsedSinceLastStart: 0.1
+      ) == true
+    )
+
+    let respAll7 = UsageSummaryResponse(days: 7, tool: nil)
+    let respCodex7 = UsageSummaryResponse(days: 7, tool: "codex")
+    let respCodex30 = UsageSummaryResponse(days: 30, tool: "codex")
+
+    // Stale seq or mismatched scope response must be rejected, and CSV export blocked when mismatched.
+    #expect(UsageFetchGate.shouldAcceptResponse(requestSeq: 4, currentSeq: 5, response: respCodex30, activeScope: codex30) == false)
+    #expect(UsageFetchGate.shouldAcceptResponse(requestSeq: 5, currentSeq: 5, response: respAll7, activeScope: codex7) == false)
+    #expect(UsageFetchGate.shouldAcceptResponse(requestSeq: 5, currentSeq: 5, response: respCodex30, activeScope: codex30) == true)
+
+    #expect(UsageFetchGate.canExportCsv(data: respAll7, activeScope: codex7) == false)
+    #expect(UsageFetchGate.canExportCsv(data: respCodex7, activeScope: codex7) == true)
+    #expect(UsageQueryKey(response: respAll7) == all7)
+  }
 }
