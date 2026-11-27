@@ -281,11 +281,11 @@ const MODEL_PRICING_PER_M = {
     regionalUsMultiplier: 1.1,
   },
   'claude-sonnet-5': {
-    input: 3.0,
-    cacheRead: 0.3,
-    cacheWrite: 3.75,
-    cacheWrite1h: 6.0,
-    output: 15.0,
+    input: 2.0,
+    cacheRead: 0.2,
+    cacheWrite: 2.5,
+    cacheWrite1h: 4.0,
+    output: 10.0,
     regionalUsMultiplier: 1.1,
   },
   'claude-sonnet-4.6': {
@@ -318,6 +318,16 @@ const MODEL_PRICING_PER_M = {
   'claude-3-7-sonnet': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6.0, output: 15.0 },
   'claude-3.5-sonnet': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6.0, output: 15.0 },
   'claude-3-5-sonnet': { input: 3.0, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6.0, output: 15.0 },
+  'claude-haiku-5.5': {
+    input: 0.1,
+    cacheRead: 0.01,
+    cacheWrite: 0.125,
+    cacheWrite1h: 0.2,
+    output: 0.5,
+    thresholdTokens: 100_000,
+    above: { input: 0.5, cacheRead: 0.05, cacheWrite: 0.625, cacheWrite1h: 1.0, output: 2.5 },
+    regionalUsMultiplier: 1.1,
+  },
   'claude-haiku-4.5': { input: 1.0, cacheRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2.0, output: 5.0 },
   'claude-3.5-haiku': { input: 0.8, cacheRead: 0.08, cacheWrite: 1.0, cacheWrite1h: 1.6, output: 4.0 },
   'claude-3-5-haiku': { input: 0.8, cacheRead: 0.08, cacheWrite: 1.0, cacheWrite1h: 1.6, output: 4.0 },
@@ -343,6 +353,7 @@ const MODEL_PRICING_PER_M = {
     cacheWrite: 10.0,
     cacheWrite1h: 16.0,
     output: 40.0,
+    fastMultiplier: 2,
     regionalUsMultiplier: 1.1,
   },
   'claude-mythos-5': {
@@ -367,6 +378,7 @@ const MODEL_PRICING_PER_M = {
     cacheWrite: 10.0,
     cacheWrite1h: 16.0,
     output: 40.0,
+    fastMultiplier: 2,
     regionalUsMultiplier: 1.1,
   },
 
@@ -431,13 +443,24 @@ const MODEL_ALIASES = {
   'claude-haiku-3.5': 'claude-3.5-haiku',
 };
 
-const VALID_BANDS = new Set(['le_200k', '200k_272k', 'gt_272k']);
+// Per-call prompt-size bands, bounded at every published long-context threshold (100K, 200K,
+// 272K) so a bucket never straddles one. 'le_200k' is the legacy band of rows stored before the
+// 100K boundary existed.
+const BAND_RANGES = {
+  le_100k: [0, 100_000],
+  '100k_200k': [100_000, 200_000],
+  le_200k: [0, 200_000],
+  '200k_272k': [200_000, 272_000],
+  gt_272k: [272_000, Infinity],
+};
+const VALID_BANDS = new Set(Object.keys(BAND_RANGES));
 
 export function classifyContextBand(callInputTokens) {
   const n = Number(callInputTokens) || 0;
   if (n > 272_000) return 'gt_272k';
   if (n > 200_000) return '200k_272k';
-  return 'le_200k';
+  if (n > 100_000) return '100k_200k';
+  return 'le_100k';
 }
 
 export function normalizeServiceTier(raw) {
@@ -670,20 +693,28 @@ function normalizeModelCandidateEntries(rawModel) {
   }));
 }
 
+/**
+ * A speed tier inferred from a name suffix (e.g. "-fast") only applies to a base model that
+ * actually has that tier. Otherwise the suffix names a separate SKU (e.g. grok-4-fast is a
+ * cheaper model, not grok-4 at 2x), so the base rate must not be borrowed.
+ */
+function rateSupportsInferredTier(rate, inferredServiceTier) {
+  if (inferredServiceTier === 'fast') return typeof rate?.fastMultiplier === 'number';
+  if (inferredServiceTier === 'ultrafast') return typeof rate?.ultrafastMultiplier === 'number';
+  return true;
+}
+
 function resolveModelPricingMeta(model, customRates = null) {
   const entries = normalizeModelCandidateEntries(model);
   if (entries.length === 0) return null;
 
-  if (customRates && typeof customRates === 'object') {
+  for (const table of [customRates && typeof customRates === 'object' ? customRates : null, MODEL_PRICING_PER_M]) {
+    if (!table) continue;
     for (const { candidate, inferredServiceTier } of entries) {
-      if (customRates[candidate]) {
-        return { rate: customRates[candidate], inferredServiceTier };
+      const rate = table[candidate];
+      if (rate && rateSupportsInferredTier(rate, inferredServiceTier)) {
+        return { rate, inferredServiceTier };
       }
-    }
-  }
-  for (const { candidate, inferredServiceTier } of entries) {
-    if (MODEL_PRICING_PER_M[candidate]) {
-      return { rate: MODEL_PRICING_PER_M[candidate], inferredServiceTier };
     }
   }
   return null;
@@ -718,17 +749,12 @@ function applyEffectiveSchedule(base, completedAtMs) {
 }
 
 function resolveBandLongTier(band, thresholdTokens, avgContextTokens) {
-  if (band === 'gt_272k') {
-    return thresholdTokens <= 272_000 ? true : avgContextTokens > thresholdTokens;
-  }
-  if (band === '200k_272k') {
-    if (thresholdTokens <= 200_000) return true;
-    if (thresholdTokens >= 272_000) return false;
-    return avgContextTokens > thresholdTokens;
-  }
-  if (band === 'le_200k') {
-    return thresholdTokens >= 200_000 ? false : avgContextTokens > thresholdTokens;
-  }
+  const range = BAND_RANGES[band];
+  if (!range) return avgContextTokens > thresholdTokens;
+  // Every call in the band is above (or at/below) the threshold: exact per-request decision.
+  if (thresholdTokens <= range[0]) return true;
+  if (thresholdTokens >= range[1]) return false;
+  // Threshold inside the band (only legacy 'le_200k' rows vs. a 100K threshold): approximate.
   return avgContextTokens > thresholdTokens;
 }
 
@@ -802,6 +828,7 @@ export function estimateTurnCost(turn, customRates = null) {
   const buckets = sanitizeUsageBuckets(turn?.usageBuckets);
   if (buckets) {
     let pricedBuckets = 0;
+    let unpricedBuckets = 0;
     let uncachedCostUsd = 0;
     let cacheReadCostUsd = 0;
     let cacheWriteCostUsd = 0;
@@ -810,7 +837,11 @@ export function estimateTurnCost(turn, customRates = null) {
 
     for (const bkt of buckets) {
       const meta = resolveModelPricingMeta(bkt.m || turn?.model, customRates);
-      if (!meta) continue;
+      if (!meta) {
+        // Never price an unknown model at another model's rate; report it as unpriced instead.
+        unpricedBuckets += 1;
+        continue;
+      }
       pricedBuckets += 1;
 
       const base = applyEffectiveSchedule(meta.rate, turn?.completedAtMs);
@@ -859,6 +890,8 @@ export function estimateTurnCost(turn, customRates = null) {
 
     return {
       priced: true,
+      // Some calls in this turn used a model with no known rate: the cost covers the rest only.
+      partial: explicitCost === null && unpricedBuckets > 0,
       costUsd: Number(costUsd.toFixed(6)),
       savingsUsd: Number(savingsUsd.toFixed(6)),
       uncachedCostUsd: Number(uncachedCostUsd.toFixed(6)),

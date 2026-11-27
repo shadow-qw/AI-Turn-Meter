@@ -107,9 +107,27 @@ function contentHasToolUse(content) {
  */
 export function parseClaudeCodeSessionContent(
   content,
-  { sessionId = null, workspacePath = null, filePath = '', tool = 'claude' } = {}
+  {
+    sessionId = null,
+    workspacePath = null,
+    filePath = '',
+    tool = 'claude',
+    // Cross-file dedupe: resumed/forked sessions copy earlier API calls (same message.id +
+    // requestId) into a new file. Calls for which isForeignCall(key) is true belong to another
+    // file and are skipped; every key seen is added to seenCallKeys; turns left empty only
+    // because their calls were skipped get their turnUid pushed to droppedTurnUids.
+    isForeignCall = null,
+    seenCallKeys = null,
+    droppedTurnUids = null,
+  } = {}
 ) {
   if (typeof content !== 'string' || !content.trim()) return [];
+  const foreignMemo = new Map();
+  const callIsForeign = (key) => {
+    if (typeof isForeignCall !== 'function') return false;
+    if (!foreignMemo.has(key)) foreignMemo.set(key, Boolean(isForeignCall(key)));
+    return foreignMemo.get(key);
+  };
 
   const lines = content.split(/\r?\n/);
   const explicitSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
@@ -204,6 +222,15 @@ export function parseClaudeCodeSessionContent(
 
     const msg = obj.message;
     if (!msg || typeof msg !== 'object') continue;
+
+    if (typeof msg.id === 'string' && msg.id.trim()) {
+      const callKey = `${msg.id.trim()}|${typeof obj.requestId === 'string' ? obj.requestId.trim() : ''}`;
+      seenCallKeys?.add(callKey);
+      if (callIsForeign(callKey)) {
+        if (current) current.hadForeignCall = true;
+        continue;
+      }
+    }
 
     const rawModel = typeof msg.model === 'string' ? msg.model.trim() : '';
     if (rawModel === '<synthetic>') continue;
@@ -323,11 +350,22 @@ export function parseClaudeCodeSessionContent(
 
   const finalSessionId =
     resolvedSessionId || (filePath ? basename(filePath, '.jsonl') : '') || 'claude-code-session';
+  const resolvedTool = typeof tool === 'string' && tool.trim() ? tool.trim() : 'claude';
+  const turnIdFor = (rt) =>
+    resolvedAgentId ? `agent-${resolvedAgentId}-turn-${rt.turnIndex}` : `turn-${rt.turnIndex}`;
+  const markDropped = (rt) => {
+    if (rt.hadForeignCall && Array.isArray(droppedTurnUids)) {
+      droppedTurnUids.push(`${resolvedTool}:${finalSessionId}:${turnIdFor(rt)}`);
+    }
+  };
 
   const completed = [];
   for (const rt of rawTurns) {
     const usageCalls = rt.callOrder.filter((c) => c.hasUsage);
-    if (usageCalls.length === 0) continue;
+    if (usageCalls.length === 0) {
+      markDropped(rt);
+      continue;
+    }
 
     let uncachedInputTokens = 0;
     let cacheReadTokens = 0;
@@ -359,7 +397,10 @@ export function parseClaudeCodeSessionContent(
     }
 
     const totalInputTokens = uncachedInputTokens + cacheReadTokens + cacheWriteTokens;
-    if (totalInputTokens === 0 && outputTokens === 0) continue;
+    if (totalInputTokens === 0 && outputTokens === 0) {
+      markDropped(rt);
+      continue;
+    }
     const usageBuckets = finalizeUsageBuckets(bucketMap);
 
     let replyPreview = null;
@@ -409,8 +450,7 @@ export function parseClaudeCodeSessionContent(
       tpsMethod = 'unavailable';
     }
 
-    const turnId = resolvedAgentId ? `agent-${resolvedAgentId}-turn-${rt.turnIndex}` : `turn-${rt.turnIndex}`;
-    const resolvedTool = typeof tool === 'string' && tool.trim() ? tool.trim() : 'claude';
+    const turnId = turnIdFor(rt);
     completed.push({
       turnUid: `${resolvedTool}:${finalSessionId}:${turnId}`,
       tool: resolvedTool,
@@ -553,12 +593,26 @@ export class ClaudeCodeAdapter {
         continue;
       }
 
-      const turns = parseClaudeCodeSessionContent(content, { filePath: fp });
+      // Files are processed oldest-first, so an API call copied into a resumed/forked session
+      // stays attributed to the file it first appeared in and is counted exactly once.
+      const seenCallKeys = new Set();
+      const droppedTurnUids = [];
+      const turns = parseClaudeCodeSessionContent(content, {
+        filePath: fp,
+        isForeignCall: this.store.isCallOwnedByOtherFile
+          ? (key) => this.store.isCallOwnedByOtherFile(key, fp)
+          : null,
+        seenCallKeys,
+        droppedTurnUids,
+      });
+      this.store.claimCallKeys?.(fp, seenCallKeys);
       this.fileMtimes.set(fp, { mtimeMs, sizeBytes });
       for (const t of turns) {
         const res = this.store.upsertTurn(t);
         if (res.changed) changed.push(res.record);
       }
+      // Turns that only repeated calls owned by another file were double counted before.
+      this.store.deleteTurns?.(droppedTurnUids);
       this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
     }
 

@@ -52,6 +52,13 @@ const UNBOUND_WORKSPACE_LABEL = '未关联工作区';
 const ACTIVE_SESSION_WINDOW_MS = 90_000;
 const RECENT_SESSIONS_CACHE_TTL_MS = 15_000;
 
+/**
+ * Revision of what the session-file adapters extract per turn. Bump it whenever a parser starts
+ * producing data that historical files must be re-parsed for (e.g. usage buckets); every file
+ * ingested under an older revision is then re-parsed once on the next scan.
+ */
+export const INGEST_PARSER_REV = 1;
+
 function normalizeWorkspacePath(raw) {
   if (typeof raw !== 'string') return '';
   const trimmed = raw.trim();
@@ -141,6 +148,8 @@ function addTurnToAccumulator(acc, row, customRates) {
     acc.pricedTurnCount += 1;
     acc.estimatedCostUsd += cost.costUsd;
     acc.cacheSavingsUsd += cost.savingsUsd || 0;
+    // Keep the known part of a partially priced turn, but surface it in "N 次请求没有价格".
+    if (cost.partial) acc.unpricedTurnCount += 1;
   } else {
     acc.unpricedTurnCount += 1;
   }
@@ -256,6 +265,23 @@ export class TurnStore {
         size_bytes INTEGER
       );
 
+      -- Successor of ingested_files. Older daemons keep writing ingested_files without knowing
+      -- parser revisions (and would mark files "done" after parsing them without usage buckets),
+      -- so this version tracks its own state in a table they never touch.
+      CREATE TABLE IF NOT EXISTS ingest_state (
+        file_path TEXT PRIMARY KEY,
+        mtime_ms REAL NOT NULL,
+        size_bytes INTEGER,
+        parser_rev INTEGER NOT NULL
+      );
+
+      -- Which session file first contained each API call (message.id|requestId). Resumed or
+      -- forked Claude Code sessions copy earlier calls into a new file; only the owner counts them.
+      CREATE TABLE IF NOT EXISTS call_owner (
+        call_key TEXT PRIMARY KEY,
+        file_path TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS sync_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -316,9 +342,12 @@ export class TurnStore {
         .all();
       if (staleSessions.length > 0) {
         const delIngested = this.db.prepare(`DELETE FROM ingested_files WHERE file_path LIKE ?`);
+        const delIngestState = this.db.prepare(`DELETE FROM ingest_state WHERE file_path LIKE ?`);
         for (const row of staleSessions) {
           if (typeof row.session_id === 'string' && row.session_id.trim()) {
-            delIngested.run(`%/${row.session_id}/.system_generated/logs/transcript.jsonl`);
+            const pattern = `%/${row.session_id}/.system_generated/logs/transcript.jsonl`;
+            delIngested.run(pattern);
+            delIngestState.run(pattern);
           }
         }
       }
@@ -329,6 +358,7 @@ export class TurnStore {
       // Clear ingested_files so previously skipped open turns (Antigravity subagents, Codex, CodeBuddy CLI)
       // and historical CodeBuddy IDE fallback timestamps are re-scanned with current parsers.
       this.db.exec('DELETE FROM ingested_files;');
+      this.db.exec('DELETE FROM ingest_state;');
 
       // Remove stale mid-turn cursor-cloud partial snapshots that overlap completed local cursor-ide turns.
       const overlapCloudRows = this.db
@@ -383,6 +413,7 @@ export class TurnStore {
       // Clear ingested_files so historical Codex, Claude Code, Antigravity, and CodeBuddy CLI
       // sessions are re-scanned once to populate per-call usage_buckets_json.
       this.db.exec('DELETE FROM ingested_files;');
+      this.db.exec('DELETE FROM ingest_state;');
       this.db.exec('PRAGMA user_version = 4;');
     }
 
@@ -463,12 +494,22 @@ export class TurnStore {
 
     this.getExistingStmt = this.db.prepare(`SELECT * FROM turns WHERE turn_uid = ?`);
 
-    this.getIngestedStmt = this.db.prepare(`SELECT mtime_ms, size_bytes FROM ingested_files WHERE file_path = ?`);
+    this.getIngestedStmt = this.db.prepare(
+      `SELECT mtime_ms, size_bytes FROM ingest_state WHERE file_path = ? AND parser_rev = ?`
+    );
     this.setIngestedStmt = this.db.prepare(`
-      INSERT INTO ingested_files (file_path, mtime_ms, size_bytes)
-      VALUES (?, ?, ?)
-      ON CONFLICT(file_path) DO UPDATE SET mtime_ms = excluded.mtime_ms, size_bytes = excluded.size_bytes
+      INSERT INTO ingest_state (file_path, mtime_ms, size_bytes, parser_rev)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(file_path) DO UPDATE SET
+        mtime_ms = excluded.mtime_ms,
+        size_bytes = excluded.size_bytes,
+        parser_rev = excluded.parser_rev
     `);
+    this.getCallOwnerStmt = this.db.prepare(`SELECT file_path FROM call_owner WHERE call_key = ?`);
+    this.claimCallStmt = this.db.prepare(
+      `INSERT INTO call_owner (call_key, file_path) VALUES (?, ?) ON CONFLICT(call_key) DO NOTHING`
+    );
+    this.deleteTurnStmt = this.db.prepare(`DELETE FROM turns WHERE turn_uid = ?`);
     this.getMetaStmt = this.db.prepare(`SELECT value FROM sync_meta WHERE key = ?`);
     this.setMetaStmt = this.db.prepare(`
       INSERT INTO sync_meta (key, value)
@@ -774,13 +815,43 @@ export class TurnStore {
     return this.enrichRecord(this.rowToNormalizedTurn(row));
   }
 
+  /** Files ingested under an older parser revision read as not ingested, so they get re-parsed. */
   getIngestedFile(filePath) {
-    const r = this.getIngestedStmt.get(filePath);
+    const r = this.getIngestedStmt.get(filePath, INGEST_PARSER_REV);
     return r ? { mtimeMs: Number(r.mtime_ms), sizeBytes: r.size_bytes ?? null } : null;
   }
 
   setIngestedFile(filePath, mtimeMs, sizeBytes = null) {
-    this.setIngestedStmt.run(filePath, mtimeMs, sizeBytes);
+    this.setIngestedStmt.run(filePath, mtimeMs, sizeBytes, INGEST_PARSER_REV);
+  }
+
+  isCallOwnedByOtherFile(callKey, filePath) {
+    const r = this.getCallOwnerStmt.get(callKey);
+    return Boolean(r && r.file_path !== filePath);
+  }
+
+  /** First file to contain a call owns it; later claims by other files are ignored. */
+  claimCallKeys(filePath, callKeys) {
+    if (!callKeys || callKeys.size === 0) return;
+    this.db.exec('BEGIN');
+    try {
+      for (const key of callKeys) this.claimCallStmt.run(key, filePath);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  deleteTurns(turnUids) {
+    if (!Array.isArray(turnUids) || turnUids.length === 0) return 0;
+    let removed = 0;
+    for (const uid of turnUids) removed += Number(this.deleteTurnStmt.run(uid).changes) || 0;
+    if (removed > 0) {
+      this.writeGeneration += 1;
+      this._recentSessionsCache.clear();
+    }
+    return removed;
   }
 
   getMeta(key) {

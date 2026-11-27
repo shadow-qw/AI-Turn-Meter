@@ -31,7 +31,7 @@ import {
   isLoopbackUrl,
   normalizeProxyUrl,
 } from '../packages/daemon/src/net.mjs';
-import { estimateTurnCost } from '../packages/daemon/src/pricing.mjs';
+import { classifyContextBand, estimateTurnCost } from '../packages/daemon/src/pricing.mjs';
 import {
   assembleAllQuotas,
   computeQuotaWindow,
@@ -1482,5 +1482,170 @@ test('fetchClaudeQuota 429 backoff never serves another identity snapshot, and g
     srv.closeAllConnections?.();
     await new Promise((resolve) => srv.close(resolve));
     rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeCodeAdapter counts each API call once across resumed/forked session files and removes rows that were double counted', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-dedupe-'));
+  const dbPath = join(tmp, 'meter.db');
+  const root = join(tmp, '.claude');
+  const proj = join(root, 'projects', '-Users-dev-repo');
+  mkdirSync(proj, { recursive: true });
+  const user = (sid, ts, text) =>
+    JSON.stringify({ type: 'user', sessionId: sid, cwd: '/Users/dev/repo', timestamp: ts, message: { role: 'user', content: text } });
+  const call = (sid, ts, id, req, cacheRead, out) =>
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: sid,
+      requestId: req,
+      cwd: '/Users/dev/repo',
+      timestamp: ts,
+      message: {
+        id,
+        model: 'claude-opus-5-5',
+        role: 'assistant',
+        content: [{ type: 'text', text: `reply ${id}` }],
+        usage: { input_tokens: 10, cache_read_input_tokens: cacheRead, output_tokens: out },
+      },
+    });
+  // Original session: two turns. The resumed session copies both (rewriting sessionId) and adds one.
+  const fileA = join(proj, 'sess-orig.jsonl');
+  const fileB = join(proj, 'sess-resumed.jsonl');
+  writeFileSync(
+    fileA,
+    [
+      user('sess-orig', '2026-11-20T10:00:00.000Z', 'q1'),
+      call('sess-orig', '2026-11-20T10:00:05.000Z', 'msg_1', 'req_1', 1_000_000, 1_000),
+      user('sess-orig', '2026-11-20T10:01:00.000Z', 'q2'),
+      call('sess-orig', '2026-11-20T10:01:05.000Z', 'msg_2', 'req_2', 2_000_000, 2_000),
+    ].join('\n') + '\n'
+  );
+  writeFileSync(
+    fileB,
+    [
+      user('sess-resumed', '2026-11-20T10:00:00.000Z', 'q1'),
+      call('sess-resumed', '2026-11-20T10:00:05.000Z', 'msg_1', 'req_1', 1_000_000, 1_000),
+      user('sess-resumed', '2026-11-20T10:01:00.000Z', 'q2'),
+      call('sess-resumed', '2026-11-20T10:01:05.000Z', 'msg_2', 'req_2', 2_000_000, 2_000),
+      user('sess-resumed', '2026-11-21T09:00:00.000Z', 'q3'),
+      call('sess-resumed', '2026-11-21T09:00:05.000Z', 'msg_3', 'req_3', 3_000_000, 3_000),
+    ].join('\n') + '\n'
+  );
+  utimesSync(fileA, new Date('2026-11-20T10:02:00Z'), new Date('2026-11-20T10:02:00Z'));
+  utimesSync(fileB, new Date('2026-11-21T09:01:00Z'), new Date('2026-11-21T09:01:00Z'));
+  const nowMs = Date.parse('2026-11-22T00:00:00Z');
+  const sumTurns = (s) =>
+    s.db.prepare(`SELECT COUNT(*) n, SUM(cache_read_tokens) cr, SUM(output_tokens) o FROM turns WHERE tool = 'claude'`).get();
+
+  try {
+    // Simulate rows written by an older version that parsed each file on its own (double counting),
+    // with the legacy ingested_files table marking both files as done.
+    const legacy = new TurnStore(dbPath);
+    for (const fp of [fileA, fileB]) {
+      for (const t of parseClaudeCodeSessionContent(readFileSync(fp, 'utf8'), { filePath: fp })) legacy.upsertTurn(t);
+      legacy.db.prepare(`INSERT INTO ingested_files (file_path, mtime_ms, size_bytes) VALUES (?, 0, 0)`).run(fp);
+    }
+    assert.equal(sumTurns(legacy).cr, 9_000_000, 'legacy rows double count msg_1 and msg_2');
+    legacy.close();
+
+    const store = new TurnStore(dbPath);
+    const adapter = new ClaudeCodeAdapter({ store, claudeRoot: root, onTurns: () => {} });
+    adapter.scan({ maxRecentFiles: Infinity });
+
+    // Each call counted once: msg_1 + msg_2 stay with the original file, msg_3 with the resumed one.
+    const totals = sumTurns(store);
+    assert.deepEqual({ n: totals.n, cr: totals.cr, o: totals.o }, { n: 3, cr: 6_000_000, o: 6_000 });
+    const uids = store.db.prepare(`SELECT turn_uid FROM turns WHERE tool = 'claude' ORDER BY turn_uid`).all().map((r) => r.turn_uid);
+    assert.deepEqual(uids, ['claude:sess-orig:turn-1', 'claude:sess-orig:turn-2', 'claude:sess-resumed:turn-3']);
+    const usage = store.getUsageSummary({ days: 30, tool: 'claude', nowMs });
+    assert.equal(usage.totals.estimatedCostUsd, Number(((6_000_000 * 0.2 + 30 * 4 + 6_000 * 20) / 1e6).toFixed(4)));
+
+    // Stable across rescans and across a fresh adapter (ownership + parser revision persisted).
+    assert.equal(adapter.scan({ maxRecentFiles: Infinity }).length, 0);
+    assert.equal(new ClaudeCodeAdapter({ store, claudeRoot: root, onTurns: () => {} }).scan({ maxRecentFiles: Infinity }).length, 0);
+    assert.deepEqual(sumTurns(store), totals);
+    store.close();
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('ingest_state re-parses files ingested by older daemons or older parser revisions', () => {
+  const store = new TurnStore(':memory:');
+  try {
+    const fp = '/tmp/some/session.jsonl';
+    // An older daemon only knows ingested_files; that must not mark the file as parsed for this version.
+    store.db.prepare(`INSERT INTO ingested_files (file_path, mtime_ms, size_bytes) VALUES (?, 1, 2)`).run(fp);
+    assert.equal(store.getIngestedFile(fp), null);
+    store.setIngestedFile(fp, 1, 2);
+    assert.deepEqual(store.getIngestedFile(fp), { mtimeMs: 1, sizeBytes: 2 });
+    // A row from an older parser revision reads as not ingested.
+    store.db.prepare(`UPDATE ingest_state SET parser_rev = parser_rev - 1 WHERE file_path = ?`).run(fp);
+    assert.equal(store.getIngestedFile(fp), null);
+  } finally {
+    store.close();
+  }
+});
+
+test('pricing: official Claude 5.x rates, Haiku 5.5 per-request 100K tier, no borrowed -fast rates, and partial turns surface as unpriced', () => {
+  const one = (model, n, extra = {}) =>
+    estimateTurnCost({
+      model,
+      usageBuckets: [{ m: model, b: classifyContextBand(n), c: 1, in: n, u: n, cr: 0, cw5: 0, cw1h: 0, out: 1_000_000, ...extra }],
+    }).costUsd;
+  // Haiku 5.5: up to 100K prompt -> $0.10 / $0.50; over 100K -> $0.50 / $2.50; US inference 1.1x on both.
+  assert.equal(one('claude-haiku-5-5', 100_000), 0.51);
+  assert.equal(one('claude-haiku-5-5', 100_001), Number((100_001 * 0.5 / 1e6 + 2.5).toFixed(6)));
+  assert.equal(one('claude-haiku-5-5', 150_000, { geo: 'us' }), Number(((0.15 * 0.5 + 2.5) * 1.1).toFixed(6)));
+  // Sonnet 5 is $2 / $10 (the scheduled $3 / $15 increase was cancelled).
+  assert.equal(one('claude-sonnet-5', 1_000_000), 12);
+  // Opus 5.5: cache hits at 0.05x input, 1M context at standard price.
+  assert.equal(
+    estimateTurnCost({
+      model: 'claude-opus-5-5',
+      usageBuckets: [{ m: 'claude-opus-5-5', b: 'gt_272k', c: 1, in: 900_000, u: 0, cr: 900_000, cw5: 0, cw1h: 0, out: 0 }],
+    }).costUsd,
+    0.18
+  );
+  // Fable 5.2 fast mode is 2x ($16 / $80).
+  assert.equal(one('claude-fable-5-2', 100_000, { st: 'fast' }), 81.6);
+  // A "-fast" suffix only borrows a base rate that actually has a fast tier.
+  const flat = { totalInputTokens: 1e6, uncachedInputTokens: 1e6, outputTokens: 1e6, callCount: 1 };
+  assert.equal(estimateTurnCost({ ...flat, model: 'grok-4-fast' }).priced, false);
+  assert.equal(estimateTurnCost({ ...flat, model: 'gpt-5-fast' }).costUsd, 22.5);
+  // A bucket with an unknown model is not priced at another model's rate; the turn is flagged partial.
+  const partial = estimateTurnCost({
+    model: 'claude-opus-5-5',
+    usageBuckets: [
+      { m: 'claude-opus-5-5', b: 'le_100k', c: 1, in: 1e6, u: 1e6, cr: 0, cw5: 0, cw1h: 0, out: 0 },
+      { m: 'mystery-model', b: 'le_100k', c: 1, in: 1e6, u: 1e6, cr: 0, cw5: 0, cw1h: 0, out: 1e6 },
+    ],
+  });
+  assert.equal(partial.partial, true);
+  assert.equal(partial.costUsd, 4);
+
+  const store = new TurnStore(':memory:');
+  try {
+    store.upsertTurn({
+      turnUid: 'claude:s:turn-1',
+      tool: 'claude',
+      sessionId: 's',
+      turnId: 'turn-1',
+      model: 'claude-opus-5-5',
+      completedAtMs: Date.parse('2026-11-21T00:00:00Z'),
+      totalInputTokens: 2e6,
+      uncachedInputTokens: 2e6,
+      outputTokens: 1e6,
+      callCount: 2,
+      usageBuckets: [
+        { m: 'claude-opus-5-5', b: 'le_100k', c: 1, in: 1e6, u: 1e6, cr: 0, cw5: 0, cw1h: 0, out: 0 },
+        { m: 'mystery-model', b: 'le_100k', c: 1, in: 1e6, u: 1e6, cr: 0, cw5: 0, cw1h: 0, out: 1e6 },
+      ],
+    });
+    const t = store.getUsageSummary({ days: 30, tool: 'claude', nowMs: Date.parse('2026-11-22T00:00:00Z') }).totals;
+    assert.equal(t.estimatedCostUsd, 4);
+    assert.equal(t.unpricedTurnCount, 1, 'the unpriced part shows up in "N 次请求没有价格"');
+  } finally {
+    store.close();
   }
 });
