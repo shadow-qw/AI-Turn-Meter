@@ -23,6 +23,44 @@ function toFiniteNonNeg(v) {
   return v;
 }
 
+function extractClaudeUsageMetrics(u) {
+  if (!u || typeof u !== 'object') return null;
+  const uncachedInput = toFiniteNonNeg(u.input_tokens) ?? 0;
+  const cacheRead = toFiniteNonNeg(u.cache_read_input_tokens) ?? 0;
+  const e5m =
+    u.cache_creation && typeof u.cache_creation === 'object'
+      ? toFiniteNonNeg(u.cache_creation.ephemeral_5m_input_tokens)
+      : null;
+  const e1h =
+    u.cache_creation && typeof u.cache_creation === 'object'
+      ? toFiniteNonNeg(u.cache_creation.ephemeral_1h_input_tokens)
+      : null;
+  const rawCW = toFiniteNonNeg(u.cache_creation_input_tokens);
+  const cacheWrite1h = e1h ?? 0;
+  const cacheWrite5m = e5m !== null ? e5m : Math.max(0, (rawCW ?? 0) - cacheWrite1h);
+  const cacheWrite = Math.max(rawCW ?? 0, cacheWrite5m + cacheWrite1h);
+  const output = toFiniteNonNeg(u.output_tokens) ?? 0;
+  const thinking =
+    toFiniteNonNeg(u.output_tokens_details?.thinking_tokens) ??
+    toFiniteNonNeg(u.thinking_tokens) ??
+    toFiniteNonNeg(u.reasoning_output_tokens);
+  const speedTier = normalizeServiceTier(u.speed);
+  const rawTier = normalizeServiceTier(u.service_tier);
+  const serviceTier = speedTier || rawTier;
+  const inferenceGeo = normalizeInferenceGeo(u.inference_geo);
+  return {
+    uncachedInput,
+    cacheRead,
+    cacheWrite,
+    cacheWrite5m,
+    cacheWrite1h,
+    output,
+    thinking,
+    serviceTier,
+    inferenceGeo,
+  };
+}
+
 function mergeIntervalsMs(intervals) {
   const valid = intervals
     .filter(([s, e]) => Number.isFinite(s) && Number.isFinite(e) && e > s)
@@ -224,6 +262,7 @@ export class ClaudeSessionStreamParser {
     let outputTokens = 0;
     let thinkingTokens = 0;
     let hasThinking = false;
+    let advisorCallCount = 0;
     const bucketMap = new Map();
 
     for (const c of usageCalls) {
@@ -245,6 +284,38 @@ export class ClaudeSessionStreamParser {
         cacheWrite1h: c.cacheWrite1h,
         output: c.output,
       });
+
+      if (c.advisorIterations && c.advisorIterations.size > 0) {
+        for (const adv of c.advisorIterations.values()) {
+          if (
+            adv.uncachedInput === 0 &&
+            adv.cacheRead === 0 &&
+            adv.cacheWrite === 0 &&
+            adv.output === 0
+          ) {
+            continue;
+          }
+          advisorCallCount += 1;
+          uncachedInputTokens += adv.uncachedInput;
+          cacheReadTokens += adv.cacheRead;
+          cacheWriteTokens += adv.cacheWrite;
+          outputTokens += adv.output;
+          if (adv.thinking !== null) {
+            thinkingTokens += adv.thinking;
+            hasThinking = true;
+          }
+          accumulateUsageBucket(bucketMap, {
+            model: adv.model,
+            serviceTier: adv.serviceTier || c.serviceTier,
+            inferenceGeo: adv.inferenceGeo || c.inferenceGeo,
+            uncachedInput: adv.uncachedInput,
+            cacheRead: adv.cacheRead,
+            cacheWrite5m: adv.cacheWrite5m,
+            cacheWrite1h: adv.cacheWrite1h,
+            output: adv.output,
+          });
+        }
+      }
     }
 
     const totalInputTokens = uncachedInputTokens + cacheReadTokens + cacheWriteTokens;
@@ -311,7 +382,7 @@ export class ClaudeSessionStreamParser {
       workspacePath: rt.workspacePath || this.resolvedWorkspacePath || null,
       startedAtMs,
       completedAtMs,
-      callCount: usageCalls.length,
+      callCount: usageCalls.length + advisorCallCount,
       totalInputTokens,
       uncachedInputTokens,
       cacheReadTokens,
@@ -383,6 +454,9 @@ export class ClaudeSessionStreamParser {
         toolIntervals: [],
         calls: new Map(),
         callOrder: [],
+        latestRequestlessKeyByMsgId: new Map(),
+        callRound: 0,
+        needsNextCallRound: false,
         anonSeq: 0,
       };
       currentDirty = true;
@@ -437,12 +511,15 @@ export class ClaudeSessionStreamParser {
         const kind = classifyUserEntry(obj);
         if (kind === 'user_prompt') {
           startTurn(tsMs, lineCwd);
-        } else if (kind === 'tool_result' && this.current && tsMs !== null) {
-          if (this.current.pendingToolStartMs === null && this.current.lastAssistantTsMs !== null) {
-            this.current.pendingToolStartMs = this.current.lastAssistantTsMs;
-          }
-          if (this.current.lastToolResultTsMs === null || tsMs > this.current.lastToolResultTsMs) {
-            this.current.lastToolResultTsMs = tsMs;
+        } else if (kind === 'tool_result' && this.current) {
+          this.current.needsNextCallRound = true;
+          if (tsMs !== null) {
+            if (this.current.pendingToolStartMs === null && this.current.lastAssistantTsMs !== null) {
+              this.current.pendingToolStartMs = this.current.lastAssistantTsMs;
+            }
+            if (this.current.lastToolResultTsMs === null || tsMs > this.current.lastToolResultTsMs) {
+              this.current.lastToolResultTsMs = tsMs;
+            }
           }
           currentDirty = true;
         }
@@ -455,8 +532,21 @@ export class ClaudeSessionStreamParser {
       const msg = obj.message;
       if (!msg || typeof msg !== 'object') continue;
 
-      if (typeof msg.id === 'string' && msg.id.trim()) {
-        const callKey = `${msg.id.trim()}|${typeof obj.requestId === 'string' ? obj.requestId.trim() : ''}`;
+      const rawMsgId = typeof msg.id === 'string' ? msg.id.trim() : '';
+      const rawReqId = typeof obj.requestId === 'string' ? obj.requestId.trim() : '';
+      const tsKey =
+        typeof obj.timestamp === 'string' && obj.timestamp.trim()
+          ? obj.timestamp.trim()
+          : tsMs !== null
+            ? String(tsMs)
+            : '';
+
+      if (rawMsgId) {
+        const scopeSessionId =
+          (typeof obj.sessionId === 'string' && obj.sessionId.trim()) || this._finalSessionId();
+        const callKey = rawReqId
+          ? `${rawMsgId}|${rawReqId}`
+          : `${rawMsgId}||${scopeSessionId}|${tsKey}`;
         seenCallKeys?.add(callKey);
         if (callIsForeign(callKey)) {
           if (this.current) {
@@ -480,16 +570,43 @@ export class ClaudeSessionStreamParser {
       if (!this.current) {
         startTurn(tsMs, lineCwd);
       }
+      if (this.current.needsNextCallRound) {
+        this.current.callRound += 1;
+        this.current.needsNextCallRound = false;
+      }
       currentDirty = true;
 
-      const msgId =
-        typeof msg.id === 'string' && msg.id.trim()
-          ? msg.id.trim()
-          : typeof obj.uuid === 'string' && obj.uuid.trim()
+      const nextMetrics = hasUsage ? extractClaudeUsageMetrics(usage) : null;
+      let callMapKey;
+      if (rawMsgId && rawReqId) {
+        callMapKey = `${rawMsgId}|${rawReqId}`;
+      } else if (rawMsgId) {
+        const prevKey = this.current.latestRequestlessKeyByMsgId.get(rawMsgId);
+        const prevEntry = prevKey ? this.current.calls.get(prevKey) : null;
+        const canReuseStreaming =
+          Boolean(prevEntry) &&
+          prevEntry.callRound === this.current.callRound &&
+          (prevEntry.lastTsKey === tsKey ||
+            (prevEntry.stopReason === null &&
+              (!nextMetrics ||
+                !prevEntry.hasUsage ||
+                (prevEntry.uncachedInput === nextMetrics.uncachedInput &&
+                  prevEntry.cacheRead === nextMetrics.cacheRead &&
+                  prevEntry.cacheWrite === nextMetrics.cacheWrite))));
+        if (canReuseStreaming) {
+          callMapKey = prevKey;
+        } else {
+          callMapKey = `${rawMsgId}||${tsKey || 'notime'}#${(this.current.anonSeq += 1)}`;
+          this.current.latestRequestlessKeyByMsgId.set(rawMsgId, callMapKey);
+        }
+      } else {
+        callMapKey =
+          typeof obj.uuid === 'string' && obj.uuid.trim()
             ? obj.uuid.trim()
             : `anon-${(this.current.anonSeq += 1)}`;
+      }
 
-      const isNewCall = !this.current.calls.has(msgId);
+      const isNewCall = !this.current.calls.has(callMapKey);
       if (isNewCall && this.current.lastToolResultTsMs !== null) {
         flushPendingToolWait(this.current);
       }
@@ -508,11 +625,14 @@ export class ClaudeSessionStreamParser {
         this.current.pendingToolStartMs = tsMs;
       }
 
-      let entry = this.current.calls.get(msgId);
+      let entry = this.current.calls.get(callMapKey);
       if (!entry) {
         entry = {
-          id: msgId,
+          id: rawMsgId || callMapKey,
           model: null,
+          callRound: this.current.callRound,
+          lastTsKey: tsKey,
+          stopReason: null,
           hasUsage: false,
           uncachedInput: 0,
           cacheRead: 0,
@@ -523,53 +643,80 @@ export class ClaudeSessionStreamParser {
           thinking: null,
           serviceTier: null,
           inferenceGeo: null,
+          advisorIterations: new Map(),
           textParts: [],
           seenTexts: new Set(),
         };
-        this.current.calls.set(msgId, entry);
+        this.current.calls.set(callMapKey, entry);
         this.current.callOrder.push(entry);
+      }
+      entry.lastTsKey = tsKey;
+      if (typeof msg.stop_reason === 'string' && msg.stop_reason.trim()) {
+        entry.stopReason = msg.stop_reason.trim();
       }
       if (rawModel && rawModel.toLowerCase() !== 'unknown') {
         entry.model = rawModel;
       }
 
-      if (hasUsage) {
+      if (hasUsage && nextMetrics) {
         entry.hasUsage = true;
-        const uncached = toFiniteNonNeg(usage.input_tokens) ?? 0;
-        const cacheRead = toFiniteNonNeg(usage.cache_read_input_tokens) ?? 0;
-        const e5m =
-          usage.cache_creation && typeof usage.cache_creation === 'object'
-            ? toFiniteNonNeg(usage.cache_creation.ephemeral_5m_input_tokens)
-            : null;
-        const e1h =
-          usage.cache_creation && typeof usage.cache_creation === 'object'
-            ? toFiniteNonNeg(usage.cache_creation.ephemeral_1h_input_tokens)
-            : null;
-        const rawCW = toFiniteNonNeg(usage.cache_creation_input_tokens);
-        const cw1h = e1h ?? 0;
-        const cw5m = e5m !== null ? e5m : Math.max(0, (rawCW ?? 0) - cw1h);
-        const cacheWrite = Math.max(rawCW ?? 0, cw5m + cw1h);
-        const output = toFiniteNonNeg(usage.output_tokens) ?? 0;
-        const thinking =
-          toFiniteNonNeg(usage.output_tokens_details?.thinking_tokens) ??
-          toFiniteNonNeg(usage.thinking_tokens) ??
-          toFiniteNonNeg(usage.reasoning_output_tokens);
-
-        entry.uncachedInput = Math.max(entry.uncachedInput, uncached);
-        entry.cacheRead = Math.max(entry.cacheRead, cacheRead);
-        entry.cacheWrite1h = Math.max(entry.cacheWrite1h, cw1h);
-        entry.cacheWrite = Math.max(entry.cacheWrite, cacheWrite);
+        entry.uncachedInput = Math.max(entry.uncachedInput, nextMetrics.uncachedInput);
+        entry.cacheRead = Math.max(entry.cacheRead, nextMetrics.cacheRead);
+        entry.cacheWrite1h = Math.max(entry.cacheWrite1h, nextMetrics.cacheWrite1h);
+        entry.cacheWrite = Math.max(entry.cacheWrite, nextMetrics.cacheWrite);
         entry.cacheWrite5m = Math.max(0, entry.cacheWrite - entry.cacheWrite1h);
-        entry.output = Math.max(entry.output, output);
-        if (thinking !== null) {
-          entry.thinking = entry.thinking === null ? thinking : Math.max(entry.thinking, thinking);
+        entry.output = Math.max(entry.output, nextMetrics.output);
+        if (nextMetrics.thinking !== null) {
+          entry.thinking =
+            entry.thinking === null ? nextMetrics.thinking : Math.max(entry.thinking, nextMetrics.thinking);
         }
-        const speedTier = normalizeServiceTier(usage.speed);
-        const rawTier = normalizeServiceTier(usage.service_tier);
-        const callTier = speedTier || rawTier;
-        if (callTier) entry.serviceTier = callTier;
-        const geo = normalizeInferenceGeo(usage.inference_geo);
-        if (geo) entry.inferenceGeo = geo;
+        if (nextMetrics.serviceTier) entry.serviceTier = nextMetrics.serviceTier;
+        if (nextMetrics.inferenceGeo) entry.inferenceGeo = nextMetrics.inferenceGeo;
+
+        if (Array.isArray(usage.iterations)) {
+          for (let idx = 0; idx < usage.iterations.length; idx += 1) {
+            const iter = usage.iterations[idx];
+            if (!iter || typeof iter !== 'object' || iter.type !== 'advisor_message') continue;
+            const advModel =
+              (typeof iter.model === 'string' && iter.model.trim()) ||
+              (typeof obj.advisorModel === 'string' && obj.advisorModel.trim()) ||
+              '';
+            if (!advModel) continue;
+            const advMetrics = extractClaudeUsageMetrics(iter);
+            if (!advMetrics) continue;
+            let advEntry = entry.advisorIterations.get(idx);
+            if (!advEntry) {
+              advEntry = {
+                model: advModel,
+                uncachedInput: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cacheWrite5m: 0,
+                cacheWrite1h: 0,
+                output: 0,
+                thinking: null,
+                serviceTier: null,
+                inferenceGeo: null,
+              };
+              entry.advisorIterations.set(idx, advEntry);
+            }
+            advEntry.model = advModel;
+            advEntry.uncachedInput = Math.max(advEntry.uncachedInput, advMetrics.uncachedInput);
+            advEntry.cacheRead = Math.max(advEntry.cacheRead, advMetrics.cacheRead);
+            advEntry.cacheWrite1h = Math.max(advEntry.cacheWrite1h, advMetrics.cacheWrite1h);
+            advEntry.cacheWrite = Math.max(advEntry.cacheWrite, advMetrics.cacheWrite);
+            advEntry.cacheWrite5m = Math.max(0, advEntry.cacheWrite - advEntry.cacheWrite1h);
+            advEntry.output = Math.max(advEntry.output, advMetrics.output);
+            if (advMetrics.thinking !== null) {
+              advEntry.thinking =
+                advEntry.thinking === null
+                  ? advMetrics.thinking
+                  : Math.max(advEntry.thinking, advMetrics.thinking);
+            }
+            if (advMetrics.serviceTier) advEntry.serviceTier = advMetrics.serviceTier;
+            if (advMetrics.inferenceGeo) advEntry.inferenceGeo = advMetrics.inferenceGeo;
+          }
+        }
       }
 
       for (const part of textParts) {

@@ -241,7 +241,7 @@ test('Disabled tools skip adapter scans and quota cache isolates enabledTools', 
     const agy = new AntigravityAdapter({ store, geminiRoot: '/nonexistent-dir', enableRpc: false, isEnabled: () => enabled });
     const cb = new CodeBuddyAdapter({ store, extDataDir: '/nonexistent-dir', cliProjectsDir: '/nonexistent-dir', isEnabled: () => enabled });
 
-    assert.deepEqual(codex.scan(), []);
+    assert.deepEqual(await codex.scan(), []);
     assert.deepEqual(await agy.scan(), []);
     assert.deepEqual(cb.scan(), []);
 

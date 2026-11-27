@@ -11,9 +11,12 @@ const zstdCompressSync = typeof zlib.zstdCompressSync === 'function' ? zlib.zstd
 import { TurnStore } from '../packages/daemon/src/store.mjs';
 import { normalizeTurn } from '../packages/daemon/src/format.mjs';
 import { estimateTurnCost } from '../packages/daemon/src/pricing.mjs';
+import { forEachZstdLine } from '../packages/daemon/src/zstd.mjs';
 import { parseClaudeCodeSessionContent } from '../packages/daemon/src/adapters/claude-code.mjs';
 import {
   AntigravityAdapter,
+  decodeAntigravityGenMetadataRow,
+  loadAntigravityConversationSpeedIndex,
   parseAntigravityTranscriptContent,
   parseAntigravityTranscriptDetailed,
 } from '../packages/daemon/src/adapters/antigravity.mjs';
@@ -377,7 +380,7 @@ test('AntigravityAdapter.scan() guards concurrent invocations with _scanning loc
   }
 });
 
-test('CodexAdapter defers ingested_files caching for open turns so >120s flushOpenTurns actually fires', () => {
+test('CodexAdapter defers ingested_files caching for open turns so >120s flushOpenTurns actually fires', async () => {
   const openTurnJsonl = [
     JSON.stringify({
       timestamp: '2026-11-23T04:00:00.000Z',
@@ -428,18 +431,18 @@ test('CodexAdapter defers ingested_files caching for open turns so >120s flushOp
     const adapter = new CodexAdapter({ store, sessionsDir: join(tmpRoot, 'sessions'), archivedDir });
 
     // 1. Scan at +10s (<120s): open turn deferred, NOT persisted to ingested_files
-    const s1 = adapter.scan({ nowMs: mtimeMs + 10_000 });
+    const s1 = await adapter.scan({ nowMs: mtimeMs + 10_000 });
     assert.equal(s1.length, 0);
     assert.equal(store.getIngestedFile(fp), null);
     assert.equal(adapter.pendingOpenFiles.has(fp), true);
 
     // 2. Scan at +50s (<120s, unchanged): throttled cleanly
-    const s2 = adapter.scan({ nowMs: mtimeMs + 50_000 });
+    const s2 = await adapter.scan({ nowMs: mtimeMs + 50_000 });
     assert.equal(s2.length, 0);
     assert.equal(store.getIngestedFile(fp), null);
 
     // 3. Scan at +125s (>120s, unchanged): flushes open turn and persists ingested_files
-    const s3 = adapter.scan({ nowMs: mtimeMs + 125_000 });
+    const s3 = await adapter.scan({ nowMs: mtimeMs + 125_000 });
     assert.equal(s3.length, 1);
     assert.equal(s3[0].turnUid, 'codex:codex-open-1:turn-open');
     assert.equal(s3[0].totalInputTokens, 4000);
@@ -448,7 +451,7 @@ test('CodexAdapter defers ingested_files caching for open turns so >120s flushOp
     assert.ok(store.getIngestedFile(fp), 'ingested_files must be persisted once flushed');
 
     // 4. Subsequent scan at +140s is skipped cleanly
-    assert.equal(adapter.scan({ nowMs: mtimeMs + 140_000 }).length, 0);
+    assert.equal((await adapter.scan({ nowMs: mtimeMs + 140_000 })).length, 0);
 
     // 5. Archived .jsonl.zst with open turn flushes immediately even at +5s
     if (zstdCompressSync) {
@@ -456,7 +459,7 @@ test('CodexAdapter defers ingested_files caching for open turns so >120s flushOp
       const zstContent = openTurnJsonl.replace(/codex-open-1/g, 'codex-zst-1');
       writeFileSync(zstPath, zstdCompressSync(Buffer.from(zstContent, 'utf8')));
       const zstMtime = statSync(zstPath).mtimeMs;
-      const sZst = adapter.scan({ nowMs: zstMtime + 5_000 });
+      const sZst = await adapter.scan({ nowMs: zstMtime + 5_000 });
       assert.equal(sZst.length, 1);
       assert.equal(sZst[0].turnUid, 'codex:codex-zst-1:turn-open');
       assert.ok(store.getIngestedFile(zstPath));
@@ -467,7 +470,7 @@ test('CodexAdapter defers ingested_files caching for open turns so >120s flushOp
     const liveInitial = openTurnJsonl.replace(/codex-open-1/g, 'codex-live-1');
     writeFileSync(fpLive, liveInitial);
     const liveMtime1 = statSync(fpLive).mtimeMs;
-    assert.equal(adapter.scan({ nowMs: liveMtime1 + 5_000 }).length, 0);
+    assert.equal((await adapter.scan({ nowMs: liveMtime1 + 5_000 })).length, 0);
     assert.equal(store.getIngestedFile(fpLive), null);
 
     const taskCompleteLine = JSON.stringify({
@@ -477,7 +480,7 @@ test('CodexAdapter defers ingested_files caching for open turns so >120s flushOp
     });
     writeFileSync(fpLive, `${liveInitial}\n${taskCompleteLine}\n`);
     const liveMtime2 = statSync(fpLive).mtimeMs;
-    const sLive = adapter.scan({ nowMs: liveMtime2 + 5_000 });
+    const sLive = await adapter.scan({ nowMs: liveMtime2 + 5_000 });
     assert.equal(sLive.length, 1);
     assert.equal(sLive[0].turnUid, 'codex:codex-live-1:turn-open');
     assert.equal(adapter.pendingOpenFiles.has(fpLive), false);
@@ -1177,6 +1180,341 @@ test('TurnStore migrates v3->v4, preserves cursor-cloud explicitCostUsd on dedup
       assert.equal(receipt.availableDates[0].estimatedCostUsd, 1.056);
     } finally {
       store.close();
+    }
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+function pbVarint(n) {
+  let v = BigInt(n);
+  const out = [];
+  while (v >= 0x80n) {
+    out.push(Number((v & 0x7fn) | 0x80n));
+    v >>= 7n;
+  }
+  out.push(Number(v));
+  return Buffer.from(out);
+}
+
+function pbFieldBytes(fieldNum, payload) {
+  const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, 'utf8');
+  return Buffer.concat([pbVarint((fieldNum << 3) | 2), pbVarint(buf.length), buf]);
+}
+
+function pbFieldVarint(fieldNum, val) {
+  return Buffer.concat([pbVarint((fieldNum << 3) | 0), pbVarint(val)]);
+}
+
+function buildGenMetadataBlob({ stepIndices, responseModel, displayName, outputTokens, thinkingTokens, ttftMs, streamingMs }) {
+  const usage = Buffer.concat([
+    ...(outputTokens !== undefined ? [pbFieldVarint(3, outputTokens)] : []),
+    ...(thinkingTokens !== undefined ? [pbFieldVarint(9, thinkingTokens)] : []),
+  ]);
+  const dur = (ms) =>
+    Buffer.concat([
+      pbFieldVarint(1, Math.floor(ms / 1000)),
+      pbFieldVarint(2, (ms % 1000) * 1_000_000),
+    ]);
+  const chatModel = Buffer.concat([
+    ...(usage.length ? [pbFieldBytes(4, usage)] : []),
+    ...(ttftMs !== undefined ? [pbFieldBytes(11, dur(ttftMs))] : []),
+    ...(streamingMs !== undefined ? [pbFieldBytes(12, dur(streamingMs))] : []),
+    ...(responseModel ? [pbFieldBytes(19, responseModel)] : []),
+    ...(displayName ? [pbFieldBytes(21, displayName)] : []),
+  ]);
+  const packedSteps = Buffer.concat(stepIndices.map((s) => pbVarint(s)));
+  return Buffer.concat([pbFieldBytes(1, chatModel), pbFieldBytes(2, packedSteps)]);
+}
+
+test('Antigravity pricing falls back on unknown bucket, TurnStore protects named buckets, and offline gen_metadata protobuf restores models & TPS', async () => {
+  // 1. Pricing fallback when bucket m is "unknown" or missing, while real unknown models remain partial
+  const unknownBucketCost = estimateTurnCost({
+    model: 'gemini-4-neon',
+    completedAtMs: Date.UTC(2026, 10, 20),
+    usageBuckets: [{ m: 'unknown', b: 'le_100k', c: 1, in: 1_000_000, u: 1_000_000, cr: 0, cw5: 0, cw1h: 0, out: 100_000 }],
+  });
+  assert.equal(unknownBucketCost.priced, true);
+  assert.equal(unknownBucketCost.partial, false);
+  assert.equal(unknownBucketCost.costUsd, 4.5);
+
+  const realUnknownBucket = estimateTurnCost({
+    model: 'gemini-4-neon',
+    completedAtMs: Date.UTC(2026, 10, 20),
+    usageBuckets: [
+      { m: 'unknown', b: 'le_100k', c: 1, in: 1_000_000, u: 1_000_000, cr: 0, cw5: 0, cw1h: 0, out: 0 },
+      { m: 'mystery-model', b: 'le_100k', c: 1, in: 1_000_000, u: 1_000_000, cr: 0, cw5: 0, cw1h: 0, out: 0 },
+    ],
+  });
+  assert.equal(realUnknownBucket.partial, true);
+  assert.equal(realUnknownBucket.costUsd, 3);
+
+  // 2. TurnStore protects named usage_buckets_json from offline rescan overwrite with unknown model
+  const store = new TurnStore(':memory:');
+  try {
+    store.upsertTurn({
+      turnUid: 'antigravity:sess-p:turn-0',
+      tool: 'antigravity',
+      host: 'antigravity-desktop',
+      sessionId: 'sess-p',
+      turnId: 'turn-0',
+      model: 'gemini-4-neon',
+      completedAtMs: Date.UTC(2026, 10, 20),
+      callCount: 1,
+      totalInputTokens: 100_000,
+      uncachedInputTokens: 100_000,
+      outputTokens: 1_000,
+      usageBuckets: [{ m: 'gemini-4-neon', b: 'le_100k', c: 1, in: 100_000, u: 100_000, cr: 0, cw5: 0, cw1h: 0, out: 1_000 }],
+    });
+    store.upsertTurn({
+      turnUid: 'antigravity:sess-p:turn-0',
+      tool: 'antigravity',
+      host: 'antigravity-desktop',
+      sessionId: 'sess-p',
+      turnId: 'turn-0',
+      model: 'unknown',
+      completedAtMs: Date.UTC(2026, 10, 20),
+      callCount: 1,
+      totalInputTokens: 100_000,
+      uncachedInputTokens: 100_000,
+      outputTokens: 1_000,
+      usageBuckets: [{ b: 'le_100k', c: 1, in: 100_000, u: 100_000, cr: 0, cw5: 0, cw1h: 0, out: 1_000 }],
+    });
+    const saved = store.db.prepare(`SELECT model, usage_buckets_json FROM turns WHERE turn_uid = 'antigravity:sess-p:turn-0'`).get();
+    assert.equal(saved.model, 'gemini-4-neon');
+    assert.equal(JSON.parse(saved.usage_buckets_json)[0].m, 'gemini-4-neon');
+  } finally {
+    store.close();
+  }
+
+  // 3. Binary protobuf gen_metadata decoder + offline SQLite scan
+  const decoded = decodeAntigravityGenMetadataRow(
+    buildGenMetadataBlob({
+      stepIndices: [1, 2],
+      responseModel: 'gemini-4-hydrogen',
+      displayName: 'Gemini 4 Hydrogen (High)',
+      outputTokens: 500,
+      thinkingTokens: 200,
+      ttftMs: 1200,
+      streamingMs: 2500,
+    })
+  );
+  assert.deepEqual(decoded.stepIndices, [1, 2]);
+  assert.equal(decoded.entry.model, 'gemini-4-hydrogen');
+  assert.equal(decoded.entry.outputTokens, 500);
+  assert.equal(decoded.entry.thinkingTokens, 200);
+  assert.equal(decoded.entry.ttftMs, 1200);
+  assert.equal(decoded.entry.streamingMs, 2500);
+
+  const tmpGem = mkdtempSync(join(tmpdir(), 'atm-ag-genmeta-'));
+  try {
+    const sid = 'sess-genmeta-1';
+    const logsDir = join(tmpGem, 'antigravity', 'brain', sid, '.system_generated', 'logs');
+    const convDir = join(tmpGem, 'antigravity', 'conversations');
+    mkdirSync(logsDir, { recursive: true });
+    mkdirSync(convDir, { recursive: true });
+
+    writeFileSync(
+      join(logsDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-10T01:00:00Z' }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-10T01:00:03Z',
+          input_tokens: 100_000,
+          cache_read_tokens: 0,
+          output_tokens: 500,
+          tool_calls: [{ id: 't1' }],
+        }),
+        JSON.stringify({
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-10T01:00:08Z',
+          input_tokens: 100_000,
+          cache_read_tokens: 0,
+          output_tokens: 1_000,
+          tool_calls: [],
+        }),
+      ].join('\n')
+    );
+
+    const convDb = new DatabaseSync(join(convDir, `${sid}.db`));
+    convDb.exec(`CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER);`);
+    const ins = convDb.prepare(`INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)`);
+    const b0 = buildGenMetadataBlob({
+      stepIndices: [1],
+      responseModel: 'gemini-4-hydrogen',
+      outputTokens: 500,
+      thinkingTokens: 150,
+      ttftMs: 900,
+      streamingMs: 2000,
+    });
+    // Row 1 omits field 19 responseModel and falls back to field 21 displayName
+    const b1 = buildGenMetadataBlob({
+      stepIndices: [3],
+      displayName: 'Gemini 3.8 Flash (High)',
+      outputTokens: 1000,
+      thinkingTokens: 300,
+      ttftMs: 400,
+      streamingMs: 2000,
+    });
+    ins.run(0, b0, b0.length);
+    ins.run(1, b1, b1.length);
+    convDb.close();
+
+    const idxMap = loadAntigravityConversationSpeedIndex(tmpGem, 'antigravity', sid);
+    assert.equal(idxMap.get(1)?.model, 'gemini-4-hydrogen');
+    assert.equal(idxMap.get(3)?.model, 'Gemini 3.8 Flash (High)');
+
+    const agStore = new TurnStore(':memory:');
+    try {
+      const adapter = new AntigravityAdapter({ store: agStore, geminiRoot: tmpGem, enableRpc: false });
+      const emitted = await adapter.scan({ maxRecentFiles: Infinity });
+      assert.equal(emitted.length, 1);
+      assert.equal(emitted[0].tpsMethod, 'streaming_decode');
+      assert.equal(emitted[0].thinkingTokens, 450);
+      assert.equal(emitted[0].usageBuckets.length, 2);
+      // Step 1 (hydrogen: 0.1*1.5 + 0.0005*7.5 = 0.15375) + Step 3 (3.8 flash: 0.1*0.75 + 0.001*3.75 = 0.07875) = 0.2325
+      assert.equal(emitted[0].estimatedCostUsd, 0.2325);
+    } finally {
+      agStore.close();
+    }
+  } finally {
+    rmSync(tmpGem, { recursive: true, force: true });
+  }
+});
+
+test('CodexAdapter deduplicates replayed parent turns across forked rollouts and purges legacy orphan duplicates', async () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'atm-codex-fork-dedupe-'));
+  const sessDir = join(tmpRoot, 'sessions', '2026', '11', '12');
+  mkdirSync(sessDir, { recursive: true });
+  const parentId = '11111111-1111-7111-8111-111111111111';
+  const childId = '22222222-2222-7222-8222-222222222222';
+  const parentFile = join(sessDir, `rollout-2026-11-12T10-00-00-${parentId}.jsonl`);
+  const childFile = join(sessDir, `rollout-2026-11-12T10-10-00-${childId}.jsonl`);
+
+  const tc = (ts, tid, totIn, totOut, lastIn, lastOut) =>
+    JSON.stringify({
+      timestamp: ts,
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: totIn, cached_input_tokens: 0, output_tokens: totOut, reasoning_output_tokens: 0 },
+          last_token_usage: { input_tokens: lastIn, cached_input_tokens: 0, output_tokens: lastOut, reasoning_output_tokens: 0 },
+        },
+      },
+    });
+
+  writeFileSync(
+    parentFile,
+    [
+      JSON.stringify({ timestamp: '2026-11-12T10:00:00Z', type: 'session_meta', payload: { id: parentId, cwd: '/tmp/p' } }),
+      JSON.stringify({ timestamp: '2026-11-12T10:00:01Z', type: 'turn_context', payload: { turn_id: 'pt-1', model: 'gpt-5.4' } }),
+      tc('2026-11-12T10:00:05Z', 'pt-1', 1000, 100, 1000, 100),
+      JSON.stringify({ timestamp: '2026-11-12T10:00:06Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'pt-1' } }),
+      JSON.stringify({ timestamp: '2026-11-12T10:01:00Z', type: 'turn_context', payload: { turn_id: 'pt-2', model: 'gpt-5.4' } }),
+      tc('2026-11-12T10:01:05Z', 'pt-2', 3000, 300, 2000, 200),
+      JSON.stringify({ timestamp: '2026-11-12T10:01:06Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'pt-2' } }),
+    ].join('\n') + '\n'
+  );
+
+  // Forked child replays zero-delta baseline + parent pt-1 under synthetic rollout-4 + partial pt-2, then makes its own new turn ct-1
+  writeFileSync(
+    childFile,
+    [
+      JSON.stringify({ timestamp: '2026-11-12T10:10:00Z', type: 'session_meta', payload: { id: childId, forked_from_id: parentId, cwd: '/tmp/p' } }),
+      tc('2026-11-12T10:10:00Z', null, 1000, 100, 0, 0),
+      JSON.stringify({ timestamp: '2026-11-12T10:10:00Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'rollout-4' } }),
+      JSON.stringify({ timestamp: '2026-11-12T10:10:00Z', type: 'turn_context', payload: { turn_id: 'pt-1', model: 'gpt-5.4' } }),
+      tc('2026-11-12T10:10:00Z', 'pt-1', 1000, 100, 1000, 100),
+      JSON.stringify({ timestamp: '2026-11-12T10:10:01Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'pt-1' } }),
+      JSON.stringify({ timestamp: '2026-11-12T10:10:02Z', type: 'turn_context', payload: { turn_id: 'pt-2', model: 'gpt-5.4' } }),
+      tc('2026-11-12T10:10:02Z', 'pt-2', 3000, 300, 2000, 200),
+      JSON.stringify({ timestamp: '2026-11-12T10:10:03Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'pt-2' } }),
+      JSON.stringify({ timestamp: '2026-11-12T10:11:00Z', type: 'turn_context', payload: { turn_id: 'ct-1', model: 'gpt-5.4' } }),
+      tc('2026-11-12T10:11:05Z', 'ct-1', 3500, 350, 500, 50),
+      JSON.stringify({ timestamp: '2026-11-12T10:11:06Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'ct-1' } }),
+    ].join('\n') + '\n'
+  );
+
+  // Set child mtime older than parent to verify codexFileOrderMs filename ordering still processes parent first
+  const tParent = new Date('2026-11-12T10:15:00Z');
+  const tChild = new Date('2026-11-12T10:10:00Z');
+  utimesSync(parentFile, tParent, tParent);
+  utimesSync(childFile, tChild, tChild);
+
+  const store = new TurnStore(':memory:');
+  try {
+    // Seed an orphan pre-turn_source duplicate row (like legacy guardian session_id vs id mismatch)
+    store.upsertTurn({
+      turnUid: `codex:legacy-orphan:pt-1`,
+      tool: 'codex',
+      host: 'codex-desktop',
+      sessionId: 'legacy-orphan',
+      turnId: 'pt-1',
+      model: 'gpt-5.4',
+      completedAtMs: Date.parse('2026-11-12T10:00:06Z'),
+      totalInputTokens: 1000,
+      uncachedInputTokens: 1000,
+      outputTokens: 100,
+    });
+
+    const adapter = new CodexAdapter({ store, sessionsDir: join(tmpRoot, 'sessions'), archivedDir: join(tmpRoot, 'arch') });
+    await adapter.scan({ maxRecentFiles: Infinity });
+
+    const rows = store.db.prepare(`SELECT session_id, turn_id, total_input_tokens, output_tokens FROM turns WHERE tool = 'codex' ORDER BY completed_at_ms`).all();
+    assert.deepEqual(
+      rows.map((r) => ({ sid: r.session_id, tid: r.turn_id, in: r.total_input_tokens, out: r.output_tokens })),
+      [
+        { sid: parentId, tid: 'pt-1', in: 1000, out: 100 },
+        { sid: parentId, tid: 'pt-2', in: 2000, out: 200 },
+        { sid: childId, tid: 'ct-1', in: 500, out: 50 },
+      ]
+    );
+    assert.equal(store.getCodexIngestResetPending(), false);
+  } finally {
+    store.close();
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('forEachZstdLine streams compressed files via native or CLI fallback and warns on failure', async (t) => {
+  if (!zstdCompressSync) {
+    t.skip('native zstdCompressSync unavailable on this Node runtime');
+    return;
+  }
+  const tmpDir = mkdtempSync(join(tmpdir(), 'atm-zst-stream-'));
+  try {
+    const zstPath = join(tmpDir, 'sample.jsonl.zst');
+    const lines = ['{"a":1}', '{"b":2}', '{"c":3}'];
+    writeFileSync(zstPath, zstdCompressSync(Buffer.from(`${lines.join('\n')}\n`, 'utf8')));
+
+    const nativeOut = [];
+    const okNative = await forEachZstdLine(zstPath, (l) => nativeOut.push(l));
+    assert.equal(okNative, true);
+    assert.deepEqual(nativeOut, lines);
+
+    const warnings = [];
+    const okMissing = await forEachZstdLine(zstPath, () => {}, {
+      nativeStreamFactory: null,
+      cliBin: null,
+      warn: (msg) => warnings.push(msg),
+    });
+    assert.equal(okMissing, false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /zstd CLI unavailable/);
+
+    const cliOut = [];
+    const okCli = await forEachZstdLine(zstPath, (l) => cliOut.push(l), {
+      nativeStreamFactory: null,
+      warn: () => {},
+    });
+    if (okCli) {
+      assert.deepEqual(cliOut, lines);
     }
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });

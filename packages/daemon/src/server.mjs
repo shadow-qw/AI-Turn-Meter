@@ -1396,7 +1396,7 @@ export function createMeterServer({
               const becameEnabled = (k) => (!prevEnabled && config.tools[k] !== false) || (prevTools[k] === false && config.tools[k] !== false);
               if (enableWatchers) {
                 if (becameEnabled('codex')) {
-                  try { codexAdapter.scan({ maxRecentFiles: 12 }); } catch {}
+                  codexAdapter.scan({ maxRecentFiles: 12 }).catch(() => {});
                 }
                 if (becameEnabled('claude')) {
                   try { claudeCodeAdapter.scan({ maxRecentFiles: 12 }); } catch {}

@@ -62,6 +62,235 @@ export function buildAntigravitySpeedIndex(generatorMetadata) {
   return index;
 }
 
+function readProtoVarint(buf, offset, end = buf.length) {
+  let val = 0n;
+  let shift = 0n;
+  let i = offset;
+  while (i < end) {
+    const b = buf[i];
+    i += 1;
+    val |= BigInt(b & 0x7f) << shift;
+    if ((b & 0x80) === 0) {
+      return { value: val, nextOffset: i };
+    }
+    shift += 7n;
+    if (shift > 70n) return null;
+  }
+  return null;
+}
+
+function decodeProtobufFields(buf) {
+  if (!buf || typeof buf.length !== 'number' || buf.length === 0) return [];
+  const view = buf instanceof Uint8Array ? buf : Buffer.from(buf);
+  const fields = [];
+  let i = 0;
+  const end = view.length;
+  while (i < end) {
+    const tagRes = readProtoVarint(view, i, end);
+    if (!tagRes) return null;
+    i = tagRes.nextOffset;
+    const fieldNumber = Number(tagRes.value >> 3n);
+    const wireType = Number(tagRes.value & 7n);
+    if (fieldNumber <= 0) return null;
+    if (wireType === 0) {
+      const valRes = readProtoVarint(view, i, end);
+      if (!valRes) return null;
+      i = valRes.nextOffset;
+      fields.push({ fieldNumber, wireType, value: valRes.value });
+    } else if (wireType === 1) {
+      if (i + 8 > end) return null;
+      i += 8;
+      fields.push({ fieldNumber, wireType, value: null });
+    } else if (wireType === 2) {
+      const lenRes = readProtoVarint(view, i, end);
+      if (!lenRes) return null;
+      const len = Number(lenRes.value);
+      i = lenRes.nextOffset;
+      if (!Number.isSafeInteger(len) || len < 0 || i + len > end) return null;
+      fields.push({ fieldNumber, wireType, value: view.subarray(i, i + len) });
+      i += len;
+    } else if (wireType === 5) {
+      if (i + 4 > end) return null;
+      i += 4;
+      fields.push({ fieldNumber, wireType, value: null });
+    } else {
+      return null;
+    }
+  }
+  return fields;
+}
+
+function decodePackedVarints(buf) {
+  const out = [];
+  let i = 0;
+  while (i < buf.length) {
+    const res = readProtoVarint(buf, i, buf.length);
+    if (!res) break;
+    i = res.nextOffset;
+    const n = Number(res.value);
+    if (Number.isSafeInteger(n) && n >= 0) out.push(n);
+  }
+  return out;
+}
+
+function decodeDurationMs(buf) {
+  const fields = decodeProtobufFields(buf);
+  if (!fields) return null;
+  let seconds = 0;
+  let nanos = 0;
+  for (const f of fields) {
+    if (f.wireType !== 0) continue;
+    if (f.fieldNumber === 1) seconds = Number(f.value);
+    else if (f.fieldNumber === 2) nanos = Number(f.value);
+  }
+  if (!Number.isFinite(seconds) || !Number.isFinite(nanos) || seconds < 0 || nanos < 0) {
+    return null;
+  }
+  const ms = Math.round(seconds * 1000 + nanos / 1e6);
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
+/**
+ * Decode one binary Protobuf row from Antigravity's `conversations/<id>.db` `gen_metadata` table
+ * into `{ stepIndices, entry }` matching `buildAntigravitySpeedIndex`.
+ * @param {Uint8Array | Buffer} blob
+ */
+export function decodeAntigravityGenMetadataRow(blob) {
+  const root = decodeProtobufFields(blob);
+  if (!root || root.length === 0) return null;
+
+  let chatModelBuf = null;
+  const stepIndices = [];
+  for (const f of root) {
+    if (f.fieldNumber === 1 && f.wireType === 2) {
+      chatModelBuf = f.value;
+    } else if (f.fieldNumber === 2) {
+      if (f.wireType === 2) {
+        stepIndices.push(...decodePackedVarints(f.value));
+      } else if (f.wireType === 0) {
+        const n = Number(f.value);
+        if (Number.isSafeInteger(n) && n >= 0) stepIndices.push(n);
+      }
+    }
+  }
+  if (!chatModelBuf || stepIndices.length === 0) return null;
+
+  const cmFields = decodeProtobufFields(chatModelBuf);
+  if (!cmFields) return null;
+
+  let outputTokens = null;
+  let thinkingTokens = null;
+  let ttftMs = null;
+  let streamingMs = null;
+  let responseModel = '';
+  let modelDisplayName = '';
+
+  for (const f of cmFields) {
+    if (f.wireType !== 2) continue;
+    if (f.fieldNumber === 4) {
+      const usageFields = decodeProtobufFields(f.value);
+      if (usageFields) {
+        for (const uf of usageFields) {
+          if (uf.wireType !== 0) continue;
+          if (uf.fieldNumber === 3) {
+            const n = Number(uf.value);
+            if (Number.isFinite(n) && n >= 0) outputTokens = Math.round(n);
+          } else if (uf.fieldNumber === 9) {
+            const n = Number(uf.value);
+            if (Number.isFinite(n) && n >= 0) thinkingTokens = Math.round(n);
+          }
+        }
+      }
+    } else if (f.fieldNumber === 11) {
+      const ms = decodeDurationMs(f.value);
+      if (ms !== null) ttftMs = ms;
+    } else if (f.fieldNumber === 12) {
+      const ms = decodeDurationMs(f.value);
+      if (ms !== null) streamingMs = ms;
+    } else if (f.fieldNumber === 19) {
+      const s = Buffer.from(f.value).toString('utf8').trim();
+      if (s) responseModel = s;
+    } else if (f.fieldNumber === 21) {
+      const s = Buffer.from(f.value).toString('utf8').trim();
+      if (s) modelDisplayName = s;
+    }
+  }
+
+  const model = (responseModel || modelDisplayName || '').trim();
+  if (!model && ttftMs === null && streamingMs === null && outputTokens === null && thinkingTokens === null) {
+    return null;
+  }
+
+  return {
+    stepIndices,
+    entry: {
+      ttftMs,
+      streamingMs,
+      outputTokens,
+      thinkingTokens,
+      model,
+    },
+  };
+}
+
+/**
+ * Read offline step->model & streaming-speed index from `~/.gemini/<sub >/conversations/<sessionId>.db`
+ * (`gen_metadata` table) when the live Antigravity language server is unavailable or no longer tracks the session.
+ * @param {string} geminiRoot
+ * @param {string | null} sub
+ * @param {string} sessionId
+ * @returns {Map<number, object> | null}
+ */
+export function loadAntigravityConversationSpeedIndex(geminiRoot, sub, sessionId) {
+  if (!geminiRoot || !sessionId || typeof sessionId !== 'string') return null;
+  const candidateDirs = [];
+  for (const d of [sub, 'antigravity', 'antigravity-ide', 'antigravity-cli']) {
+    if (typeof d === 'string' && d && !candidateDirs.includes(d)) candidateDirs.push(d);
+  }
+  let dbPath = null;
+  for (const dir of candidateDirs) {
+    const p = join(geminiRoot, dir, 'conversations', `${sessionId}.db`);
+    if (existsSync(p)) {
+      dbPath = p;
+      break;
+    }
+  }
+  if (!dbPath) return null;
+
+  let db = null;
+  try {
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+    } catch {
+      db = new DatabaseSync(`file:${dbPath}?mode=ro&immutable=1`, { readOnly: true });
+    }
+    const hasTable = db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gen_metadata'`)
+      .get();
+    if (!hasTable) return null;
+
+    const rows = db.prepare(`SELECT data FROM gen_metadata ORDER BY idx ASC`).all();
+    const index = new Map();
+    for (const row of rows) {
+      if (!row?.data) continue;
+      const decoded = decodeAntigravityGenMetadataRow(row.data);
+      if (!decoded) continue;
+      for (const idx of decoded.stepIndices) {
+        index.set(idx, decoded.entry);
+      }
+    }
+    return index.size > 0 ? index : null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Ignore close error
+    }
+  }
+}
+
 /**
  * Parse an Antigravity transcript.jsonl into completed user-turn summaries plus open-turn status.
  * @param {string} content
@@ -238,7 +467,7 @@ export function parseAntigravityTranscriptDetailed(
     const bucketMap = new Map();
     for (const su of stepUsages) {
       accumulateUsageBucket(bucketMap, {
-        model: su.model || model,
+        model: su.model || (model !== 'unknown' ? model : null),
         uncachedInput: su.uncachedInput,
         cacheRead: su.cacheRead,
         cacheWrite5m: 0,
@@ -815,7 +1044,7 @@ export class AntigravityAdapter {
         const fp = join(brainDir, ent.name, '.system_generated', 'logs', 'transcript.jsonl');
         try {
           const st = statSync(fp);
-          results.push({ fp, sessionId: ent.name, host, mtimeMs: st.mtimeMs, sizeBytes: st.size });
+          results.push({ fp, sessionId: ent.name, host, sub, mtimeMs: st.mtimeMs, sizeBytes: st.size });
         } catch {
           // No transcript yet
         }
@@ -884,7 +1113,7 @@ export class AntigravityAdapter {
       const servers = hasRecentFile ? await this.getServers(nowMs) : null;
       const changed = [];
 
-      for (const { fp, sessionId, host, mtimeMs, sizeBytes } of dirtyFiles) {
+      for (const { fp, sessionId, host, sub, mtimeMs, sizeBytes } of dirtyFiles) {
         let content;
         try {
           content = readFileSync(fp, 'utf8');
@@ -895,6 +1124,9 @@ export class AntigravityAdapter {
         if (servers && servers.length > 0 && effectiveNow - mtimeMs < 15 * 60_000) {
           const meta = await fetchGeneratorMetadata(servers, sessionId);
           if (meta) speedIndex = buildAntigravitySpeedIndex(meta);
+        }
+        if (!speedIndex || speedIndex.size === 0) {
+          speedIndex = loadAntigravityConversationSpeedIndex(this.geminiRoot, sub, sessionId);
         }
 
         const convMeta = metaMap.get(sessionId);

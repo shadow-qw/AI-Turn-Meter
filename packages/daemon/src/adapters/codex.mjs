@@ -1,11 +1,14 @@
-import { readdirSync, readFileSync, statSync, watch } from 'node:fs';
+import { readdirSync, statSync, watch } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { decompressZstdSync } from '../zstd.mjs';
+import { forEachFileLine } from '../zstd.mjs';
 import { accumulateUsageBucket, finalizeUsageBuckets, normalizeServiceTier } from '../pricing.mjs';
 
 const CODEX_OPENAI_MODEL_RE = /^(?:openai\/)?(?:gpt-|o1|o3|o4|codex-|chatgpt-)/i;
 const OPEN_TURN_FLUSH_MS = 120_000;
+const READ_RETRY_BASE_MS = 30_000;
+const READ_RETRY_MAX_MS = 60 * 60_000;
+const ROLLOUT_TS_RE = /^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/;
 
 /**
  * Return true when `model` is an OpenAI / Codex model rather than a third-party gateway proxy.
@@ -48,43 +51,87 @@ function mergeIntervalsMs(intervals) {
   return total + (curEnd - curStart);
 }
 
+function codexFileOrderMs(fp, st) {
+  const m = basename(fp).match(ROLLOUT_TS_RE);
+  if (m) {
+    return Date.UTC(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      Number(m[4]),
+      Number(m[5]),
+      Number(m[6])
+    );
+  }
+  const born = Number(st?.birthtimeMs);
+  const mtime = Number(st?.mtimeMs) || 0;
+  return born > 0 ? Math.min(born, mtime || born) : mtime;
+}
+
 /**
- * Parse a Codex session rollout JSONL string into completed TurnRecord inputs plus open-turn status.
- * @param {string} content
- * @param {string} filePath
- * @param {{ flushOpenTurns?: boolean, onlyOpenAiModels?: boolean }} [opts]
- * @returns {{ turns: Array<object>, hasOpenTurns: boolean }}
+ * Stateful line-by-line parser for Codex session rollouts (`.jsonl` and streamed `.jsonl.zst`).
+ * Supports cross-file parent/fork replay deduplication via `isForeignCall` and `seenCallKeys`.
  */
-export function parseCodexSessionDetailed(
-  content,
-  filePath = '',
-  { flushOpenTurns = false, onlyOpenAiModels = true } = {}
-) {
-  const lines = content.split(/\r?\n/);
-  let sessionId = filePath.split('/').pop()?.replace(/\.jsonl(?:\.zst)?$/i, '') || 'codex-session';
-  let hasSessionMetaId = false;
-  let isForkedRollout = /_[0-9a-f-]{20,}\.jsonl(?:\.zst)?$/i.test(filePath);
-  let workspacePath = null;
-  let currentModel = 'unknown';
-  let currentServiceTier = null;
+export class CodexSessionStreamParser {
+  constructor({
+    filePath = '',
+    flushOpenTurns = false,
+    onlyOpenAiModels = true,
+    isForeignCall = null,
+    seenCallKeys = null,
+    droppedTurnUids = null,
+    resolveLineageRoot = null,
+  } = {}) {
+    this.filePath = filePath;
+    this.flushOpenTurns = Boolean(flushOpenTurns);
+    this.onlyOpenAiModels = Boolean(onlyOpenAiModels);
+    this.isForeignCall = isForeignCall;
+    this.seenCallKeys = seenCallKeys;
+    this.droppedTurnUids = droppedTurnUids;
+    this.resolveLineageRoot = resolveLineageRoot;
+    this.foreignMemo = new Map();
 
-  /** @type {Map<string, any>} */
-  const turns = new Map();
-  const completedTurns = [];
+    this.sessionId = filePath.split('/').pop()?.replace(/\.jsonl(?:\.zst)?$/i, '') || 'codex-session';
+    this.hasSessionMetaId = false;
+    this.forkedFromId = null;
+    this.isForkedRollout = /_[0-9a-f-]{20,}\.jsonl(?:\.zst)?$/i.test(filePath);
+    this.inForkReplayPrefix = this.isForkedRollout;
+    this.lineageRoot = this.sessionId;
+    this.hasKnownParent = false;
+    this.sawForeignCall = false;
+    this.workspacePath = null;
+    this.currentModel = 'unknown';
+    this.currentServiceTier = null;
 
-  let fileLastTotalSig = null;
-  let hasSeenTokenUsageRecord = false;
-  let skippedForkBaseline = false;
+    /** @type {Map<string, any>} */
+    this.turns = new Map();
+    this.completedTurns = [];
+    this.allTurnUids = new Set();
 
-  function ensureTurn(turnId, startedAtMs = null) {
+    this.fileLastTotalSig = null;
+    this.hasSeenTokenUsageRecord = false;
+    this.skippedForkBaseline = false;
+    this.countedOwnTokenCount = false;
+    this.activeTurnId = null;
+  }
+
+  _callIsForeign(key) {
+    if (!key || typeof this.isForeignCall !== 'function') return false;
+    if (!this.foreignMemo.has(key)) {
+      this.foreignMemo.set(key, Boolean(this.isForeignCall(key)));
+    }
+    return this.foreignMemo.get(key);
+  }
+
+  _ensureTurn(turnId, startedAtMs = null) {
     if (!turnId) return null;
-    let t = turns.get(turnId);
+    let t = this.turns.get(turnId);
     if (!t) {
       t = {
         turnId,
-        model: currentModel,
+        model: this.currentModel,
         hasTurnContextModel: false,
-        serviceTier: currentServiceTier,
+        serviceTier: this.currentServiceTier,
         hasTurnContextTier: false,
         startedAtMs,
         lastEventMs: startedAtMs,
@@ -100,9 +147,10 @@ export function parseCodexSessionDetailed(
         fallbackTurnUsage: { input: 0, cached: 0, cacheWrite: 0, output: 0, thinking: 0, calls: 0 },
         fallbackCalls: [],
         lastAgentText: null,
+        hadForeignCall: false,
         flushed: false,
       };
-      turns.set(turnId, t);
+      this.turns.set(turnId, t);
     }
     if (startedAtMs !== null && t.startedAtMs === null) {
       t.startedAtMs = startedAtMs;
@@ -110,21 +158,29 @@ export function parseCodexSessionDetailed(
     if (startedAtMs !== null) {
       t.lastEventMs = startedAtMs;
     }
-    if (!t.hasTurnContextModel && t.model === 'unknown' && currentModel !== 'unknown') {
-      t.model = currentModel;
+    if (!t.hasTurnContextModel && t.model === 'unknown' && this.currentModel !== 'unknown') {
+      t.model = this.currentModel;
     }
-    if (!t.hasTurnContextTier && t.serviceTier === null && currentServiceTier !== null) {
-      t.serviceTier = currentServiceTier;
+    if (!t.hasTurnContextTier && t.serviceTier === null && this.currentServiceTier !== null) {
+      t.serviceTier = this.currentServiceTier;
     }
     return t;
   }
 
-  function finalizeTurn(t, { completedAtMs, explicitDurationMs = null, rawTtftMs = null, lastAgentMessage = null } = {}) {
+  _finalizeTurn(t, { completedAtMs, explicitDurationMs = null, rawTtftMs = null, lastAgentMessage = null } = {}) {
     if (!t || t.flushed) return;
     t.flushed = true;
 
-    const effectiveModel = t.model !== 'unknown' ? t.model : currentModel;
-    if (onlyOpenAiModels && !isCodexOpenAiModel(effectiveModel)) {
+    const turnUid = `codex:${this.sessionId}:${t.turnId}`;
+    const markDropped = () => {
+      if (t.hadForeignCall && Array.isArray(this.droppedTurnUids)) {
+        this.droppedTurnUids.push(turnUid);
+      }
+    };
+
+    const effectiveModel = t.model !== 'unknown' ? t.model : this.currentModel;
+    if (this.onlyOpenAiModels && !isCodexOpenAiModel(effectiveModel)) {
+      markDropped();
       return;
     }
 
@@ -137,7 +193,7 @@ export function parseCodexSessionDetailed(
 
     if (t.calls.length > 0) {
       const lastTurnUsage = [...t.calls].reverse().find((c) => c.turnUsage)?.turnUsage;
-      if (lastTurnUsage) {
+      if (lastTurnUsage && !t.hadForeignCall) {
         totalInputTokens = Number(lastTurnUsage.input_tokens) || 0;
         cacheReadTokens = Number(lastTurnUsage.cached_input_tokens) || 0;
         cacheWriteTokens = Number(lastTurnUsage.cache_write_input_tokens) || 0;
@@ -162,9 +218,12 @@ export function parseCodexSessionDetailed(
       callCount = t.fallbackTurnUsage.calls;
     }
 
-    if (totalInputTokens <= 0 && outputTokens <= 0) return;
+    if (totalInputTokens <= 0 && outputTokens <= 0) {
+      markDropped();
+      return;
+    }
 
-    const effectiveTier = t.serviceTier ?? currentServiceTier;
+    const effectiveTier = t.serviceTier ?? this.currentServiceTier;
     const bucketMap = new Map();
     if (t.calls.length > 0) {
       let sumIn = 0;
@@ -271,14 +330,15 @@ export function parseCodexSessionDetailed(
       }
     }
 
-    completedTurns.push({
-      turnUid: `codex:${sessionId}:${t.turnId}`,
+    this.allTurnUids.add(turnUid);
+    this.completedTurns.push({
+      turnUid,
       tool: 'codex',
       host: 'codex-desktop',
-      sessionId,
+      sessionId: this.sessionId,
       turnId: t.turnId,
       model: effectiveModel,
-      workspacePath,
+      workspacePath: this.workspacePath,
       startedAtMs: t.startedAtMs,
       completedAtMs: resolvedCompletedMs,
       callCount,
@@ -301,52 +361,105 @@ export function parseCodexSessionDetailed(
     });
   }
 
-  let activeTurnId = null;
-
-  function switchActiveTurn(newTurnId, tsMs) {
-    if (activeTurnId && newTurnId && activeTurnId !== newTurnId) {
-      const prev = turns.get(activeTurnId);
+  _switchActiveTurn(newTurnId, tsMs) {
+    if (this.activeTurnId && newTurnId && this.activeTurnId !== newTurnId) {
+      const prev = this.turns.get(this.activeTurnId);
       if (prev && !prev.flushed) {
-        finalizeTurn(prev, { completedAtMs: prev.lastEventMs ?? tsMs });
+        this._finalizeTurn(prev, { completedAtMs: prev.lastEventMs ?? tsMs });
       }
     }
-    if (newTurnId) activeTurnId = newTurnId;
+    if (newTurnId) this.activeTurnId = newTurnId;
   }
 
-  for (const line of lines) {
-    if (!line.trim()) continue;
+  _canEmitTurn(t) {
+    if (!t || t.flushed) return false;
+    const effectiveModel = t.model !== 'unknown' ? t.model : this.currentModel;
+    if (this.onlyOpenAiModels && !isCodexOpenAiModel(effectiveModel)) {
+      return false;
+    }
+    if (t.calls.length > 0) {
+      const lastTurnUsage = [...t.calls].reverse().find((c) => c.turnUsage)?.turnUsage;
+      if (lastTurnUsage && !t.hadForeignCall) {
+        return (Number(lastTurnUsage.input_tokens) || 0) > 0 || (Number(lastTurnUsage.output_tokens) || 0) > 0;
+      }
+      let inp = 0;
+      let out = 0;
+      for (const c of t.calls) {
+        if (!c.usage) continue;
+        inp += Number(c.usage.input_tokens) || 0;
+        out += Number(c.usage.output_tokens) || 0;
+      }
+      return inp > 0 || out > 0;
+    }
+    if (t.fallbackTurnUsage.calls > 0) {
+      return t.fallbackTurnUsage.input > 0 || t.fallbackTurnUsage.output > 0;
+    }
+    return false;
+  }
+
+  feedLine(line) {
+    if (!line || !line.trim()) return;
     let obj;
     try {
       obj = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
+    if (!obj || typeof obj !== 'object') return;
 
     const tsMs = parseIsoMs(obj.timestamp);
     const topType = obj.type;
     const p = obj.payload;
-    if (!p || typeof p !== 'object') continue;
+    if (!p || typeof p !== 'object') return;
 
     if (topType === 'session_meta') {
-      const metaId = typeof p.id === 'string' && p.id ? p.id : typeof p.session_id === 'string' && p.session_id ? p.session_id : null;
+      const metaId =
+        typeof p.id === 'string' && p.id
+          ? p.id
+          : typeof p.session_id === 'string' && p.session_id
+            ? p.session_id
+            : null;
+      // Subagent rollouts copy their parent's session_meta into the inherited history right after
+      // their own. Only the file's first session_meta describes this rollout; a later meta with a
+      // different id belongs to an ancestor and must not rename the session, its fork parent, or cwd.
+      if (this.hasSessionMetaId && metaId && metaId !== this.sessionId) {
+        return;
+      }
       if (metaId) {
-        sessionId = metaId;
-        hasSessionMetaId = true;
+        this.sessionId = metaId;
+        this.hasSessionMetaId = true;
       }
-      if (p.forked_from_id || p.history_base || p.subagent_history_start_ordinal) {
-        isForkedRollout = true;
+      const rawForkParent =
+        (typeof p.forked_from_id === 'string' && p.forked_from_id.trim()) ||
+        (typeof p.source?.subagent?.thread_spawn?.parent_thread_id === 'string' &&
+          p.source.subagent.thread_spawn.parent_thread_id.trim()) ||
+        null;
+      if (rawForkParent) {
+        this.forkedFromId = rawForkParent;
       }
-      if (typeof p.cwd === 'string' && p.cwd) workspacePath = p.cwd;
-      continue;
+      if (rawForkParent || p.history_base || p.subagent_history_start_ordinal) {
+        this.isForkedRollout = true;
+        this.inForkReplayPrefix = true;
+      }
+      if (typeof this.resolveLineageRoot === 'function') {
+        const info = this.resolveLineageRoot(this.sessionId, this.forkedFromId);
+        this.lineageRoot = info?.rootId || this.sessionId;
+        this.hasKnownParent = Boolean(info?.hasKnownParent);
+      } else {
+        this.lineageRoot = this.forkedFromId || this.sessionId;
+        this.hasKnownParent = false;
+      }
+      if (typeof p.cwd === 'string' && p.cwd) this.workspacePath = p.cwd;
+      return;
     }
 
     if (topType === 'turn_context') {
-      if (typeof p.model === 'string' && p.model) currentModel = p.model;
-      if (typeof p.service_tier === 'string') currentServiceTier = normalizeServiceTier(p.service_tier);
-      if (typeof p.cwd === 'string' && p.cwd && !workspacePath) workspacePath = p.cwd;
+      if (typeof p.model === 'string' && p.model) this.currentModel = p.model;
+      if (typeof p.service_tier === 'string') this.currentServiceTier = normalizeServiceTier(p.service_tier);
+      if (typeof p.cwd === 'string' && p.cwd && !this.workspacePath) this.workspacePath = p.cwd;
       if (typeof p.turn_id === 'string' && p.turn_id) {
-        switchActiveTurn(p.turn_id, tsMs);
-        const t = ensureTurn(activeTurnId, tsMs);
+        this._switchActiveTurn(p.turn_id, tsMs);
+        const t = this._ensureTurn(this.activeTurnId, tsMs);
         if (t && typeof p.model === 'string' && p.model) {
           t.model = p.model;
           t.hasTurnContextModel = true;
@@ -356,17 +469,29 @@ export function parseCodexSessionDetailed(
           t.hasTurnContextTier = true;
         }
       }
-      continue;
+      return;
     }
 
     if (topType === 'token_usage_record') {
-      hasSeenTokenUsageRecord = true;
-      const turnId = p.turn_id || activeTurnId;
-      const t = ensureTurn(turnId, tsMs);
-      if (!t) continue;
-      if (!hasSessionMetaId && typeof p.session_id === 'string' && p.session_id) {
-        sessionId = p.session_id;
+      this.hasSeenTokenUsageRecord = true;
+      const turnId = p.turn_id || this.activeTurnId;
+      const t = this._ensureTurn(turnId, tsMs);
+      if (!t) return;
+      if (!this.hasSessionMetaId && typeof p.session_id === 'string' && p.session_id) {
+        this.sessionId = p.session_id;
       }
+
+      const respId = typeof p.response_id === 'string' ? p.response_id : null;
+      const respKey = respId ? `codex:resp:${this.lineageRoot || this.sessionId}:${respId}` : null;
+      if (respKey) {
+        this.seenCallKeys?.add(respKey);
+        if (this.isForkedRollout && this.inForkReplayPrefix && this._callIsForeign(respKey)) {
+          t.hadForeignCall = true;
+          this.sawForeignCall = true;
+          return;
+        }
+      }
+      this.inForkReplayPrefix = false;
 
       // Flush any completed tool execution window before this API call finished
       if (t.lastCallEndMs !== null && t.lastToolEndMs !== null && t.lastToolEndMs > t.lastCallEndMs) {
@@ -378,94 +503,121 @@ export function parseCodexSessionDetailed(
         t.lastEventMs = tsMs;
       }
 
-      const respId = typeof p.response_id === 'string' ? p.response_id : null;
       if (!respId || !t.seenResponseIds.has(respId)) {
         if (respId) t.seenResponseIds.add(respId);
         t.calls.push({
-          model: t.model !== 'unknown' ? t.model : currentModel,
-          serviceTier: t.serviceTier ?? currentServiceTier,
+          model: t.model !== 'unknown' ? t.model : this.currentModel,
+          serviceTier: t.serviceTier ?? this.currentServiceTier,
           usage: p.usage || null,
           turnUsage: p.turn_token_usage || null,
           tsMs,
         });
       }
-      continue;
+      return;
     }
 
     if (topType === 'response_item') {
-      const t = ensureTurn(activeTurnId, tsMs);
+      const t = this._ensureTurn(this.activeTurnId, tsMs);
       if (t && tsMs !== null) {
         t.lastEventMs = tsMs;
         if (p.type === 'function_call_output' || p.type === 'custom_tool_call_output') {
           t.lastToolEndMs = tsMs;
         }
       }
-      continue;
+      return;
     }
 
-    if (topType !== 'event_msg') continue;
+    if (topType !== 'event_msg') return;
     const pt = p.type;
 
     if (pt === 'thread_settings_applied') {
       const m = p.thread_settings?.model;
       if (typeof m === 'string' && m) {
-        currentModel = m;
+        this.currentModel = m;
         // Only backfill if current active turn had no turn_context model yet
-        const activeTurn = activeTurnId ? turns.get(activeTurnId) : null;
+        const activeTurn = this.activeTurnId ? this.turns.get(this.activeTurnId) : null;
         if (activeTurn && !activeTurn.hasTurnContextModel && activeTurn.model === 'unknown') {
           activeTurn.model = m;
         }
       }
       const st = p.thread_settings?.service_tier;
       if (typeof st === 'string') {
-        currentServiceTier = normalizeServiceTier(st);
-        const activeTurn = activeTurnId ? turns.get(activeTurnId) : null;
+        this.currentServiceTier = normalizeServiceTier(st);
+        const activeTurn = this.activeTurnId ? this.turns.get(this.activeTurnId) : null;
         if (
           activeTurn &&
           !activeTurn.hasTurnContextTier &&
           activeTurn.calls.length === 0 &&
           activeTurn.fallbackTurnUsage.calls === 0
         ) {
-          activeTurn.serviceTier = currentServiceTier;
+          activeTurn.serviceTier = this.currentServiceTier;
         }
       }
       const cwd = p.thread_settings?.cwd;
-      if (typeof cwd === 'string' && cwd && !workspacePath) workspacePath = cwd;
-      continue;
+      if (typeof cwd === 'string' && cwd && !this.workspacePath) this.workspacePath = cwd;
+      return;
     }
 
     if (pt === 'task_started') {
-      switchActiveTurn(p.turn_id, tsMs);
+      this._switchActiveTurn(p.turn_id, tsMs);
       const startedMs =
         tsMs ?? (typeof p.started_at === 'number' ? p.started_at * 1000 : null);
-      ensureTurn(activeTurnId, startedMs);
-      continue;
+      this._ensureTurn(this.activeTurnId, startedMs);
+      return;
     }
 
     if (pt === 'token_count') {
-      const t = ensureTurn(activeTurnId, tsMs);
+      const t = this._ensureTurn(this.activeTurnId, tsMs);
       const last = p.info?.last_token_usage;
       const total = p.info?.total_token_usage;
       if (t && last && typeof last === 'object') {
         const sig = JSON.stringify(total || last);
-        if (fileLastTotalSig !== sig) {
-          fileLastTotalSig = sig;
+        if (this.fileLastTotalSig !== sig) {
+          this.fileLastTotalSig = sig;
           const totalIn = Number(total?.input_tokens) || 0;
+          const totalCached = Number(total?.cached_input_tokens) || 0;
+          const totalOut = Number(total?.output_tokens) || 0;
+          const totalReasoning = Number(total?.reasoning_output_tokens) || 0;
+
           const lastIn = Number(last.input_tokens) || 0;
-          // In forked/resumed rollouts, initial token_count before any new call reflects the inherited parent baseline.
+          const cachedIn = Number(last.cached_input_tokens) || 0;
+          const cacheWriteIn = Number(last.cache_write_input_tokens) || 0;
+          const outTok = Number(last.output_tokens) || 0;
+
+          if (lastIn === 0 && outTok === 0 && cachedIn === 0 && cacheWriteIn === 0) {
+            return;
+          }
+
+          const tcKey =
+            total && typeof total === 'object'
+              ? `codex:tc:${this.lineageRoot || this.sessionId}:${totalIn}:${totalCached}:${totalOut}:${totalReasoning}:${lastIn}:${outTok}`
+              : null;
+          if (tcKey) this.seenCallKeys?.add(tcKey);
+
+          if (this.isForkedRollout && this.inForkReplayPrefix && tcKey && this._callIsForeign(tcKey)) {
+            t.hadForeignCall = true;
+            this.sawForeignCall = true;
+            return;
+          }
+
+          // Single-file fallback when parent rollout is absent: the file's first token_count, before
+          // this rollout has counted any call of its own, reflects the inherited parent baseline. Once a
+          // call was counted, a later turn's first token_count is real usage, not a baseline.
           if (
-            isForkedRollout &&
-            !hasSeenTokenUsageRecord &&
-            !skippedForkBaseline &&
+            this.isForkedRollout &&
+            !this.hasSeenTokenUsageRecord &&
+            !this.skippedForkBaseline &&
+            !this.sawForeignCall &&
+            !this.hasKnownParent &&
+            !this.countedOwnTokenCount &&
             t.fallbackTurnUsage.calls === 0 &&
             t.calls.length === 0 &&
             totalIn > lastIn
           ) {
-            skippedForkBaseline = true;
+            this.skippedForkBaseline = true;
           } else {
-            const cachedIn = Number(last.cached_input_tokens) || 0;
-            const cacheWriteIn = Number(last.cache_write_input_tokens) || 0;
-            const outTok = Number(last.output_tokens) || 0;
+            this.countedOwnTokenCount = true;
+            this.inForkReplayPrefix = false;
             t.fallbackTurnUsage.input += lastIn;
             t.fallbackTurnUsage.cached += cachedIn;
             t.fallbackTurnUsage.cacheWrite += cacheWriteIn;
@@ -473,8 +625,8 @@ export function parseCodexSessionDetailed(
             t.fallbackTurnUsage.thinking += Number(last.reasoning_output_tokens) || 0;
             t.fallbackTurnUsage.calls += 1;
             t.fallbackCalls.push({
-              model: t.model !== 'unknown' ? t.model : currentModel,
-              serviceTier: t.serviceTier ?? currentServiceTier,
+              model: t.model !== 'unknown' ? t.model : this.currentModel,
+              serviceTier: t.serviceTier ?? this.currentServiceTier,
               input: lastIn,
               cached: cachedIn,
               cacheWrite: cacheWriteIn,
@@ -483,12 +635,12 @@ export function parseCodexSessionDetailed(
           }
         }
       }
-      continue;
+      return;
     }
 
     if (pt === 'item_completed') {
-      const turnId = p.turn_id || activeTurnId;
-      const t = ensureTurn(turnId, tsMs);
+      const turnId = p.turn_id || this.activeTurnId;
+      const t = this._ensureTurn(turnId, tsMs);
       const itemType = p.item?.type;
       const itemStart =
         typeof p.started_at_ms === 'number' && Number.isFinite(p.started_at_ms) ? p.started_at_ms : null;
@@ -512,13 +664,13 @@ export function parseCodexSessionDetailed(
           }
         }
       }
-      continue;
+      return;
     }
 
     if (pt === 'task_complete') {
-      const turnId = p.turn_id || activeTurnId;
-      const t = ensureTurn(turnId, tsMs);
-      if (!t) continue;
+      const turnId = p.turn_id || this.activeTurnId;
+      const t = this._ensureTurn(turnId, tsMs);
+      if (!t) return;
 
       const completedAtMs =
         tsMs ??
@@ -530,73 +682,66 @@ export function parseCodexSessionDetailed(
           ? p.time_to_first_token_ms
           : null;
 
-      finalizeTurn(t, {
+      this._finalizeTurn(t, {
         completedAtMs,
         explicitDurationMs,
         rawTtftMs,
         lastAgentMessage: p.last_agent_message,
       });
 
-      if (activeTurnId === turnId) activeTurnId = null;
+      if (this.activeTurnId === turnId) this.activeTurnId = null;
     }
   }
 
-  function canEmitTurn(t) {
-    if (!t || t.flushed) return false;
-    const effectiveModel = t.model !== 'unknown' ? t.model : currentModel;
-    if (onlyOpenAiModels && !isCodexOpenAiModel(effectiveModel)) {
-      return false;
-    }
-    if (t.calls.length > 0) {
-      const lastTurnUsage = [...t.calls].reverse().find((c) => c.turnUsage)?.turnUsage;
-      if (lastTurnUsage) {
-        return (Number(lastTurnUsage.input_tokens) || 0) > 0 || (Number(lastTurnUsage.output_tokens) || 0) > 0;
+  finish() {
+    let hasOpenTurns = false;
+    if (this.flushOpenTurns) {
+      for (const t of this.turns.values()) {
+        if (!t.flushed) {
+          this._finalizeTurn(t, { completedAtMs: t.lastEventMs });
+        }
       }
-      let inp = 0;
-      let out = 0;
-      for (const c of t.calls) {
-        if (!c.usage) continue;
-        inp += Number(c.usage.input_tokens) || 0;
-        out += Number(c.usage.output_tokens) || 0;
+    } else {
+      for (const t of this.turns.values()) {
+        if (this._canEmitTurn(t)) {
+          hasOpenTurns = true;
+          break;
+        }
       }
-      return inp > 0 || out > 0;
     }
-    if (t.fallbackTurnUsage.calls > 0) {
-      return t.fallbackTurnUsage.input > 0 || t.fallbackTurnUsage.output > 0;
-    }
-    return false;
+    return {
+      turns: this.completedTurns,
+      hasOpenTurns,
+      sessionId: this.sessionId,
+      forkedFromId: this.forkedFromId,
+      allTurnUids: this.allTurnUids,
+    };
   }
+}
 
-  let hasOpenTurns = false;
-  if (flushOpenTurns) {
-    for (const t of turns.values()) {
-      if (!t.flushed) {
-        finalizeTurn(t, { completedAtMs: t.lastEventMs });
-      }
-    }
-  } else {
-    for (const t of turns.values()) {
-      if (canEmitTurn(t)) {
-        hasOpenTurns = true;
-        break;
-      }
-    }
+/**
+ * Parse a Codex session rollout JSONL string into completed TurnRecord inputs plus open-turn status.
+ * @param {string} content
+ * @param {string} filePath
+ * @param {object} [opts]
+ * @returns {{ turns: Array<object>, hasOpenTurns: boolean }}
+ */
+export function parseCodexSessionDetailed(content, filePath = '', opts = {}) {
+  const parser = new CodexSessionStreamParser({ ...opts, filePath });
+  for (const line of String(content || '').split(/\r?\n/)) {
+    parser.feedLine(line);
   }
-
-  return { turns: completedTurns, hasOpenTurns };
+  const res = parser.finish();
+  return { turns: res.turns, hasOpenTurns: res.hasOpenTurns };
 }
 
 /**
  * Parse a Codex session rollout JSONL string into completed TurnRecord inputs.
  * @param {string} content
  * @param {string} filePath
- * @param {{ flushOpenTurns?: boolean, onlyOpenAiModels?: boolean }} [opts]
+ * @param {object} [opts]
  */
-export function parseCodexSessionContent(
-  content,
-  filePath = '',
-  opts = {}
-) {
+export function parseCodexSessionContent(content, filePath = '', opts = {}) {
   return parseCodexSessionDetailed(content, filePath, opts).turns;
 }
 
@@ -644,111 +789,216 @@ export class CodexAdapter {
     this.watchers = [];
     this.timer = null;
     this.backfillTimer = null;
+    this.pending = null;
+    this._scanning = false;
+    this._stopped = false;
+    /** fp -> { mtimeMs, sizeBytes, attempts, retryAtMs } for rollouts that could not be read. */
+    this.readFailures = new Map();
   }
 
-  scan({ maxRecentFiles = 30, nowMs = Date.now() } = {}) {
+  async scan({ maxRecentFiles = 30, nowMs = Date.now() } = {}) {
     if (this.isEnabled && !this.isEnabled()) return [];
-    const collectLimit = Number.isFinite(maxRecentFiles) ? Math.max(maxRecentFiles * 3, 90) : Infinity;
-    const rawPaths = [];
-    collectJsonlFiles(this.sessionsDir, rawPaths, collectLimit);
-    if (this.archivedDir) {
-      collectJsonlFiles(this.archivedDir, rawPaths, collectLimit);
-    }
+    if (this._scanning) return [];
+    this._scanning = true;
+    try {
+      const resetPending = Boolean(this.store.getCodexIngestResetPending?.());
+      const effectiveMaxFiles = resetPending ? Infinity : maxRecentFiles;
+      if (resetPending) {
+        this.fileMtimes.clear();
+      }
 
-    let files = rawPaths
-      .map((fp) => {
-        try {
-          const st = statSync(fp);
-          return { fp, mtimeMs: st.mtimeMs, sizeBytes: st.size };
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
-    if (Number.isFinite(maxRecentFiles)) {
-      const top = files.slice(0, maxRecentFiles);
-      if (this.pendingOpenFiles.size > 0) {
-        const topSet = new Set(top.map((f) => f.fp));
-        for (const item of files.slice(maxRecentFiles)) {
-          if (this.pendingOpenFiles.has(item.fp) && !topSet.has(item.fp)) {
-            top.push(item);
-            topSet.add(item.fp);
-          }
-        }
-        for (const fp of [...this.pendingOpenFiles.keys()]) {
-          if (topSet.has(fp)) continue;
+      const collectLimit = Number.isFinite(effectiveMaxFiles) ? Math.max(effectiveMaxFiles * 3, 90) : Infinity;
+      const rawPaths = [];
+      collectJsonlFiles(this.sessionsDir, rawPaths, collectLimit);
+      if (this.archivedDir) {
+        collectJsonlFiles(this.archivedDir, rawPaths, collectLimit);
+      }
+
+      let files = rawPaths
+        .map((fp) => {
           try {
             const st = statSync(fp);
-            top.push({ fp, mtimeMs: st.mtimeMs, sizeBytes: st.size });
+            return { fp, mtimeMs: st.mtimeMs, sizeBytes: st.size, orderMs: codexFileOrderMs(fp, st) };
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      if (Number.isFinite(effectiveMaxFiles)) {
+        const top = files.slice(0, effectiveMaxFiles);
+        const topSet = new Set(top.map((f) => f.fp));
+        // Unreadable rollouts outside the recent window are retried once their backoff expires.
+        for (const [fp, failure] of this.readFailures) {
+          if (topSet.has(fp) || failure.retryAtMs > nowMs) continue;
+          try {
+            const st = statSync(fp);
+            top.push({ fp, mtimeMs: st.mtimeMs, sizeBytes: st.size, orderMs: codexFileOrderMs(fp, st) });
             topSet.add(fp);
           } catch {
-            this.pendingOpenFiles.delete(fp);
+            this.readFailures.delete(fp);
           }
         }
+        if (this.pendingOpenFiles.size > 0) {
+          for (const item of files.slice(effectiveMaxFiles)) {
+            if (this.pendingOpenFiles.has(item.fp) && !topSet.has(item.fp)) {
+              top.push(item);
+              topSet.add(item.fp);
+            }
+          }
+          for (const fp of [...this.pendingOpenFiles.keys()]) {
+            if (topSet.has(fp)) continue;
+            try {
+              const st = statSync(fp);
+              top.push({ fp, mtimeMs: st.mtimeMs, sizeBytes: st.size, orderMs: codexFileOrderMs(fp, st) });
+              topSet.add(fp);
+            } catch {
+              this.pendingOpenFiles.delete(fp);
+            }
+          }
+        }
+        files = top;
       }
-      files = top;
-    }
-    files.reverse();
 
-    const changed = [];
-    for (const { fp, mtimeMs, sizeBytes } of files) {
-      const flushOpenTurns = fp.endsWith('.jsonl.zst') || nowMs - mtimeMs > OPEN_TURN_FLUSH_MS;
-      const pending = this.pendingOpenFiles.get(fp);
-      if (pending) {
-        const modified = pending.mtimeMs !== mtimeMs || pending.sizeBytes !== sizeBytes;
-        if (!modified && !flushOpenTurns) continue;
-      } else {
-        const mem = this.fileMtimes.get(fp);
-        if (mem && mem.mtimeMs === mtimeMs && mem.sizeBytes === sizeBytes) continue;
-        const cached = this.store.getIngestedFile?.(fp);
-        if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
-          this.fileMtimes.set(fp, { mtimeMs, sizeBytes });
+      // Oldest-created first so parent rollouts claim replayed calls before forked children scan.
+      files.sort((a, b) => a.orderMs - b.orderMs || a.mtimeMs - b.mtimeMs || (a.fp < b.fp ? -1 : a.fp > b.fp ? 1 : 0));
+
+      const changed = [];
+      const newReadFailures = [];
+      for (const { fp, mtimeMs, sizeBytes } of files) {
+        const flushOpenTurns = fp.endsWith('.jsonl.zst') || nowMs - mtimeMs > OPEN_TURN_FLUSH_MS;
+        const pending = this.pendingOpenFiles.get(fp);
+        if (pending) {
+          const modified = pending.mtimeMs !== mtimeMs || pending.sizeBytes !== sizeBytes;
+          if (!modified && !flushOpenTurns) continue;
+        } else {
+          const mem = this.fileMtimes.get(fp);
+          if (mem && mem.mtimeMs === mtimeMs && mem.sizeBytes === sizeBytes) continue;
+          const cached = this.store.getIngestedFile?.(fp);
+          if (cached && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes) {
+            this.fileMtimes.set(fp, { mtimeMs, sizeBytes });
+            continue;
+          }
+        }
+
+        const failure = this.readFailures.get(fp);
+        if (failure) {
+          if (failure.mtimeMs !== mtimeMs || failure.sizeBytes !== sizeBytes) {
+            this.readFailures.delete(fp);
+          } else if (nowMs < failure.retryAtMs) {
+            continue;
+          }
+        }
+
+        const isForeignCall = this.store.isCodexCallOwnedByOtherFile
+          ? (key) => this.store.isCodexCallOwnedByOtherFile(key, fp)
+          : this.store.isCallOwnedByOtherFile
+            ? (key) => this.store.isCallOwnedByOtherFile(key, fp)
+            : null;
+        const resolveLineageRoot = this.store.resolveCodexLineageRoot
+          ? (sid, pid) => this.store.resolveCodexLineageRoot(sid, pid)
+          : null;
+        const seenCallKeys = new Set();
+        const droppedTurnUids = [];
+        const parser = new CodexSessionStreamParser({
+          filePath: fp,
+          flushOpenTurns,
+          onlyOpenAiModels: true,
+          isForeignCall,
+          seenCallKeys,
+          droppedTurnUids,
+          resolveLineageRoot,
+        });
+
+        let readError = null;
+        const ok = await forEachFileLine(fp, (line) => parser.feedLine(line), {
+          warn: (msg) => {
+            readError = msg;
+          },
+        });
+        if (!ok) {
+          const prev = this.readFailures.get(fp);
+          const attempts = prev && prev.mtimeMs === mtimeMs && prev.sizeBytes === sizeBytes ? prev.attempts + 1 : 1;
+          const delayMs = Math.min(READ_RETRY_BASE_MS * 2 ** (attempts - 1), READ_RETRY_MAX_MS);
+          this.readFailures.set(fp, { mtimeMs, sizeBytes, attempts, retryAtMs: Date.now() + delayMs });
+          if (attempts === 1) newReadFailures.push(readError || fp);
           continue;
         }
-      }
-      let content;
-      try {
-        if (fp.endsWith('.jsonl.zst')) {
-          const decompressed = decompressZstdSync(readFileSync(fp));
-          if (!decompressed) continue;
-          content = decompressed.toString('utf8');
-        } else {
-          content = readFileSync(fp, 'utf8');
+        this.readFailures.delete(fp);
+
+        const { turns, hasOpenTurns, sessionId, forkedFromId, allTurnUids } = parser.finish();
+        if (forkedFromId) {
+          this.store.setCodexParent?.(sessionId, forkedFromId);
         }
-      } catch {
-        continue;
+        if (this.store.claimCodexCallKeys) {
+          this.store.claimCodexCallKeys(fp, seenCallKeys);
+        } else {
+          this.store.claimCallKeys?.(fp, seenCallKeys);
+        }
+        for (const t of turns) {
+          const res = this.store.upsertTurn(t);
+          if (res.changed) changed.push(res.record);
+        }
+        this.store.deleteTurns?.(droppedTurnUids);
+        this.store.syncFileTurns?.(fp, Array.from(allTurnUids));
+
+        if (hasOpenTurns && !flushOpenTurns) {
+          this.fileMtimes.delete(fp);
+          this.pendingOpenFiles.set(fp, { mtimeMs, sizeBytes });
+        } else {
+          this.pendingOpenFiles.delete(fp);
+          this.fileMtimes.set(fp, { mtimeMs, sizeBytes });
+          this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
+        }
       }
-      const { turns, hasOpenTurns } = parseCodexSessionDetailed(content, fp, {
-        flushOpenTurns,
-        onlyOpenAiModels: true,
-      });
-      for (const t of turns) {
-        const res = this.store.upsertTurn(t);
-        if (res.changed) changed.push(res.record);
+
+      if (newReadFailures.length > 0) {
+        console.warn(
+          `[ai-turn-meter] codex: ${newReadFailures.length} rollout file(s) could not be read; retrying with backoff. First: ${newReadFailures[0]}`
+        );
       }
-      if (hasOpenTurns && !flushOpenTurns) {
-        this.fileMtimes.delete(fp);
-        this.pendingOpenFiles.set(fp, { mtimeMs, sizeBytes });
-      } else {
-        this.pendingOpenFiles.delete(fp);
-        this.fileMtimes.set(fp, { mtimeMs, sizeBytes });
-        this.store.setIngestedFile?.(fp, mtimeMs, sizeBytes);
+
+      // Unreadable files are retried on their own backoff, so they do not hold the reset open (which
+      // would force a full rescan every poll). They are re-parsed under the new rules once readable.
+      if (resetPending && !Number.isFinite(effectiveMaxFiles)) {
+        this.store.purgeLegacyDuplicateCodexTurns?.();
+        this.store.completeCodexIngestReset?.();
       }
+
+      if (changed.length > 0 && this.onTurns) {
+        this.onTurns(changed);
+      }
+      return changed;
+    } finally {
+      this._scanning = false;
     }
-    if (changed.length > 0 && this.onTurns) {
-      this.onTurns(changed);
-    }
-    return changed;
   }
 
   start() {
-    this.scan({ maxRecentFiles: 24 });
-    this.backfillTimer = setTimeout(() => {
-      this.backfillTimer = null;
-      this.scan({ maxRecentFiles: Infinity });
-    }, 150);
-    this.backfillTimer.unref?.();
+    this._stopped = false;
+    const resetPending = Boolean(this.store.getCodexIngestResetPending?.());
+    if (resetPending) {
+      this.backfillTimer = setTimeout(() => {
+        this.backfillTimer = null;
+        if (this._stopped) return;
+        this.scan({ maxRecentFiles: Infinity }).catch(() => {});
+      }, 50);
+      this.backfillTimer.unref?.();
+    } else {
+      this.scan({ maxRecentFiles: 24 }).catch(() => {});
+      const runBackfill = () => {
+        this.backfillTimer = null;
+        if (this._stopped) return;
+        if (this._scanning) {
+          this.backfillTimer = setTimeout(runBackfill, 300);
+          this.backfillTimer.unref?.();
+          return;
+        }
+        this.scan({ maxRecentFiles: Infinity }).catch(() => {});
+      };
+      this.backfillTimer = setTimeout(runBackfill, 150);
+      this.backfillTimer.unref?.();
+    }
     for (const dir of [this.sessionsDir, this.archivedDir].filter(Boolean)) {
       try {
         const w = watch(dir, { recursive: true }, () => {
@@ -759,23 +1009,41 @@ export class CodexAdapter {
         // Directory may not exist yet; poll fallback covers it
       }
     }
-    this.timer = setInterval(() => this.scan({ maxRecentFiles: 12 }), 2000);
+    this.timer = setInterval(() => {
+      if (!this._stopped) this.scan({ maxRecentFiles: 12 }).catch(() => {});
+    }, 2000);
     this.timer.unref?.();
   }
 
   scheduleScan() {
-    if (this.pending) return;
+    if (this._stopped || this.pending) return;
     this.pending = setTimeout(() => {
       this.pending = null;
-      this.scan({ maxRecentFiles: 12 });
+      if (this._stopped) return;
+      if (this._scanning) {
+        this.scheduleScan();
+        return;
+      }
+      this.scan({ maxRecentFiles: 12 }).catch(() => {});
     }, 150);
+    this.pending.unref?.();
   }
 
   stop() {
+    this._stopped = true;
     for (const w of this.watchers) w.close();
     this.watchers = [];
-    if (this.timer) clearInterval(this.timer);
-    if (this.backfillTimer) clearTimeout(this.backfillTimer);
-    if (this.pending) clearTimeout(this.pending);
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    if (this.backfillTimer) {
+      clearTimeout(this.backfillTimer);
+      this.backfillTimer = null;
+    }
+    if (this.pending) {
+      clearTimeout(this.pending);
+      this.pending = null;
+    }
   }
 }

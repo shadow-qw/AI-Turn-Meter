@@ -5,7 +5,7 @@ import https from 'node:https';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { decompressZstdSync } from './zstd.mjs';
+import { forEachFileLine } from './zstd.mjs';
 import {
   buildLanguageServerEndpoints,
   inspectAntigravityLanguageServers,
@@ -346,7 +346,7 @@ export function resolveCodexUsageUrl(codexHome, configContents = null) {
 const MAX_CODEX_RATE_LIMIT_FILES = 15;
 const MAX_CODEX_RATE_LIMIT_BYTES = 20 * 1024 * 1024;
 
-function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
+async function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
   try {
     const maxAgeMs = 30 * 86400 * 1000;
     const candidates = [];
@@ -374,24 +374,21 @@ function findNewestCodexRateLimits(codexHome, nowMs = Date.now()) {
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const { p, size } of candidates.slice(0, MAX_CODEX_RATE_LIMIT_FILES)) {
       if (size > MAX_CODEX_RATE_LIMIT_BYTES) continue;
-      let raw;
-      try {
-        if (p.endsWith('.jsonl.zst')) {
-          const decompressed = decompressZstdSync(readFileSync(p));
-          if (!decompressed) continue;
-          raw = decompressed.toString('utf8');
-        } else {
-          raw = readFileSync(p, 'utf8');
-        }
-      } catch {
-        continue;
-      }
-      const lines = raw.trim().split('\n');
-      const minIdx = Math.max(0, lines.length - 4000);
+      const ringSize = 4000;
+      const ring = new Array(ringSize);
+      let ringTotal = 0;
+      const ok = await forEachFileLine(p, (line) => {
+        if (!line.trim()) return;
+        ring[ringTotal % ringSize] = line;
+        ringTotal += 1;
+      });
+      if (!ok || ringTotal === 0) continue;
+      const kept = Math.min(ringTotal, ringSize);
       let fallbackRl = null;
-      for (let i = lines.length - 1; i >= minIdx; i -= 1) {
+      for (let k = 0; k < kept; k += 1) {
+        const line = ring[(ringTotal - 1 - k) % ringSize];
         try {
-          const obj = JSON.parse(lines[i]);
+          const obj = JSON.parse(line);
           const rl = obj?.payload?.rate_limits;
           if (
             rl &&
@@ -499,7 +496,7 @@ export async function fetchCodexQuota(nowMs = Date.now(), { allowNetwork = true 
     }
 
     if (!rateLimit) {
-      const localRl = findNewestCodexRateLimits(codexHome, nowMs);
+      const localRl = await findNewestCodexRateLimits(codexHome, nowMs);
       if (localRl) {
         if (localRl.plan_type) planTitle = formatCodexPlan(localRl.plan_type);
         const normalizeLocalWin = (w) => {

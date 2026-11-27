@@ -187,9 +187,37 @@ const MODEL_PRICING_PER_M = {
     output: 10.0,
     effectiveChanges: [{ fromMs: Date.UTC(2026, 11, 1), input: 4.0, cacheRead: 0.2, output: 20.0 }],
   },
-  'gemini-3.8-flash-n': { input: 0.3, cacheRead: 0.03, output: 2.5 },
-  'gemini-3.8-flash': { input: 0.3, cacheRead: 0.03, output: 2.5 },
-  'gemini-flash-worker-agy': { input: 0.3, cacheRead: 0.03, output: 2.5 },
+  // Gemini 3.6 / 3.8 Flash: aistudio.google.com/docs/pricing (checked 2026-11-27) lists $0.75 / $0.075 / $3.75
+  // through 2026-12-31 and $1.50 / $0.15 / $7.50 from 2027-01-01. Antigravity reports the 3.8 Flash
+  // variant as gemini-3.8-flash-n ("Gemini 3.8 Flash" in gen_metadata display names).
+  'gemini-3.8-flash': {
+    input: 0.75,
+    cacheRead: 0.075,
+    output: 3.75,
+    effectiveChanges: [{ fromMs: Date.UTC(2027, 0, 1), input: 1.5, cacheRead: 0.15, output: 7.5 }],
+  },
+  'gemini-3.8-flash-n': {
+    input: 0.75,
+    cacheRead: 0.075,
+    output: 3.75,
+    effectiveChanges: [{ fromMs: Date.UTC(2027, 0, 1), input: 1.5, cacheRead: 0.15, output: 7.5 }],
+  },
+  'gemini-3.6-flash': {
+    input: 0.75,
+    cacheRead: 0.075,
+    output: 3.75,
+    effectiveChanges: [{ fromMs: Date.UTC(2027, 0, 1), input: 1.5, cacheRead: 0.15, output: 7.5 }],
+  },
+  // Antigravity's flash sub-agent worker (shown under "Gemini 4 Hydrogen (Orchestrator)"). Google
+  // publishes no rate for it; priced as the current Flash generation (3.8 Flash).
+  'gemini-flash-worker-agy': {
+    input: 0.75,
+    cacheRead: 0.075,
+    output: 3.75,
+    effectiveChanges: [{ fromMs: Date.UTC(2027, 0, 1), input: 1.5, cacheRead: 0.15, output: 7.5 }],
+  },
+  // Gemini 3 Flash (gemini-3-flash-preview): $0.50 / $0.05 / $3.00.
+  'gemini-3-flash-preview': { input: 0.5, cacheRead: 0.05, output: 3.0 },
   'gemini-3.1-pro': {
     input: 2.0,
     cacheRead: 0.2,
@@ -436,8 +464,13 @@ const MODEL_ALIASES = {
   'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
   'gemini-pro-default': 'gemini-3.1-pro',
   'gemini-pro-agent': 'gemini-3.1-pro',
-  'gemini-3.7-flash-safety-le': 'gemini-2.5-flash',
-  'gemini-3.7-flash': 'gemini-2.5-flash',
+  // Gemini 3.7 Flash has no public rate; the 3.6 and 3.8 Flash generations around it share one price.
+  'gemini-3.7-flash-safety-le': 'gemini-3.6-flash',
+  'gemini-3.7-flash-exp-b': 'gemini-3.6-flash',
+  'gemini-3.7-flash': 'gemini-3.6-flash',
+  // Antigravity's Gemini 3 Flash codename.
+  'gemini-3-flash-a': 'gemini-3-flash-preview',
+  'gemini-3-flash': 'gemini-3-flash-preview',
   'claude-sonnet-3.7': 'claude-3.7-sonnet',
   'claude-sonnet-3.5': 'claude-3.5-sonnet',
   'claude-haiku-3.5': 'claude-3.5-haiku',
@@ -485,6 +518,13 @@ function toNonNegIntVal(v) {
   return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
 }
 
+function normalizeBucketModel(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'unknown') return null;
+  return trimmed;
+}
+
 export function accumulateUsageBucket(bucketMap, call) {
   if (!(bucketMap instanceof Map) || !call || typeof call !== 'object') return;
   const u = toNonNegIntVal(call.uncachedInput);
@@ -496,7 +536,7 @@ export function accumulateUsageBucket(bucketMap, call) {
   if (callInput === 0 && out === 0) return;
 
   const b = classifyContextBand(callInput);
-  const m = typeof call.model === 'string' && call.model.trim() ? call.model.trim() : null;
+  const m = normalizeBucketModel(call.model);
   const st = normalizeServiceTier(call.serviceTier);
   const geo = normalizeInferenceGeo(call.inferenceGeo);
   const key = `${m || ''}\0${st || ''}\0${geo || ''}\0${b}`;
@@ -558,7 +598,7 @@ export function sanitizeUsageBuckets(raw) {
     if (totalIn === 0 && out === 0) continue;
 
     const b = typeof item.b === 'string' && VALID_BANDS.has(item.b) ? item.b : classifyContextBand(totalIn);
-    const m = typeof item.m === 'string' && item.m.trim() ? item.m.trim() : null;
+    const m = normalizeBucketModel(item.m);
     const st = normalizeServiceTier(item.st);
     const geo = normalizeInferenceGeo(item.geo);
     const c = Math.max(1, toNonNegIntVal(item.c) || 1);

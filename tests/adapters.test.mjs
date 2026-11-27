@@ -2189,7 +2189,7 @@ test('CodexAdapter decompresses historical .jsonl.zst archives and syncCursorHis
           sessionsDir: join(codexRoot, 'sessions'),
           archivedDir: archDir,
         });
-        const first = adapter.scan({ maxRecentFiles: Infinity });
+        const first = await adapter.scan({ maxRecentFiles: Infinity });
         assert.equal(first.length, 1);
         assert.equal(first[0].model, 'gpt-6-astra');
         assert.equal(first[0].totalInputTokens, 200_000);
@@ -2200,7 +2200,7 @@ test('CodexAdapter decompresses historical .jsonl.zst archives and syncCursorHis
           sessionsDir: join(codexRoot, 'sessions'),
           archivedDir: archDir,
         });
-        assert.equal(adapter2.scan({ maxRecentFiles: Infinity }).length, 0);
+        assert.equal((await adapter2.scan({ maxRecentFiles: Infinity })).length, 0);
       } finally {
         store.close();
       }

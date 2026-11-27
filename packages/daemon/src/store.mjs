@@ -57,7 +57,7 @@ const RECENT_SESSIONS_CACHE_TTL_MS = 15_000;
  * producing data that historical files must be re-parsed for (e.g. usage buckets); every file
  * ingested under an older revision is then re-parsed once on the next scan.
  */
-export const INGEST_PARSER_REV = 2;
+export const INGEST_PARSER_REV = 3;
 
 function normalizeWorkspacePath(raw) {
   if (typeof raw !== 'string') return '';
@@ -84,6 +84,13 @@ function shortSessionId(sessionId) {
   const s = String(sessionId || '').trim();
   if (!s) return 'session';
   return s.length > 12 ? s.slice(0, 8) : s;
+}
+
+function bucketsHaveNamedModel(buckets) {
+  return (
+    Array.isArray(buckets) &&
+    buckets.some((b) => typeof b?.m === 'string' && b.m.trim() && b.m.trim().toLowerCase() !== 'unknown')
+  );
 }
 
 function createUsageAccumulator() {
@@ -289,6 +296,22 @@ export class TurnStore {
         file_path TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_turn_source_file ON turn_source(file_path);
+
+      CREATE TABLE IF NOT EXISTS codex_lineage (
+        session_id TEXT PRIMARY KEY,
+        parent_id TEXT NOT NULL
+      );
+
+      -- Codex records one ownership key per token event (tens of thousands of rows), so it keeps them
+      -- apart from call_owner and stores a small file id instead of repeating the full path per row.
+      CREATE TABLE IF NOT EXISTS ingest_file (
+        id INTEGER PRIMARY KEY,
+        path TEXT NOT NULL UNIQUE
+      );
+      CREATE TABLE IF NOT EXISTS codex_call_owner (
+        call_key TEXT PRIMARY KEY,
+        file_id INTEGER NOT NULL
+      ) WITHOUT ROWID;
 
       CREATE TABLE IF NOT EXISTS sync_meta (
         key TEXT PRIMARY KEY,
@@ -525,6 +548,25 @@ export class TurnStore {
       ON CONFLICT(turn_uid) DO UPDATE SET file_path = excluded.file_path
     `);
     this.deleteTurnSourceStmt = this.db.prepare(`DELETE FROM turn_source WHERE turn_uid = ?`);
+    this.setCodexParentStmt = this.db.prepare(`
+      INSERT INTO codex_lineage (session_id, parent_id) VALUES (?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET parent_id = excluded.parent_id
+    `);
+    this.getCodexParentStmt = this.db.prepare(`SELECT parent_id FROM codex_lineage WHERE session_id = ?`);
+    this.hasCodexTurnStmt = this.db.prepare(`SELECT 1 FROM turns WHERE tool = 'codex' AND session_id = ? LIMIT 1`);
+    // Range bounds instead of LIKE so the primary-key index serves the prefix lookup.
+    this.hasCodexCallOwnerPrefixStmt = this.db.prepare(
+      `SELECT 1 FROM codex_call_owner WHERE call_key >= ? AND call_key < ? LIMIT 1`
+    );
+    this.getIngestFileIdStmt = this.db.prepare(`SELECT id FROM ingest_file WHERE path = ?`);
+    this.insertIngestFileStmt = this.db.prepare(
+      `INSERT INTO ingest_file (path) VALUES (?) ON CONFLICT(path) DO NOTHING`
+    );
+    this.getCodexCallOwnerStmt = this.db.prepare(`SELECT file_id FROM codex_call_owner WHERE call_key = ?`);
+    this.claimCodexCallStmt = this.db.prepare(
+      `INSERT INTO codex_call_owner (call_key, file_id) VALUES (?, ?) ON CONFLICT(call_key) DO NOTHING`
+    );
+    this._ingestFileIds = new Map();
     this.getMetaStmt = this.db.prepare(`SELECT value FROM sync_meta WHERE key = ?`);
     this.setMetaStmt = this.db.prepare(`
       INSERT INTO sync_meta (key, value)
@@ -533,15 +575,35 @@ export class TurnStore {
     `);
 
     // A parser revision bump re-parses every session file; call ownership is rebuilt alongside it so
-    // it follows the current rules (oldest-created file first). Adapters do a full scan first while
-    // this is set, so an original session is not out-raced by a recent fork of it. Offline read-only
-    // CLI tools pass allowIngestReset=false so they neither clear tables nor consume the migration flag.
+    // it follows the current rules (oldest-created file first). Keep ownership records whose source
+    // files were already pruned from disk so surviving forks never re-claim deleted originals' calls.
     this.ingestResetPending = this.getMeta('ingest_parser_rev') !== String(INGEST_PARSER_REV);
     if (this.ingestResetPending && allowIngestReset) {
       if (this.getMeta('ingest_reset_cleared_rev') !== String(INGEST_PARSER_REV)) {
         this.db.exec('BEGIN');
         try {
-          this.db.exec('DELETE FROM call_owner; DELETE FROM ingest_state;');
+          const ownerFiles = this.db.prepare('SELECT DISTINCT file_path FROM call_owner').all();
+          const delOwnerByFile = this.db.prepare('DELETE FROM call_owner WHERE file_path = ?');
+          for (const row of ownerFiles) {
+            if (typeof row.file_path === 'string' && row.file_path && existsSync(row.file_path)) {
+              delOwnerByFile.run(row.file_path);
+            }
+          }
+          // Same rule for Codex ownership, in one pass over codex_call_owner.
+          const liveCodexFileIds = this.db
+            .prepare('SELECT id, path FROM ingest_file')
+            .all()
+            .filter((r) => typeof r.path === 'string' && r.path && existsSync(r.path))
+            .map((r) => Number(r.id));
+          if (liveCodexFileIds.length > 0) {
+            this.db
+              .prepare('DELETE FROM codex_call_owner WHERE file_id IN (SELECT value FROM json_each(?))')
+              .run(JSON.stringify(liveCodexFileIds));
+          }
+          // Pre-release builds kept Codex keys in call_owner; they now live in codex_call_owner.
+          this.db.exec("DELETE FROM call_owner WHERE call_key >= 'codex:' AND call_key < 'codex;';");
+          this.db.exec('DELETE FROM ingest_state;');
+          this.db.exec("DELETE FROM sync_meta WHERE key = 'codex_ingest_rev';");
           this.setMeta('ingest_reset_cleared_rev', INGEST_PARSER_REV);
           this.db.exec('COMMIT');
         } catch (err) {
@@ -624,6 +686,16 @@ export class TurnStore {
 
     const usageBucketsJson =
       Array.isArray(t.usageBuckets) && t.usageBuckets.length > 0 ? JSON.stringify(t.usageBuckets) : null;
+    const prevBuckets = prev ? sanitizeUsageBuckets(prev.usage_buckets_json) : null;
+    const nextBuckets = sanitizeUsageBuckets(t.usageBuckets);
+    const preserveBuckets =
+      Boolean(prev) &&
+      bucketsHaveNamedModel(prevBuckets) &&
+      !bucketsHaveNamedModel(nextBuckets) &&
+      t.model === 'unknown' &&
+      prev.total_input_tokens === t.totalInputTokens &&
+      prev.output_tokens === t.outputTokens;
+    const effectiveUsageBucketsJson = preserveBuckets ? prev.usage_buckets_json : usageBucketsJson;
 
     const preserveStreaming =
       Boolean(prev) &&
@@ -647,7 +719,7 @@ export class TurnStore {
       (!preserveStreaming && t.model !== 'unknown' && prev.model !== t.model) ||
       (!prev.workspace_path && Boolean(t.workspacePath)) ||
       (resolvedExplicitCostUsd !== null && prev.explicit_cost_usd !== resolvedExplicitCostUsd) ||
-      (usageBucketsJson !== null && prev.usage_buckets_json !== usageBucketsJson);
+      (effectiveUsageBucketsJson !== null && prev.usage_buckets_json !== effectiveUsageBucketsJson);
 
     if (changed) {
       this.upsertStmt.run(
@@ -676,7 +748,7 @@ export class TurnStore {
         t.tpsMethod,
         t.replyPreview,
         resolvedExplicitCostUsd,
-        usageBucketsJson
+        effectiveUsageBucketsJson
       );
     }
 
@@ -877,6 +949,43 @@ export class TurnStore {
     }
   }
 
+  _ingestFileId(filePath, { create = false } = {}) {
+    if (typeof filePath !== 'string' || !filePath) return null;
+    const cached = this._ingestFileIds.get(filePath);
+    if (cached !== undefined) return cached;
+    let row = this.getIngestFileIdStmt.get(filePath);
+    if (!row && create) {
+      this.insertIngestFileStmt.run(filePath);
+      row = this.getIngestFileIdStmt.get(filePath);
+    }
+    if (!row) return null;
+    const id = Number(row.id);
+    this._ingestFileIds.set(filePath, id);
+    return id;
+  }
+
+  isCodexCallOwnedByOtherFile(callKey, filePath) {
+    const r = this.getCodexCallOwnerStmt.get(callKey);
+    if (!r) return false;
+    return Number(r.file_id) !== this._ingestFileId(filePath);
+  }
+
+  /** Codex counterpart of claimCallKeys: the first file to contain a call owns it. */
+  claimCodexCallKeys(filePath, callKeys) {
+    if (!callKeys || callKeys.size === 0) return;
+    this.db.exec('BEGIN');
+    try {
+      const fileId = this._ingestFileId(filePath, { create: true });
+      for (const key of callKeys) this.claimCodexCallStmt.run(key, fileId);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      // A rolled-back insert may have minted this id; never reuse it from the cache.
+      this._ingestFileIds.delete(filePath);
+      throw err;
+    }
+  }
+
   deleteTurns(turnUids) {
     if (!Array.isArray(turnUids) || turnUids.length === 0) return 0;
     let removed = 0;
@@ -934,6 +1043,76 @@ export class TurnStore {
     if (!this.ingestResetPending) return;
     this.setMeta('ingest_parser_rev', INGEST_PARSER_REV);
     this.ingestResetPending = false;
+  }
+
+  setCodexParent(sessionId, parentId) {
+    if (typeof sessionId !== 'string' || typeof parentId !== 'string') return;
+    const sid = sessionId.trim();
+    const pid = parentId.trim();
+    if (!sid || !pid || sid === pid) return;
+    this.setCodexParentStmt.run(sid, pid);
+  }
+
+  resolveCodexLineageRoot(sessionId, parentId = null) {
+    const sid = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!sid) return { rootId: '', hasKnownParent: false };
+    const pid = typeof parentId === 'string' && parentId.trim() && parentId.trim() !== sid ? parentId.trim() : null;
+    if (pid) {
+      this.setCodexParent(sid, pid);
+    }
+    let cur = pid || this.getCodexParentStmt.get(sid)?.parent_id || null;
+    const visited = new Set([sid]);
+    let rootId = sid;
+    let hasKnownParent = false;
+    let depth = 0;
+    while (cur && !visited.has(cur) && depth < 64) {
+      visited.add(cur);
+      depth += 1;
+      rootId = cur;
+      if (!hasKnownParent) {
+        const hasTurn = this.hasCodexTurnStmt.get(cur);
+        // Every key starting "codex:tc:<cur>:" sorts in [prefix, prefix with ':' bumped to ';').
+        const hasOwner = this.hasCodexCallOwnerPrefixStmt.get(`codex:tc:${cur}:`, `codex:tc:${cur};`);
+        if (hasTurn || hasOwner) hasKnownParent = true;
+      }
+      const nextParent = this.getCodexParentStmt.get(cur)?.parent_id || null;
+      if (nextParent) hasKnownParent = true;
+      cur = nextParent;
+    }
+    return { rootId, hasKnownParent };
+  }
+
+  getCodexIngestResetPending() {
+    return this.getMeta('codex_ingest_rev') !== String(INGEST_PARSER_REV);
+  }
+
+  completeCodexIngestReset() {
+    this.setMeta('codex_ingest_rev', INGEST_PARSER_REV);
+  }
+
+  purgeLegacyDuplicateCodexTurns() {
+    const info = this.db
+      .prepare(
+        `DELETE FROM turns
+         WHERE tool = 'codex'
+           AND turn_uid NOT IN (SELECT turn_uid FROM turn_source)
+           AND EXISTS (
+             SELECT 1
+             FROM turns t2
+             JOIN turn_source ts ON ts.turn_uid = t2.turn_uid
+             WHERE t2.tool = 'codex'
+               AND t2.turn_id = turns.turn_id
+               AND t2.total_input_tokens = turns.total_input_tokens
+               AND t2.output_tokens = turns.output_tokens
+           )`
+      )
+      .run();
+    const removed = Number(info?.changes) || 0;
+    if (removed > 0) {
+      this.writeGeneration += 1;
+      this._recentSessionsCache.clear();
+    }
+    return removed;
   }
 
   getCursorLocalHookRows() {

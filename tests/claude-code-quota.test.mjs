@@ -1924,3 +1924,153 @@ test('ClaudeCodeAdapter byte-offset incremental scan handles appends, partial tr
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('ClaudeCodeAdapter counts advisor_message iterations, separates requestless reused message.ids, and keeps deleted-file call_owner on rev bump', () => {
+  // 1. Advisor iterations + requestless reused message.id
+  const jsonl = [
+    JSON.stringify({
+      type: 'user',
+      sessionId: 'sess-adv',
+      cwd: '/Users/dev/adv',
+      timestamp: '2026-11-26T10:00:00.000Z',
+      message: { role: 'user', content: 'Run with advisor' },
+    }),
+    // Streaming chunk 1 with advisor_message
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: 'sess-adv',
+      timestamp: '2026-11-26T10:00:01.000Z',
+      message: {
+        id: 'gw-msg-1',
+        model: 'claude-sonnet-4-5-20250929',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Working...' }],
+        usage: {
+          input_tokens: 1000,
+          cache_read_input_tokens: 0,
+          output_tokens: 50,
+          iterations: [
+            { type: 'message', input_tokens: 1000, output_tokens: 50 },
+            { type: 'advisor_message', model: 'claude-opus-4-5-20251101', input_tokens: 10_000, output_tokens: 500 },
+          ],
+        },
+      },
+    }),
+    // Streaming chunk 2 (same timestamp / open stop_reason -> merges without doubling advisor)
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: 'sess-adv',
+      timestamp: '2026-11-26T10:00:01.000Z',
+      message: {
+        id: 'gw-msg-1',
+        model: 'claude-sonnet-4-5-20250929',
+        role: 'assistant',
+        stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'tu1', name: 'Read', input: {} }],
+        usage: {
+          input_tokens: 1000,
+          cache_read_input_tokens: 0,
+          output_tokens: 100,
+          iterations: [
+            { type: 'message', input_tokens: 1000, output_tokens: 100 },
+            { type: 'advisor_message', model: 'claude-opus-4-5-20251101', input_tokens: 10_000, output_tokens: 500 },
+          ],
+        },
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      sessionId: 'sess-adv',
+      timestamp: '2026-11-26T10:00:02.000Z',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] },
+    }),
+    // Gateway reuses the SAME message.id "gw-msg-1" without requestId at a new timestamp after tool_result
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: 'sess-adv',
+      timestamp: '2026-11-26T10:00:03.000Z',
+      message: {
+        id: 'gw-msg-1',
+        model: 'claude-sonnet-4-5-20250929',
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Done.' }],
+        usage: {
+          input_tokens: 2000,
+          cache_read_input_tokens: 0,
+          output_tokens: 200,
+        },
+      },
+    }),
+  ].join('\n');
+
+  const turns = parseClaudeCodeSessionContent(jsonl, { filePath: '/tmp/sess-adv.jsonl' });
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].callCount, 3);
+  assert.equal(turns[0].totalInputTokens, 13_000);
+  assert.equal(turns[0].outputTokens, 800);
+  assert.equal(turns[0].usageBuckets.length, 2);
+  // Sonnet 4.5 (3000 in @ $3 + 300 out @ $15 = 0.009 + 0.0045 = 0.0135)
+  // + Opus 4.5 advisor (10000 in @ $5 + 500 out @ $25 = 0.05 + 0.0125 = 0.0625) = 0.076
+  assert.equal(estimateTurnCost(turns[0]).costUsd, 0.076);
+
+  // 2. Deleted original file's call_owner survives INGEST_PARSER_REV bump so surviving fork does not double-count
+  const tmp = mkdtempSync(join(tmpdir(), 'atm-claude-deleted-owner-'));
+  const dbPath = join(tmp, 'meter.db');
+  const root = join(tmp, '.claude');
+  const proj = join(root, 'projects', '-Users-dev-del');
+  mkdirSync(proj, { recursive: true });
+  const ORIG = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01';
+  const FORK = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb02';
+  const origFile = join(proj, `${ORIG}.jsonl`);
+  const forkFile = join(proj, `${FORK}.jsonl`);
+  const mkU = (sid, ts, text) => JSON.stringify({ type: 'user', sessionId: sid, cwd: '/Users/dev/del', timestamp: ts, message: { role: 'user', content: text } });
+  const mkA = (sid, ts, id, out) =>
+    JSON.stringify({
+      type: 'assistant',
+      sessionId: sid,
+      cwd: '/Users/dev/del',
+      timestamp: ts,
+      message: { id, model: 'claude-opus-5-5', role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: id }], usage: { input_tokens: 1000, output_tokens: out } },
+    });
+
+  try {
+    writeFileSync(origFile, [mkU(ORIG, '2026-11-01T10:00:00Z', 'q1'), mkA(ORIG, '2026-11-01T10:00:05Z', 'shared_gw', 100)].join('\n') + '\n');
+    utimesSync(origFile, new Date('2026-11-01T10:00:05Z'), new Date('2026-11-01T10:00:05Z'));
+    writeFileSync(
+      forkFile,
+      [
+        mkU(ORIG, '2026-11-01T10:00:00Z', 'q1'),
+        mkA(ORIG, '2026-11-01T10:00:05Z', 'shared_gw', 100),
+        mkU(FORK, '2026-11-26T10:00:00Z', 'q2'),
+        mkA(FORK, '2026-11-26T10:00:05Z', 'shared_gw', 250),
+      ].join('\n') + '\n'
+    );
+    utimesSync(forkFile, new Date('2026-11-26T10:00:05Z'), new Date('2026-11-26T10:00:05Z'));
+
+    const s1 = new TurnStore(dbPath);
+    new ClaudeCodeAdapter({ store: s1, claudeRoot: root, onTurns: () => {} }).scan({ maxRecentFiles: Infinity });
+    s1.close();
+
+    // Delete original file from disk and simulate an INGEST_PARSER_REV bump
+    rmSync(origFile);
+    const sBump = new TurnStore(dbPath);
+    sBump.db.exec(`DELETE FROM sync_meta WHERE key IN ('ingest_parser_rev', 'ingest_reset_cleared_rev')`);
+    sBump.close();
+
+    const s2 = new TurnStore(dbPath);
+    assert.equal(s2.ingestResetPending, true);
+    new ClaudeCodeAdapter({ store: s2, claudeRoot: root, onTurns: () => {} }).scan({ maxRecentFiles: Infinity });
+    const claudeRows = s2.db.prepare(`SELECT session_id, output_tokens FROM turns WHERE tool = 'claude' ORDER BY session_id`).all();
+    assert.deepEqual(
+      claudeRows.map((r) => ({ sid: r.session_id, out: r.output_tokens })),
+      [
+        { sid: ORIG, out: 100 },
+        { sid: FORK, out: 250 },
+      ]
+    );
+    s2.close();
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
